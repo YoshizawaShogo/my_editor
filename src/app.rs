@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    io::{Write, stdout},
     path::{Path, PathBuf},
 };
 
@@ -8,11 +7,20 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Layout},
+    style::Style,
+    text::{Line, Span},
+    widgets::{Block, Paragraph},
 };
 
 use crate::{
     config,
+    color::AppColors,
     document::Document,
     error::Result,
     mode::Mode,
@@ -74,22 +82,11 @@ impl App {
         Ok(app)
     }
 
-    pub fn render_to<W: Write>(
-        &self,
-        writer: &mut W,
-        page_height: usize,
-        page_width: usize,
-    ) -> Result<()> {
-        self.workspace
-            .current_document()
-            .render_first_page_to(writer, page_height, page_width)
-    }
-
     pub fn run(&mut self) -> Result<()> {
         let mut terminal_session = TerminalSession::enter()?;
 
         loop {
-            self.render_frame(terminal_session.writer())?;
+            self.render_frame(terminal_session.terminal())?;
 
             if self.handle_event(event::read()?)? {
                 break;
@@ -124,11 +121,35 @@ impl App {
         Ok(())
     }
 
-    fn render_frame<W: Write>(&self, writer: &mut W) -> Result<()> {
-        let (page_width, page_height) = terminal::size().unwrap_or((80, 24));
-        execute!(writer, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-        self.render_to(writer, page_height as usize, page_width as usize)?;
-        writer.flush()?;
+    fn render_frame(&self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let render = self
+                .workspace
+                .current_document()
+                .render_first_page(area.height as usize, area.width as usize)
+                .expect("document render should succeed during draw");
+
+            let layout = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+            let background = Block::default().style(Style::default().bg(AppColors::BACKGROUND));
+            let content = Paragraph::new(render.lines.join("\n")).style(
+                Style::default()
+                    .fg(AppColors::FOREGROUND)
+                    .bg(AppColors::BACKGROUND),
+            );
+            let footer = Paragraph::new(self.footer_line(&render.status)).style(
+                Style::default().bg(AppColors::PANEL),
+            );
+
+            frame.render_widget(background, area);
+            frame.render_widget(content, layout[0]);
+            frame.render_widget(footer, layout[1]);
+        })?;
         Ok(())
     }
 
@@ -158,6 +179,31 @@ impl App {
             _ => Ok(false),
         }
     }
+
+    fn footer_color(&self) -> ratatui::style::Color {
+        match self.mode {
+            Mode::Normal => AppColors::NORMAL_MODE,
+            Mode::Insert => AppColors::INSERT_MODE,
+            Mode::Command => AppColors::COMMAND_MODE,
+            Mode::Shell => AppColors::SHELL_MODE,
+        }
+    }
+
+    fn footer_line(&self, status: &str) -> Line<'static> {
+        let mode = self.mode.label();
+        let file_name = self.workspace.current_document_name();
+        let mode_bg = self.footer_color();
+        let footer_bg = AppColors::PANEL;
+
+        Line::from(vec![
+            powerline_segment(mode.to_owned(), AppColors::BACKGROUND, mode_bg),
+            powerline_separator_left(mode_bg, footer_bg),
+            powerline_segment(file_name, AppColors::ACCENT, footer_bg),
+            powerline_separator_right(mode_bg),
+            powerline_segment(status.to_owned(), AppColors::MUTED, footer_bg),
+            powerline_separator_right(mode_bg),
+        ])
+    }
 }
 
 impl Workspace {
@@ -176,26 +222,32 @@ impl Workspace {
             })
             .collect()
     }
+
+    pub fn current_document_name(&self) -> String {
+        display_name(&self.documents[self.current_index].path)
+    }
 }
 
 struct TerminalSession {
-    stdout: std::io::Stdout,
+    terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
     active: bool,
 }
 
 impl TerminalSession {
     fn enter() -> Result<Self> {
-        let mut stdout = stdout();
+        let mut stdout = std::io::stdout();
         terminal::enable_raw_mode()?;
         execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
         Ok(Self {
-            stdout,
+            terminal,
             active: true,
         })
     }
 
-    fn writer(&mut self) -> &mut std::io::Stdout {
-        &mut self.stdout
+    fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<std::io::Stdout>> {
+        &mut self.terminal
     }
 
     fn leave(&mut self) -> Result<()> {
@@ -203,7 +255,8 @@ impl TerminalSession {
             return Ok(());
         }
 
-        execute!(self.stdout, cursor::Show, LeaveAlternateScreen)?;
+        self.terminal.flush()?;
+        execute!(self.terminal.backend_mut(), cursor::Show, LeaveAlternateScreen)?;
         terminal::disable_raw_mode()?;
         self.active = false;
         Ok(())
@@ -213,7 +266,8 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         if self.active {
-            let _ = execute!(self.stdout, cursor::Show, LeaveAlternateScreen);
+            let _ = self.terminal.flush();
+            let _ = execute!(self.terminal.backend_mut(), cursor::Show, LeaveAlternateScreen);
             let _ = terminal::disable_raw_mode();
         }
     }
@@ -224,6 +278,36 @@ fn display_name(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| path.display().to_string())
+}
+
+fn powerline_segment(
+    text: String,
+    foreground: ratatui::style::Color,
+    background: ratatui::style::Color,
+) -> Span<'static> {
+    Span::styled(
+        format!(" {text} "),
+        Style::default().fg(foreground).bg(background),
+    )
+}
+
+fn powerline_separator_left(
+    left_background: ratatui::style::Color,
+    right_background: ratatui::style::Color,
+) -> Span<'static> {
+    Span::styled(
+        "\u{e0b0}",
+        Style::default()
+            .fg(left_background)
+            .bg(right_background),
+    )
+}
+
+fn powerline_separator_right(foreground: ratatui::style::Color) -> Span<'static> {
+    Span::styled(
+        format!(" {} ", '\u{e0b1}'),
+        Style::default().fg(foreground).bg(AppColors::PANEL),
+    )
 }
 
 #[allow(dead_code)]

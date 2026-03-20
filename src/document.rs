@@ -1,4 +1,4 @@
-use std::{fs, io::Write, path::Path};
+use std::{fs, path::Path};
 
 use crate::{config, error::Result};
 
@@ -11,6 +11,11 @@ pub enum Document {
 }
 
 const LINE_NUMBER_WIDTH: usize = 6;
+
+pub struct DocumentRender {
+    pub lines: Vec<String>,
+    pub status: String,
+}
 
 impl Document {
     pub fn open(path: &Path) -> Result<Self> {
@@ -27,64 +32,55 @@ impl Document {
         Ok(Self::Editable(editable::EditableDocument::open(path)?))
     }
 
-    pub fn render_first_page_to<W: Write>(
-        &self,
-        writer: &mut W,
-        page_height: usize,
-        page_width: usize,
-    ) -> Result<()> {
+    pub fn render_first_page(&self, page_height: usize, page_width: usize) -> Result<DocumentRender> {
         let content_height = page_height.saturating_sub(1);
         let content_width = page_width.saturating_sub(LINE_NUMBER_WIDTH + 1);
 
         match self {
             Self::Editable(document) => {
                 let page = document.read_page(content_height, content_width)?;
-                for row in page.rows {
-                    write_line(
-                        writer,
-                        &format!(
+                let lines = page
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        format!(
                             "{:>width$} {}",
                             row.line_number,
                             row.text,
                             width = LINE_NUMBER_WIDTH
-                        ),
-                    )?;
-                }
-                write_footer(writer, page_width, "EDITOR")?;
+                        )
+                    })
+                    .collect();
+                let status = build_status(page_width, "EDITOR");
+                Ok(DocumentRender { lines, status })
             }
             Self::LargeFile(document) => {
                 let page = document.read_page(content_height, content_width)?;
-                for row in page.rows {
-                    write_line(
-                        writer,
-                        &format!(
+                let lines = page
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        format!(
                             "{:>width$} {}",
                             row.line_number,
                             row.text,
                             width = LINE_NUMBER_WIDTH
-                        ),
-                    )?;
-                }
+                        )
+                    })
+                    .collect();
                 let status = if page.next_byte_offset >= document.file_size_bytes {
                     "VIEWER END"
                 } else {
                     "VIEWER"
                 };
-                write_footer(writer, page_width, status)?;
+                let status = build_status(page_width, status);
+                Ok(DocumentRender { lines, status })
             }
         }
-        Ok(())
     }
 }
 
-fn write_footer<W: Write>(writer: &mut W, page_width: usize, label: &str) -> Result<()> {
+fn build_status(page_width: usize, label: &str) -> String {
     let width = page_width.max(label.len());
-    let footer = format!("{label}{}", "-".repeat(width.saturating_sub(label.len())));
-    write_line(writer, &footer)?;
-    Ok(())
-}
-
-fn write_line<W: Write>(writer: &mut W, line: &str) -> Result<()> {
-    write!(writer, "{line}\r\n")?;
-    Ok(())
+    format!("{label}{}", "-".repeat(width.saturating_sub(label.len())))
 }

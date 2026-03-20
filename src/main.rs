@@ -3,6 +3,7 @@ use std::{path::PathBuf, process::ExitCode};
 use clap::Parser;
 
 mod app;
+mod color;
 mod config;
 mod document;
 mod error;
