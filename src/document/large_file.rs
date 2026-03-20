@@ -4,10 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use crate::error::Result;
-
-// Cap each page read so a single very long line does not force unbounded work.
-const READ_WINDOW_BYTES: usize = 64 * 1024;
+use crate::{config, error::Result};
 
 pub struct LargeFileDocument {
     pub path: PathBuf,
@@ -44,7 +41,9 @@ impl LargeFileDocument {
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(self.viewport.byte_offset))?;
 
-        let mut buffer = vec![0; READ_WINDOW_BYTES];
+        // Cap each page read so a single very long line does not force unbounded work.
+        let read_window_bytes = config::large_file_read_window_bytes();
+        let mut buffer = vec![0; read_window_bytes];
         let bytes_read = file.read(&mut buffer)?;
         buffer.truncate(bytes_read);
 
@@ -82,7 +81,7 @@ impl LargeFileDocument {
             });
         }
 
-        let next_byte_offset = if saw_newline || bytes_read < READ_WINDOW_BYTES {
+        let next_byte_offset = if saw_newline || bytes_read < read_window_bytes {
             self.viewport.byte_offset + consumed_bytes
         } else {
             self.viewport.byte_offset + bytes_read as u64
