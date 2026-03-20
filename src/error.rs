@@ -1,7 +1,9 @@
 use std::io;
 
+#[derive(Debug)]
 pub enum AppError {
     Placeholder,
+    CommandFailed(String),
     Io(io::Error),
 }
 
