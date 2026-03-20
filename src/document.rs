@@ -40,12 +40,14 @@ impl Document {
             Self::Editable(document) => {
                 let page = document.read_page(content_height, content_width)?;
                 for row in page.rows {
-                    writeln!(
+                    write_line(
                         writer,
-                        "{:>width$} {}",
-                        row.line_number,
-                        row.text,
-                        width = LINE_NUMBER_WIDTH
+                        &format!(
+                            "{:>width$} {}",
+                            row.line_number,
+                            row.text,
+                            width = LINE_NUMBER_WIDTH
+                        ),
                     )?;
                 }
                 write_footer(writer, page_width, "EDITOR")?;
@@ -53,12 +55,14 @@ impl Document {
             Self::LargeFile(document) => {
                 let page = document.read_page(content_height, content_width)?;
                 for row in page.rows {
-                    writeln!(
+                    write_line(
                         writer,
-                        "{:>width$} {}",
-                        row.line_number,
-                        row.text,
-                        width = LINE_NUMBER_WIDTH
+                        &format!(
+                            "{:>width$} {}",
+                            row.line_number,
+                            row.text,
+                            width = LINE_NUMBER_WIDTH
+                        ),
                     )?;
                 }
                 let status = if page.next_byte_offset >= document.file_size_bytes {
@@ -76,6 +80,11 @@ impl Document {
 fn write_footer<W: Write>(writer: &mut W, page_width: usize, label: &str) -> Result<()> {
     let width = page_width.max(label.len());
     let footer = format!("{label}{}", "-".repeat(width.saturating_sub(label.len())));
-    writeln!(writer, "{footer}")?;
+    write_line(writer, &footer)?;
+    Ok(())
+}
+
+fn write_line<W: Write>(writer: &mut W, line: &str) -> Result<()> {
+    write!(writer, "{line}\r\n")?;
     Ok(())
 }
