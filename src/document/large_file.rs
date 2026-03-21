@@ -16,6 +16,12 @@ pub struct LargeFileViewport {
     pub byte_offset: u64,
     pub line_number: usize,
     pub left_column: usize,
+    pub line_number_origin: LineNumberOrigin,
+}
+
+pub enum LineNumberOrigin {
+    FromTop,
+    FromBottom,
 }
 
 pub struct LargeFilePage {
@@ -37,7 +43,82 @@ impl LargeFileDocument {
         }
     }
 
-    pub fn read_page(&self, page_height: usize, page_width: usize) -> Result<LargeFilePage> {
+    pub fn read_page(
+        &self,
+        start_row: usize,
+        page_height: usize,
+        page_width: usize,
+    ) -> Result<LargeFilePage> {
+        let window = self.read_window(page_width)?;
+        let total_rows = window.rows.len();
+        let effective_start_row = if total_rows == 0 {
+            0
+        } else {
+            start_row.min(total_rows.saturating_sub(page_height.max(1)))
+        };
+        let rows = window
+            .rows
+            .into_iter()
+            .enumerate()
+            .skip(effective_start_row)
+            .take(page_height)
+            .map(|(index, row)| LargeFileRow {
+                line_number: match self.viewport.line_number_origin {
+                    LineNumberOrigin::FromTop => row.line_number,
+                    LineNumberOrigin::FromBottom => total_rows.saturating_sub(index),
+                },
+                text: row.text,
+            })
+            .collect();
+
+        Ok(LargeFilePage {
+            rows,
+            next_byte_offset: window.next_byte_offset,
+        })
+    }
+
+    pub fn jump_to_top(&mut self) {
+        self.viewport.byte_offset = 0;
+        self.viewport.line_number = 1;
+        self.viewport.left_column = 0;
+        self.viewport.line_number_origin = LineNumberOrigin::FromTop;
+    }
+
+    pub fn jump_to_bottom(&mut self, page_height: usize, page_width: usize) -> Result<usize> {
+        self.viewport.byte_offset = self
+            .file_size_bytes
+            .saturating_sub(config::large_file_read_window_bytes() as u64);
+        self.viewport.left_column = 0;
+        self.viewport.line_number_origin = LineNumberOrigin::FromBottom;
+
+        let window = self.read_window(page_width)?;
+        Ok(window.rows.len().saturating_sub(page_height.max(1)))
+    }
+}
+
+impl LargeFileViewport {
+    pub fn new() -> Self {
+        Self {
+            byte_offset: 0,
+            line_number: 1,
+            left_column: 0,
+            line_number_origin: LineNumberOrigin::FromTop,
+        }
+    }
+}
+
+struct LargeFileReadWindow {
+    rows: Vec<LargeFileWindowRow>,
+    next_byte_offset: u64,
+}
+
+struct LargeFileWindowRow {
+    line_number: usize,
+    text: String,
+}
+
+impl LargeFileDocument {
+    fn read_window(&self, page_width: usize) -> Result<LargeFileReadWindow> {
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(self.viewport.byte_offset))?;
 
@@ -48,7 +129,7 @@ impl LargeFileDocument {
         buffer.truncate(bytes_read);
 
         let chunk = String::from_utf8_lossy(&buffer);
-        let mut rows = Vec::with_capacity(page_height);
+        let mut rows = Vec::new();
         let mut line_number = self.viewport.line_number;
         let mut consumed_bytes = 0u64;
         let mut saw_newline = false;
@@ -60,13 +141,10 @@ impl LargeFileDocument {
             saw_newline |= had_newline;
 
             for piece in wrap_visible_segments(line, self.viewport.left_column, page_width) {
-                rows.push(LargeFileRow { line_number, text: piece });
-                if rows.len() >= page_height {
-                    return Ok(LargeFilePage {
-                        rows,
-                        next_byte_offset: self.viewport.byte_offset + consumed_bytes,
-                    });
-                }
+                rows.push(LargeFileWindowRow {
+                    line_number,
+                    text: piece,
+                });
             }
 
             if had_newline {
@@ -75,7 +153,7 @@ impl LargeFileDocument {
         }
 
         if rows.is_empty() {
-            rows.push(LargeFileRow {
+            rows.push(LargeFileWindowRow {
                 line_number,
                 text: String::new(),
             });
@@ -87,20 +165,10 @@ impl LargeFileDocument {
             self.viewport.byte_offset + bytes_read as u64
         };
 
-        Ok(LargeFilePage {
+        Ok(LargeFileReadWindow {
             rows,
             next_byte_offset,
         })
-    }
-}
-
-impl LargeFileViewport {
-    pub fn new() -> Self {
-        Self {
-            byte_offset: 0,
-            line_number: 1,
-            left_column: 0,
-        }
     }
 }
 

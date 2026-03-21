@@ -372,6 +372,7 @@ dependencies = [
  "ropey",
  "serde",
  "serde_json",
+ "signal-hook",
  "walkdir",
 ]
 
