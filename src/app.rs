@@ -14,10 +14,10 @@ use crossterm::{
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Position, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 use signal_hook::{consts::signal::SIGTSTP, flag, low_level};
 
@@ -40,8 +40,40 @@ pub struct App {
     pub shell: ShellState,
     pub cursor: CursorState,
     pub viewport_row: usize,
-    pub pending_g: bool,
+    pub pending_normal_action: Option<PendingNormalAction>,
     pub pending_insert_j: Option<Instant>,
+    pub last_replayable_action: Option<ReplayableAction>,
+    pub go_input: GoInputState,
+    pub yank_buffer: YankBuffer,
+}
+
+#[derive(Clone, Copy)]
+pub enum ReplayableAction {
+    NextGitHunk,
+    PreviousGitHunk,
+}
+
+#[derive(Clone, Copy)]
+pub enum PendingNormalAction {
+    GoPrefix,
+    Find(FindKind),
+    Operator(PendingOperator),
+    OperatorFind(PendingOperator, FindKind),
+}
+
+#[derive(Clone, Copy)]
+pub enum PendingOperator {
+    Change,
+    Delete,
+    Yank,
+}
+
+#[derive(Clone, Copy)]
+pub enum FindKind {
+    Forward,
+    Backward,
+    TillForward,
+    TillBackward,
 }
 
 pub struct Workspace {
@@ -68,6 +100,17 @@ pub struct CursorState {
     pub column: usize,
 }
 
+pub struct GoInputState {
+    pub active: bool,
+    pub value: String,
+}
+
+pub enum YankBuffer {
+    Empty,
+    Charwise(String),
+    Linewise(String),
+}
+
 impl App {
     pub fn open(path: &Path) -> Result<Self> {
         let document = Document::open(path)?;
@@ -91,8 +134,14 @@ impl App {
             },
             cursor: CursorState { row: 0, column: 0 },
             viewport_row: 0,
-            pending_g: false,
+            pending_normal_action: None,
             pending_insert_j: None,
+            last_replayable_action: None,
+            go_input: GoInputState {
+                active: false,
+                value: String::new(),
+            },
+            yank_buffer: YankBuffer::Empty,
         };
         app.refresh_picker_candidates()?;
         Ok(app)
@@ -140,9 +189,9 @@ impl App {
     fn render_frame(&self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
         terminal.draw(|frame| {
             let area = frame.area();
-            let render = self
-                .workspace
-                .current_document()
+            let document = self.workspace.current_document();
+            let indent_width = document.indent_width();
+            let render = document
                 .render_first_page(self.viewport_row, area.height as usize, area.width as usize)
                 .expect("document render should succeed during draw");
 
@@ -154,12 +203,7 @@ impl App {
 
             let background = Block::default().style(Style::default().bg(AppColors::BACKGROUND));
             let content = Paragraph::new(
-                render
-                    .lines
-                    .iter()
-                    .map(format_render_line)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+                format_render_lines(&render.lines, indent_width),
             )
             .style(
                 Style::default()
@@ -174,7 +218,25 @@ impl App {
             frame.render_widget(content, layout[0]);
             frame.render_widget(footer, layout[1]);
 
-            let cursor_position = self.cursor_position(&render, layout[0]);
+            if self.go_input.active {
+                let popup = centered_rect(24, 3, area);
+                let input = Paragraph::new(format!("Go: {}", self.go_input.value))
+                    .block(
+                        Block::default()
+                            .title(" Go ")
+                            .borders(Borders::ALL)
+                            .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
+                    )
+                    .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
+                frame.render_widget(Clear, popup);
+                frame.render_widget(input, popup);
+            }
+
+            let cursor_position = if self.go_input.active {
+                self.go_input_cursor_position(area)
+            } else {
+                self.cursor_position(&render, layout[0])
+            };
             frame.set_cursor_position(cursor_position);
         })?;
         Ok(())
@@ -188,6 +250,10 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key_event: KeyEvent) -> Result<bool> {
+        if self.go_input.active {
+            return self.handle_go_input_key(key_event);
+        }
+
         match self.mode {
             Mode::Normal => self.handle_normal_mode_key(key_event),
             Mode::Insert => self.handle_insert_mode_key(key_event),
@@ -208,12 +274,15 @@ impl App {
             return Ok(true);
         }
 
-        if self.pending_g {
-            self.pending_g = false;
-            if matches!(key_event.code, KeyCode::Char('g')) {
-                self.jump_to_top();
-                return Ok(false);
-            }
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('g'))
+        {
+            self.open_go_input();
+            return Ok(false);
+        }
+
+        if let Some(pending_action) = self.pending_normal_action.take() {
+            return self.handle_pending_normal_action(pending_action, key_event);
         }
 
         match key_event.code {
@@ -238,12 +307,24 @@ impl App {
                 self.page_down_half();
                 Ok(false)
             }
+            KeyCode::Char('d') => {
+                self.pending_normal_action = Some(PendingNormalAction::Operator(PendingOperator::Delete));
+                Ok(false)
+            }
             KeyCode::Char('f') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.page_down_full();
                 Ok(false)
             }
+            KeyCode::Char('f') => {
+                self.pending_normal_action = Some(PendingNormalAction::Find(FindKind::Forward));
+                Ok(false)
+            }
+            KeyCode::Char('F') => {
+                self.pending_normal_action = Some(PendingNormalAction::Find(FindKind::Backward));
+                Ok(false)
+            }
             KeyCode::Char('g') => {
-                self.pending_g = true;
+                self.pending_normal_action = Some(PendingNormalAction::GoPrefix);
                 Ok(false)
             }
             KeyCode::Char('h') => {
@@ -267,18 +348,140 @@ impl App {
                 self.move_cursor_right();
                 Ok(false)
             }
+            KeyCode::Char('c') => {
+                self.pending_normal_action = Some(PendingNormalAction::Operator(PendingOperator::Change));
+                Ok(false)
+            }
+            KeyCode::Char('o') => {
+                self.open_line_below();
+                Ok(false)
+            }
+            KeyCode::Char('p') => {
+                self.paste_after_cursor()?;
+                Ok(false)
+            }
+            KeyCode::Char('r') => {
+                self.replay_last_action()?;
+                Ok(false)
+            }
+            KeyCode::Char('t') => {
+                self.pending_normal_action = Some(PendingNormalAction::Find(FindKind::TillForward));
+                Ok(false)
+            }
+            KeyCode::Char('T') => {
+                self.pending_normal_action = Some(PendingNormalAction::Find(FindKind::TillBackward));
+                Ok(false)
+            }
+            KeyCode::Char('y') => {
+                self.pending_normal_action = Some(PendingNormalAction::Operator(PendingOperator::Yank));
+                Ok(false)
+            }
             KeyCode::Char('u') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.page_up_half();
                 Ok(false)
             }
-            KeyCode::Char('G') => {
-                self.jump_to_bottom();
+            _ => Ok(false),
+        }
+    }
+
+    fn handle_pending_normal_action(
+        &mut self,
+        pending_action: PendingNormalAction,
+        key_event: KeyEvent,
+    ) -> Result<bool> {
+        match pending_action {
+            PendingNormalAction::GoPrefix => match key_event.code {
+                KeyCode::Char('t') => {
+                    self.jump_to_top();
+                    Ok(false)
+                }
+                KeyCode::Char('T') => {
+                    self.jump_to_bottom();
+                    Ok(false)
+                }
+                KeyCode::Char('g') => {
+                    self.jump_to_next_git_marker();
+                    self.last_replayable_action = Some(ReplayableAction::NextGitHunk);
+                    Ok(false)
+                }
+                KeyCode::Char('G') => {
+                    self.jump_to_previous_git_marker();
+                    self.last_replayable_action = Some(ReplayableAction::PreviousGitHunk);
+                    Ok(false)
+                }
+                _ => Ok(false),
+            },
+            PendingNormalAction::Find(find_kind) => match key_event.code {
+                KeyCode::Char(target) => {
+                    self.run_find_motion(find_kind, target)?;
+                    Ok(false)
+                }
+                _ => Ok(false),
+            },
+            PendingNormalAction::Operator(operator) => match key_event.code {
+                KeyCode::Char('c') if matches!(operator, PendingOperator::Change) => {
+                    self.change_current_line()?;
+                    Ok(false)
+                }
+                KeyCode::Char('d') if matches!(operator, PendingOperator::Delete) => {
+                    self.delete_current_line()?;
+                    Ok(false)
+                }
+                KeyCode::Char('f') => {
+                    self.pending_normal_action =
+                        Some(PendingNormalAction::OperatorFind(operator, FindKind::Forward));
+                    Ok(false)
+                }
+                KeyCode::Char('F') => {
+                    self.pending_normal_action =
+                        Some(PendingNormalAction::OperatorFind(operator, FindKind::Backward));
+                    Ok(false)
+                }
+                KeyCode::Char('t') => {
+                    self.pending_normal_action =
+                        Some(PendingNormalAction::OperatorFind(operator, FindKind::TillForward));
+                    Ok(false)
+                }
+                KeyCode::Char('T') => {
+                    self.pending_normal_action =
+                        Some(PendingNormalAction::OperatorFind(operator, FindKind::TillBackward));
+                    Ok(false)
+                }
+                KeyCode::Char('y') if matches!(operator, PendingOperator::Yank) => {
+                    self.yank_current_line()?;
+                    Ok(false)
+                }
+                _ => Ok(false),
+            },
+            PendingNormalAction::OperatorFind(operator, find_kind) => match key_event.code {
+                KeyCode::Char(target) => {
+                    self.run_operator_find(operator, find_kind, target)?;
+                    Ok(false)
+                }
+                _ => Ok(false),
+            },
+        }
+    }
+
+    fn handle_go_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
+        match key_event.code {
+            KeyCode::Esc => {
+                self.close_go_input();
                 Ok(false)
             }
-            _ => {
-                self.pending_g = false;
+            KeyCode::Enter => {
+                self.submit_go_input()?;
                 Ok(false)
             }
+            KeyCode::Backspace => {
+                self.go_input.value.pop();
+                Ok(false)
+            }
+            KeyCode::Char(ch) if ch.is_ascii_digit() => {
+                self.go_input.value.push(ch);
+                Ok(false)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -287,13 +490,29 @@ impl App {
             && matches!(key_event.code, KeyCode::Char('s'))
         {
             self.save_current_document()?;
-            self.leave_insert_mode();
+            self.leave_insert_mode(true);
+            return Ok(false);
+        }
+
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('h'))
+        {
+            self.backspace_char();
+            self.pending_insert_j = None;
+            return Ok(false);
+        }
+
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('d'))
+        {
+            self.delete_forward_char();
+            self.pending_insert_j = None;
             return Ok(false);
         }
 
         match key_event.code {
             KeyCode::Esc => {
-                self.leave_insert_mode();
+                self.leave_insert_mode(true);
                 Ok(false)
             }
             KeyCode::Char('j') => {
@@ -303,7 +522,7 @@ impl App {
                     .is_some_and(|previous| now.duration_since(previous) <= insert_escape_timeout())
                 {
                     self.backspace_char();
-                    self.leave_insert_mode();
+                    self.leave_insert_mode(false);
                 } else {
                     self.insert_char('j');
                     self.pending_insert_j = Some(now);
@@ -321,7 +540,7 @@ impl App {
                 Ok(false)
             }
             KeyCode::Tab => {
-                self.insert_char('\t');
+                self.insert_tab();
                 self.pending_insert_j = None;
                 Ok(false)
             }
@@ -335,6 +554,300 @@ impl App {
                 Ok(false)
             }
         }
+    }
+
+    fn run_find_motion(&mut self, find_kind: FindKind, target: char) -> Result<()> {
+        let Some(found_column) = self.find_target_column(find_kind, target)? else {
+            return Ok(());
+        };
+
+        self.cursor.column = motion_destination_column(find_kind, found_column);
+        Ok(())
+    }
+
+    fn run_operator_find(
+        &mut self,
+        operator: PendingOperator,
+        find_kind: FindKind,
+        target: char,
+    ) -> Result<()> {
+        let Some(found_column) = self.find_target_column(find_kind, target)? else {
+            return Ok(());
+        };
+
+        let Some((start_column, end_column)) =
+            operator_range(self.cursor.column, found_column, find_kind)
+        else {
+            return Ok(());
+        };
+
+        if matches!(operator, PendingOperator::Yank) {
+            return self.yank_range(start_column, end_column);
+        }
+
+        let Ok((width, _)) = terminal::size() else {
+            return Ok(());
+        };
+
+        let Some((row, column)) = self.workspace.current_document_mut().remove_display_range(
+            self.cursor.row,
+            start_column,
+            end_column,
+            width as usize,
+        ) else {
+            return Ok(());
+        };
+
+        self.cursor.row = row;
+        self.cursor.column = column;
+        self.clamp_vertical_state();
+
+        if matches!(operator, PendingOperator::Change) {
+            self.mode = Mode::Insert;
+            self.pending_insert_j = None;
+        }
+
+        Ok(())
+    }
+
+    fn yank_range(&mut self, start_column: usize, end_column: usize) -> Result<()> {
+        let Ok((width, _)) = terminal::size() else {
+            return Ok(());
+        };
+
+        let line_text = self
+            .workspace
+            .current_document()
+            .display_line_text(self.cursor.row, width as usize)?;
+        let char_count = line_text.chars().count();
+        let start_column = start_column.min(char_count);
+        let end_column = end_column.min(char_count);
+
+        self.yank_buffer = YankBuffer::Charwise(
+            line_text
+                .chars()
+                .skip(start_column)
+                .take(end_column.saturating_sub(start_column))
+                .collect(),
+        );
+        Ok(())
+    }
+
+    fn find_target_column(&self, find_kind: FindKind, target: char) -> Result<Option<usize>> {
+        let Ok((width, _)) = terminal::size() else {
+            return Ok(None);
+        };
+
+        let line_text = self
+            .workspace
+            .current_document()
+            .display_line_text(self.cursor.row, width as usize)?;
+        let line_chars: Vec<char> = line_text.chars().collect();
+        let cursor_column = self.cursor.column.min(line_chars.len());
+
+        let found = match find_kind {
+            FindKind::Forward | FindKind::TillForward => (cursor_column.saturating_add(1)
+                ..line_chars.len())
+                .find(|index| line_chars[*index] == target),
+            FindKind::Backward | FindKind::TillBackward => {
+                (0..cursor_column).rev().find(|index| line_chars[*index] == target)
+            }
+        };
+
+        Ok(found)
+    }
+
+    fn replay_last_action(&mut self) -> Result<()> {
+        let Some(action) = self.last_replayable_action else {
+            return Ok(());
+        };
+
+        match action {
+            ReplayableAction::NextGitHunk => self.jump_to_next_git_marker(),
+            ReplayableAction::PreviousGitHunk => self.jump_to_previous_git_marker(),
+        }
+
+        Ok(())
+    }
+
+    fn paste_after_cursor(&mut self) -> Result<()> {
+        match self.yank_buffer_clone() {
+            YankBuffer::Empty => {}
+            YankBuffer::Charwise(yank_text) => {
+                let Ok((width, _)) = terminal::size() else {
+                    return Ok(());
+                };
+
+                let line_width = self
+                    .workspace
+                    .current_document()
+                    .display_line_width(self.cursor.row, width as usize)?;
+                let insertion_column = self.cursor.column.min(line_width);
+                self.insert_text_at(self.cursor.row, insertion_column, &yank_text);
+            }
+            YankBuffer::Linewise(line_text) => {
+                self.open_line_below_with_text(&line_text);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn insert_text_at(&mut self, mut row: usize, mut column: usize, text: &str) {
+        let Ok((width, _)) = terminal::size() else {
+            return;
+        };
+
+        for ch in text.chars() {
+            let next_position = if ch == '\n' {
+                self.workspace
+                    .current_document_mut()
+                    .insert_newline(row, column, width as usize)
+            } else {
+                self.workspace
+                    .current_document_mut()
+                    .insert_char(row, column, width as usize, ch)
+            };
+
+            let Some((next_row, next_column)) = next_position else {
+                return;
+            };
+            row = next_row;
+            column = next_column;
+        }
+
+        self.cursor.row = row;
+        self.cursor.column = column;
+        self.clamp_vertical_state();
+    }
+
+    fn open_line_below(&mut self) {
+        let Ok((width, _)) = terminal::size() else {
+            return;
+        };
+
+        if let Some((row, column)) = self
+            .workspace
+            .current_document_mut()
+            .open_below(self.cursor.row, width as usize)
+        {
+            self.cursor.row = row;
+            self.cursor.column = column;
+            self.mode = Mode::Insert;
+            self.pending_insert_j = None;
+            self.clamp_vertical_state();
+        }
+    }
+
+    fn open_line_below_with_text(&mut self, text: &str) {
+        let Ok((width, _)) = terminal::size() else {
+            return;
+        };
+
+        if let Some((row, column)) = self
+            .workspace
+            .current_document_mut()
+            .open_below(self.cursor.row, width as usize)
+        {
+            self.cursor.row = row;
+            self.cursor.column = column;
+            self.insert_text_at(row, column, text);
+        }
+    }
+
+    fn yank_current_line(&mut self) -> Result<()> {
+        let Ok((width, _)) = terminal::size() else {
+            return Ok(());
+        };
+
+        if let Some(line_text) = self
+            .workspace
+            .current_document()
+            .current_line_text(self.cursor.row, width as usize)
+        {
+            self.yank_buffer = YankBuffer::Linewise(line_text);
+        }
+
+        Ok(())
+    }
+
+    fn delete_current_line(&mut self) -> Result<()> {
+        let Ok((width, _)) = terminal::size() else {
+            return Ok(());
+        };
+
+        if let Some((line_text, (row, column))) = self
+            .workspace
+            .current_document_mut()
+            .delete_current_line(self.cursor.row, width as usize)
+        {
+            self.yank_buffer = YankBuffer::Linewise(line_text);
+            self.cursor.row = row;
+            self.cursor.column = column;
+            self.clamp_vertical_state();
+        }
+
+        Ok(())
+    }
+
+    fn change_current_line(&mut self) -> Result<()> {
+        let Ok((width, _)) = terminal::size() else {
+            return Ok(());
+        };
+
+        if let Some((line_text, (row, column))) = self
+            .workspace
+            .current_document_mut()
+            .clear_current_line(self.cursor.row, width as usize)
+        {
+            self.yank_buffer = YankBuffer::Linewise(line_text);
+            self.cursor.row = row;
+            self.cursor.column = column;
+            self.mode = Mode::Insert;
+            self.pending_insert_j = None;
+            self.clamp_vertical_state();
+        }
+
+        Ok(())
+    }
+
+    fn yank_buffer_clone(&self) -> YankBuffer {
+        match &self.yank_buffer {
+            YankBuffer::Empty => YankBuffer::Empty,
+            YankBuffer::Charwise(text) => YankBuffer::Charwise(text.clone()),
+            YankBuffer::Linewise(text) => YankBuffer::Linewise(text.clone()),
+        }
+    }
+
+    fn open_go_input(&mut self) {
+        self.go_input.active = true;
+        self.go_input.value.clear();
+    }
+
+    fn close_go_input(&mut self) {
+        self.go_input.active = false;
+        self.go_input.value.clear();
+    }
+
+    fn submit_go_input(&mut self) -> Result<()> {
+        let Ok((width, _)) = terminal::size() else {
+            self.close_go_input();
+            return Ok(());
+        };
+
+        if let Ok(line_number) = self.go_input.value.parse::<usize>() {
+            if let Some(row) = self
+                .workspace
+                .current_document()
+                .jump_row_for_line_number(line_number, width as usize)
+            {
+                self.cursor.column = 0;
+                self.jump_with_context(row, width as usize);
+            }
+        }
+
+        self.close_go_input();
+        Ok(())
     }
 
     fn footer_color(&self) -> ratatui::style::Color {
@@ -366,7 +879,7 @@ impl App {
         &self,
         render: &crate::document::DocumentRender,
         area: ratatui::layout::Rect,
-    ) -> ratatui::layout::Position {
+    ) -> Position {
         let relative_row = self.cursor.row.saturating_sub(self.viewport_row);
         let line_index = relative_row.min(render.lines.len().saturating_sub(1));
         let line = &render.lines[line_index];
@@ -376,7 +889,15 @@ impl App {
         let x = area.x.saturating_add(11).saturating_add(column as u16);
         let y = area.y.saturating_add(line_index as u16);
 
-        ratatui::layout::Position::new(x, y)
+        Position::new(x, y)
+    }
+
+    fn go_input_cursor_position(&self, area: Rect) -> Position {
+        let popup = centered_rect(24, 3, area);
+        Position::new(
+            popup.x.saturating_add(5 + self.go_input.value.chars().count() as u16),
+            popup.y.saturating_add(1),
+        )
     }
 
     fn move_cursor_up(&mut self) {
@@ -394,7 +915,23 @@ impl App {
     }
 
     fn move_cursor_right(&mut self) {
-        self.cursor.column = self.cursor.column.saturating_add(1);
+        let Ok((width, _)) = terminal::size() else {
+            return;
+        };
+
+        let Ok(line_width) = self
+            .workspace
+            .current_document()
+            .display_line_width(self.cursor.row, width as usize)
+        else {
+            return;
+        };
+
+        self.cursor.column = self
+            .cursor
+            .column
+            .saturating_add(1)
+            .min(line_width);
     }
 
     fn page_down_half(&mut self) {
@@ -511,15 +1048,61 @@ impl App {
         self.viewport_row = total_rows.saturating_sub(visible_height);
     }
 
-    fn leave_insert_mode(&mut self) {
+    fn jump_to_next_git_marker(&mut self) {
+        let Ok((width, _)) = terminal::size() else {
+            return;
+        };
+
+        if let Some(row) = self
+            .workspace
+            .current_document()
+            .next_git_marker_row(self.cursor.row, width as usize)
+        {
+            self.jump_with_context(row, width as usize);
+        }
+    }
+
+    fn jump_to_previous_git_marker(&mut self) {
+        let Ok((width, _)) = terminal::size() else {
+            return;
+        };
+
+        if let Some(row) = self
+            .workspace
+            .current_document()
+            .previous_git_marker_row(self.cursor.row, width as usize)
+        {
+            self.jump_with_context(row, width as usize);
+        }
+    }
+
+    fn jump_with_context(&mut self, target_row: usize, page_width: usize) {
+        let visible_height = self.page_step();
+
+        self.cursor.row = target_row;
+        self.viewport_row = target_row.saturating_sub(1);
+
+        if let Some(total_rows) = self.workspace.current_document().total_rows(page_width) {
+            self.cursor.row = self.cursor.row.min(total_rows.saturating_sub(1));
+            self.viewport_row = self
+                .viewport_row
+                .min(total_rows.saturating_sub(visible_height));
+        }
+
+        self.clamp_to_document_bounds();
+    }
+
+    fn leave_insert_mode(&mut self, rewind_cursor: bool) {
         self.mode = Mode::Normal;
         self.pending_insert_j = None;
-        self.cursor.column = self.cursor.column.saturating_sub(1);
+        if rewind_cursor {
+            self.cursor.column = self.cursor.column.saturating_sub(1);
+        }
     }
 
     fn save_current_document(&mut self) -> Result<()> {
         let path = self.workspace.current_document_path().to_path_buf();
-        self.workspace.current_document().save(&path)
+        self.workspace.current_document_mut().save(&path)
     }
 
     fn insert_char(&mut self, ch: char) {
@@ -555,12 +1138,44 @@ impl App {
         }
     }
 
+    fn insert_tab(&mut self) {
+        let Ok((width, _)) = terminal::size() else {
+            return;
+        };
+
+        if let Some((row, column)) = self.workspace.current_document_mut().insert_tab(
+            self.cursor.row,
+            self.cursor.column,
+            width as usize,
+        ) {
+            self.cursor.row = row;
+            self.cursor.column = column;
+            self.clamp_vertical_state();
+        }
+    }
+
     fn backspace_char(&mut self) {
         let Ok((width, _)) = terminal::size() else {
             return;
         };
 
         if let Some((row, column)) = self.workspace.current_document_mut().backspace(
+            self.cursor.row,
+            self.cursor.column,
+            width as usize,
+        ) {
+            self.cursor.row = row;
+            self.cursor.column = column;
+            self.clamp_vertical_state();
+        }
+    }
+
+    fn delete_forward_char(&mut self) {
+        let Ok((width, _)) = terminal::size() else {
+            return;
+        };
+
+        if let Some((row, column)) = self.workspace.current_document_mut().delete_forward(
             self.cursor.row,
             self.cursor.column,
             width as usize,
@@ -689,15 +1304,106 @@ fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn format_render_line(line: &crate::document::DocumentRenderLine) -> String {
-    format!(
-        "{diag:>1} {line_number:>6} {gutter:>1} {text}",
-        diag = line.diagnostic_marker,
-        line_number = line.line_number,
-        gutter = line.gutter_marker,
-        text = line.text,
-    )
+fn format_render_lines(
+    lines: &[crate::document::DocumentRenderLine],
+    indent_width: usize,
+) -> Vec<Line<'static>> {
+    let mut formatted_lines = Vec::with_capacity(lines.len());
+    let mut previous_guide_width = 0usize;
+
+    for line in lines {
+        let current_guide_width = if line.text.is_empty() {
+            previous_guide_width
+        } else {
+            line.text.chars().take_while(|ch| *ch == ' ').count()
+        };
+
+        formatted_lines.push(format_render_line(
+            line,
+            indent_width,
+            current_guide_width,
+        ));
+        previous_guide_width = current_guide_width;
+    }
+
+    formatted_lines
 }
+
+fn format_render_line(
+    line: &crate::document::DocumentRenderLine,
+    indent_width: usize,
+    empty_line_guide_width: usize,
+) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(
+            format!("{:>1}", line.diagnostic_marker),
+            Style::default().fg(AppColors::MUTED),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:>6}", line.line_number),
+            Style::default().fg(AppColors::MUTED),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:>1}", line.gutter_marker),
+            Style::default().fg(git_gutter_color(&line.gutter_marker)),
+        ),
+        Span::raw(" "),
+    ];
+    spans.extend(render_text_with_indent_guides(
+        &line.text,
+        indent_width,
+        empty_line_guide_width,
+    ));
+    Line::from(spans)
+}
+
+fn render_text_with_indent_guides(
+    text: &str,
+    indent_width: usize,
+    empty_line_guide_width: usize,
+) -> Vec<Span<'static>> {
+    let leading_spaces = text.chars().take_while(|ch| *ch == ' ').count();
+    let guide_width = indent_width.max(1);
+
+    if leading_spaces == 0 && empty_line_guide_width == 0 {
+        return vec![Span::styled(
+            text.to_owned(),
+            Style::default().fg(AppColors::FOREGROUND),
+        )];
+    }
+
+    let mut spans = Vec::new();
+    let visual_indent_width = if leading_spaces == 0 {
+        empty_line_guide_width
+    } else {
+        leading_spaces
+    };
+    let guide_count = visual_indent_width / guide_width;
+    let trailing_spaces = visual_indent_width % guide_width;
+
+    for _ in 0..guide_count {
+        spans.push(Span::styled(
+            format!("\u{2502}{}", " ".repeat(guide_width.saturating_sub(1))),
+            Style::default().fg(AppColors::INDENT_GUIDE),
+        ));
+    }
+
+    if trailing_spaces > 0 {
+        spans.push(Span::raw(" ".repeat(trailing_spaces)));
+    }
+
+    if !text.is_empty() {
+        spans.push(Span::styled(
+            text.chars().skip(leading_spaces).collect::<String>(),
+            Style::default().fg(AppColors::FOREGROUND),
+        ));
+    }
+
+    spans
+}
+
 
 fn powerline_segment(
     text: String,
@@ -708,6 +1414,15 @@ fn powerline_segment(
         format!(" {text} "),
         Style::default().fg(foreground).bg(background),
     )
+}
+
+fn git_gutter_color(marker: &str) -> ratatui::style::Color {
+    match marker {
+        "A" => AppColors::GIT_ADDED,
+        "M" => AppColors::GIT_MODIFIED,
+        "D" => AppColors::GIT_REMOVED,
+        _ => AppColors::MUTED,
+    }
 }
 
 fn powerline_separator_left(
@@ -731,6 +1446,35 @@ fn powerline_separator_right(foreground: ratatui::style::Color) -> Span<'static>
 
 fn insert_escape_timeout() -> Duration {
     Duration::from_millis(300)
+}
+
+fn motion_destination_column(find_kind: FindKind, found_column: usize) -> usize {
+    match find_kind {
+        FindKind::Forward | FindKind::Backward => found_column,
+        FindKind::TillForward => found_column.saturating_sub(1),
+        FindKind::TillBackward => found_column.saturating_add(1),
+    }
+}
+
+fn operator_range(
+    cursor_column: usize,
+    found_column: usize,
+    find_kind: FindKind,
+) -> Option<(usize, usize)> {
+    let (start_column, end_column) = match find_kind {
+        FindKind::Forward => (cursor_column, found_column.saturating_add(1)),
+        FindKind::TillForward => (cursor_column, found_column),
+        FindKind::Backward => (found_column, cursor_column.saturating_add(1)),
+        FindKind::TillBackward => (found_column.saturating_add(1), cursor_column.saturating_add(1)),
+    };
+
+    (end_column > start_column).then_some((start_column, end_column))
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+    let y = area.y.saturating_add(area.height.saturating_sub(height) / 2);
+    Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
 #[allow(dead_code)]
