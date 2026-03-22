@@ -16,6 +16,23 @@ pub struct EditableDocument {
     pub indent_width: usize,
     pub use_hard_tabs: bool,
     pub git_gutter_markers: HashMap<usize, char>,
+    pub diagnostics: HashMap<usize, DiagnosticSeverity>,
+    pub undo_stack: Vec<Rope>,
+    pub redo_stack: Vec<Rope>,
+    pub undo_group_active: bool,
+    pub undo_group_snapshot_taken: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Default)]
+pub struct DiagnosticSummary {
+    pub warnings: usize,
+    pub errors: usize,
 }
 
 impl EditableDocument {
@@ -27,8 +44,23 @@ impl EditableDocument {
             indent_width: detect_indent_width(&rope),
             use_hard_tabs: uses_hard_tabs(path),
             git_gutter_markers: load_git_gutter_markers(path),
+            diagnostics: HashMap::new(),
             rope,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            undo_group_active: false,
+            undo_group_snapshot_taken: false,
         })
+    }
+
+    pub fn begin_undo_group(&mut self) {
+        self.undo_group_active = true;
+        self.undo_group_snapshot_taken = false;
+    }
+
+    pub fn end_undo_group(&mut self) {
+        self.undo_group_active = false;
+        self.undo_group_snapshot_taken = false;
     }
 
     pub fn read_page(
@@ -102,6 +134,66 @@ impl EditableDocument {
         self.git_gutter_markers.get(&line_number).copied()
     }
 
+    pub fn diagnostic_marker(&self, line_number: usize) -> Option<DiagnosticSeverity> {
+        self.diagnostics.get(&line_number).copied()
+    }
+
+    pub fn next_diagnostic_row(
+        &self,
+        current_row: usize,
+        page_width: usize,
+        error_only: bool,
+    ) -> Option<usize> {
+        let current_line_number = self.line_number_for_display_row(current_row, page_width);
+        let mut line_numbers: Vec<usize> = self
+            .diagnostics
+            .iter()
+            .filter(|(_, severity)| !error_only || **severity == DiagnosticSeverity::Error)
+            .map(|(line_number, _)| *line_number)
+            .collect();
+        line_numbers.sort_unstable();
+        line_numbers
+            .into_iter()
+            .find(|line_number| *line_number > current_line_number)
+            .map(|line_number| self.display_row_for_line_number(line_number, page_width))
+    }
+
+    pub fn previous_diagnostic_row(
+        &self,
+        current_row: usize,
+        page_width: usize,
+        error_only: bool,
+    ) -> Option<usize> {
+        let current_line_number = self.line_number_for_display_row(current_row, page_width);
+        let mut line_numbers: Vec<usize> = self
+            .diagnostics
+            .iter()
+            .filter(|(_, severity)| !error_only || **severity == DiagnosticSeverity::Error)
+            .map(|(line_number, _)| *line_number)
+            .collect();
+        line_numbers.sort_unstable();
+        line_numbers
+            .into_iter()
+            .rev()
+            .find(|line_number| *line_number < current_line_number)
+            .map(|line_number| self.display_row_for_line_number(line_number, page_width))
+    }
+
+    pub fn set_diagnostics(&mut self, diagnostics: HashMap<usize, DiagnosticSeverity>) {
+        self.diagnostics = diagnostics;
+    }
+
+    pub fn diagnostic_summary(&self) -> DiagnosticSummary {
+        let mut summary = DiagnosticSummary::default();
+        for severity in self.diagnostics.values() {
+            match severity {
+                DiagnosticSeverity::Warning => summary.warnings += 1,
+                DiagnosticSeverity::Error => summary.errors += 1,
+            }
+        }
+        summary
+    }
+
     pub fn next_git_marker_row(&self, current_row: usize, page_width: usize) -> Option<usize> {
         let current_line_number = self.line_number_for_display_row(current_row, page_width);
         self.git_hunk_start_lines()
@@ -147,6 +239,83 @@ impl EditableDocument {
         Some(self.display_row_for_line_number(line_number, page_width.max(1)))
     }
 
+    pub fn first_match_row(&self, query: &str, page_width: usize) -> Option<usize> {
+        self.first_match_position(query, page_width).map(|(row, _)| row)
+    }
+
+    pub fn first_match_position(&self, query: &str, page_width: usize) -> Option<(usize, usize)> {
+        if query.is_empty() {
+            return None;
+        }
+
+        for (line_index, line) in self.rope.lines().enumerate() {
+            let text = line.to_string();
+            let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
+            if let Some(column) = trimmed.find(query) {
+                return Some((
+                    self.display_row_for_line_number(line_index + 1, page_width.max(1)),
+                    column,
+                ));
+            }
+        }
+
+        None
+    }
+
+    pub fn next_match_position(
+        &self,
+        query: &str,
+        start_row: usize,
+        start_column: usize,
+        page_width: usize,
+    ) -> Option<(usize, usize)> {
+        if query.is_empty() {
+            return None;
+        }
+
+        let total_rows = self.total_rows(page_width.max(1));
+        for row in start_row..total_rows {
+            let line_text = self.display_line_text(row, page_width.max(1));
+            let search_start = if row == start_row {
+                start_column.min(line_text.len())
+            } else {
+                0
+            };
+            if let Some(offset) = line_text[search_start..].find(query) {
+                return Some((row, search_start + offset));
+            }
+        }
+
+        None
+    }
+
+    pub fn previous_match_position(
+        &self,
+        query: &str,
+        start_row: usize,
+        start_column: usize,
+        page_width: usize,
+    ) -> Option<(usize, usize)> {
+        if query.is_empty() {
+            return None;
+        }
+
+        for row in (0..=start_row).rev() {
+            let line_text = self.display_line_text(row, page_width.max(1));
+            let search_end = if row == start_row {
+                start_column.min(line_text.len())
+            } else {
+                line_text.len()
+            };
+            let haystack = &line_text[..search_end];
+            if let Some(column) = haystack.rfind(query) {
+                return Some((row, column));
+            }
+        }
+
+        None
+    }
+
     pub fn display_line_text(&self, display_row: usize, page_width: usize) -> String {
         let page_width = page_width.max(1);
         let mut current_row = 0usize;
@@ -173,8 +342,10 @@ impl EditableDocument {
         page_width: usize,
         ch: char,
     ) -> (usize, usize) {
+        self.push_undo_snapshot();
         let insert_char_idx = self.char_index_for_display_position(display_row, display_column, page_width);
         self.rope.insert_char(insert_char_idx, ch);
+        self.reload_git_gutter_markers();
         self.display_position_for_char_index(insert_char_idx.saturating_add(1), page_width)
     }
 
@@ -184,8 +355,10 @@ impl EditableDocument {
         display_column: usize,
         page_width: usize,
     ) -> (usize, usize) {
+        self.push_undo_snapshot();
         let insert_char_idx = self.char_index_for_display_position(display_row, display_column, page_width);
         self.rope.insert_char(insert_char_idx, '\n');
+        self.reload_git_gutter_markers();
         self.display_position_for_char_index(insert_char_idx.saturating_add(1), page_width)
     }
 
@@ -200,7 +373,9 @@ impl EditableDocument {
             return None;
         }
 
+        self.push_undo_snapshot();
         self.rope.remove((cursor_char_idx - 1)..cursor_char_idx);
+        self.reload_git_gutter_markers();
         Some(self.display_position_for_char_index(cursor_char_idx - 1, page_width))
     }
 
@@ -215,27 +390,32 @@ impl EditableDocument {
             return None;
         }
 
+        self.push_undo_snapshot();
         self.rope.remove(cursor_char_idx..cursor_char_idx.saturating_add(1));
+        self.reload_git_gutter_markers();
         Some(self.display_position_for_char_index(cursor_char_idx, page_width))
     }
 
     pub fn remove_display_range(
         &mut self,
-        display_row: usize,
+        start_row: usize,
         start_column: usize,
+        end_row: usize,
         end_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
         let start_char_idx =
-            self.char_index_for_display_position(display_row, start_column, page_width);
+            self.char_index_for_display_position(start_row, start_column, page_width);
         let end_char_idx =
-            self.char_index_for_display_position(display_row, end_column, page_width);
+            self.char_index_for_display_position(end_row, end_column, page_width);
 
         if end_char_idx <= start_char_idx {
             return None;
         }
 
+        self.push_undo_snapshot();
         self.rope.remove(start_char_idx..end_char_idx);
+        self.reload_git_gutter_markers();
         Some(self.display_position_for_char_index(start_char_idx, page_width))
     }
 
@@ -252,7 +432,9 @@ impl EditableDocument {
         let insert_char_idx =
             self.char_index_for_display_position(display_row, display_column, page_width);
         let spaces = " ".repeat(self.indent_width.max(1));
+        self.push_undo_snapshot();
         self.rope.insert(insert_char_idx, &spaces);
+        self.reload_git_gutter_markers();
         self.display_position_for_char_index(
             insert_char_idx.saturating_add(self.indent_width.max(1)),
             page_width,
@@ -267,7 +449,9 @@ impl EditableDocument {
         let line_text = self.rope.line(line_index).to_string();
         let insert_char_idx = line_start.saturating_add(trimmed_line_char_len(&line_text));
 
+        self.push_undo_snapshot();
         self.rope.insert_char(insert_char_idx, '\n');
+        self.reload_git_gutter_markers();
         self.display_position_for_char_index(insert_char_idx.saturating_add(1), page_width)
     }
 
@@ -280,6 +464,27 @@ impl EditableDocument {
             .trim_end_matches('\n')
             .trim_end_matches('\r')
             .to_owned()
+    }
+
+    pub fn matching_bracket_position(
+        &self,
+        display_row: usize,
+        display_column: usize,
+        page_width: usize,
+    ) -> Option<(usize, usize)> {
+        let cursor_char_index =
+            self.char_index_for_display_position(display_row, display_column, page_width.max(1));
+
+        if let Some((bracket_index, bracket)) = self.bracket_at_char_index(cursor_char_index) {
+            return self.find_matching_bracket(bracket_index, bracket, page_width.max(1));
+        }
+
+        cursor_char_index
+            .checked_sub(1)
+            .and_then(|index| self.bracket_at_char_index(index))
+            .and_then(|(bracket_index, bracket)| {
+                self.find_matching_bracket(bracket_index, bracket, page_width.max(1))
+            })
     }
 
     pub fn clear_current_line(
@@ -300,9 +505,11 @@ impl EditableDocument {
         let indent_len = removed.chars().take_while(|ch| ch.is_whitespace()).count();
 
         if trimmed_len > 0 {
+            self.push_undo_snapshot();
             self.rope.remove(
                 line_start.saturating_add(indent_len)..line_start.saturating_add(trimmed_len),
             );
+            self.reload_git_gutter_markers();
         }
 
         Some((
@@ -332,7 +539,9 @@ impl EditableDocument {
         let line_char_len = line_text.chars().count();
 
         if self.rope.len_lines() <= 1 {
+            self.push_undo_snapshot();
             self.rope = Rope::from_str("");
+            self.reload_git_gutter_markers();
             return Some((removed, (0, 0)));
         }
 
@@ -341,7 +550,9 @@ impl EditableDocument {
         } else {
             line_start.saturating_add(trimmed_line_char_len(&line_text))
         };
+        self.push_undo_snapshot();
         self.rope.remove(line_start..removal_end);
+        self.reload_git_gutter_markers();
 
         let target_line_index = line_index.min(self.rope.len_lines().saturating_sub(1));
         let target_char_index = self.rope.line_to_char(target_line_index);
@@ -349,6 +560,28 @@ impl EditableDocument {
             removed,
             self.display_position_for_char_index(target_char_index, page_width),
         ))
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(previous_rope) = self.undo_stack.pop() else {
+            return false;
+        };
+
+        self.redo_stack.push(self.rope.clone());
+        self.rope = previous_rope;
+        self.reload_git_gutter_markers();
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(next_rope) = self.redo_stack.pop() else {
+            return false;
+        };
+
+        self.undo_stack.push(self.rope.clone());
+        self.rope = next_rope;
+        self.reload_git_gutter_markers();
+        true
     }
 
     fn char_index_for_display_position(
@@ -461,6 +694,67 @@ impl EditableDocument {
 
         hunk_starts
     }
+
+    fn push_undo_snapshot(&mut self) {
+        if self.undo_group_active {
+            if self.undo_group_snapshot_taken {
+                return;
+            }
+            self.undo_group_snapshot_taken = true;
+        }
+
+        self.undo_stack.push(self.rope.clone());
+        self.redo_stack.clear();
+    }
+
+    fn bracket_at_char_index(&self, char_index: usize) -> Option<(usize, char)> {
+        if char_index >= self.rope.len_chars() {
+            return None;
+        }
+
+        let ch = self.rope.char(char_index);
+        is_supported_bracket(ch).then_some((char_index, ch))
+    }
+
+    fn find_matching_bracket(
+        &self,
+        bracket_index: usize,
+        bracket: char,
+        page_width: usize,
+    ) -> Option<(usize, usize)> {
+        let (matching_bracket, search_forward) = matching_bracket(bracket)?;
+        let mut depth = 0usize;
+
+        if search_forward {
+            for index in bracket_index.saturating_add(1)..self.rope.len_chars() {
+                let ch = self.rope.char(index);
+                if ch == bracket {
+                    depth = depth.saturating_add(1);
+                } else if ch == matching_bracket {
+                    if depth == 0 {
+                        return Some(
+                            self.display_position_for_char_index(index.saturating_add(1), page_width),
+                        );
+                    }
+                    depth = depth.saturating_sub(1);
+                }
+            }
+        } else {
+            for index in (0..bracket_index).rev() {
+                let ch = self.rope.char(index);
+                if ch == bracket {
+                    depth = depth.saturating_add(1);
+                } else if ch == matching_bracket {
+                    if depth == 0 {
+                        return Some(self.display_position_for_char_index(index, page_width));
+                    }
+                    depth = depth.saturating_sub(1);
+                }
+            }
+        }
+
+        None
+    }
 }
 
 pub struct EditablePage {
@@ -561,6 +855,22 @@ fn uses_hard_tabs(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name == "Makefile")
+}
+
+fn is_supported_bracket(ch: char) -> bool {
+    matches!(ch, '(' | ')' | '{' | '}' | '[' | ']')
+}
+
+fn matching_bracket(ch: char) -> Option<(char, bool)> {
+    match ch {
+        '(' => Some((')', true)),
+        '{' => Some(('}', true)),
+        '[' => Some((']', true)),
+        ')' => Some(('(', false)),
+        '}' => Some(('{', false)),
+        ']' => Some(('[', false)),
+        _ => None,
+    }
 }
 
 fn load_git_gutter_markers(path: &Path) -> HashMap<usize, char> {

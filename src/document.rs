@@ -5,6 +5,8 @@ use crate::{config, error::Result};
 pub mod editable;
 pub mod large_file;
 
+pub use editable::{DiagnosticSeverity, DiagnosticSummary};
+
 pub enum Document {
     Editable(editable::EditableDocument),
     LargeFile(large_file::LargeFileDocument),
@@ -60,6 +62,7 @@ impl Document {
                     .into_iter()
                     .map(|row| {
                         build_render_line(
+                            document.diagnostic_marker(row.line_number),
                             row.line_number,
                             document.git_gutter_marker(row.line_number),
                             row.text,
@@ -75,7 +78,7 @@ impl Document {
                     .rows
                     .into_iter()
                     .map(|row| {
-                        build_render_line(row.line_number, None, row.text)
+                        build_render_line(None, row.line_number, None, row.text)
                     })
                     .collect();
                 let status = if page.next_byte_offset >= document.file_size_bytes {
@@ -128,6 +131,32 @@ impl Document {
         match self {
             Self::Editable(document) => document.save(path),
             Self::LargeFile(_) => Ok(()),
+        }
+    }
+
+    pub fn undo(&mut self) -> bool {
+        match self {
+            Self::Editable(document) => document.undo(),
+            Self::LargeFile(_) => false,
+        }
+    }
+
+    pub fn redo(&mut self) -> bool {
+        match self {
+            Self::Editable(document) => document.redo(),
+            Self::LargeFile(_) => false,
+        }
+    }
+
+    pub fn begin_undo_group(&mut self) {
+        if let Self::Editable(document) = self {
+            document.begin_undo_group();
+        }
+    }
+
+    pub fn end_undo_group(&mut self) {
+        if let Self::Editable(document) = self {
+            document.end_undo_group();
         }
     }
 
@@ -257,6 +286,58 @@ impl Document {
         }
     }
 
+    pub fn next_diagnostic_row(
+        &self,
+        current_row: usize,
+        page_width: usize,
+        error_only: bool,
+    ) -> Option<usize> {
+        let content_width = page_width.saturating_sub(
+            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
+        );
+
+        match self {
+            Self::Editable(document) => {
+                document.next_diagnostic_row(current_row, content_width.max(1), error_only)
+            }
+            Self::LargeFile(_) => None,
+        }
+    }
+
+    pub fn previous_diagnostic_row(
+        &self,
+        current_row: usize,
+        page_width: usize,
+        error_only: bool,
+    ) -> Option<usize> {
+        let content_width = page_width.saturating_sub(
+            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
+        );
+
+        match self {
+            Self::Editable(document) => {
+                document.previous_diagnostic_row(current_row, content_width.max(1), error_only)
+            }
+            Self::LargeFile(_) => None,
+        }
+    }
+
+    pub fn set_rust_diagnostics(
+        &mut self,
+        diagnostics: std::collections::HashMap<usize, DiagnosticSeverity>,
+    ) {
+        if let Self::Editable(document) = self {
+            document.set_diagnostics(diagnostics);
+        }
+    }
+
+    pub fn diagnostic_summary(&self) -> DiagnosticSummary {
+        match self {
+            Self::Editable(document) => document.diagnostic_summary(),
+            Self::LargeFile(_) => DiagnosticSummary::default(),
+        }
+    }
+
     pub fn display_line_width(&self, cursor_row: usize, page_width: usize) -> Result<usize> {
         let content_width = page_width.saturating_sub(
             DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
@@ -308,10 +389,70 @@ impl Document {
         }
     }
 
+    pub fn first_match_row(&self, query: &str, page_width: usize) -> Option<usize> {
+        self.first_match_position(query, page_width).map(|(row, _)| row)
+    }
+
+    pub fn first_match_position(&self, query: &str, page_width: usize) -> Option<(usize, usize)> {
+        let content_width = page_width.saturating_sub(
+            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
+        );
+
+        match self {
+            Self::Editable(document) => document.first_match_position(query, content_width.max(1)),
+            Self::LargeFile(_) => None,
+        }
+    }
+
+    pub fn next_match_position(
+        &self,
+        query: &str,
+        start_row: usize,
+        start_column: usize,
+        page_width: usize,
+    ) -> Option<(usize, usize)> {
+        let content_width = page_width.saturating_sub(
+            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
+        );
+
+        match self {
+            Self::Editable(document) => document.next_match_position(
+                query,
+                start_row,
+                start_column,
+                content_width.max(1),
+            ),
+            Self::LargeFile(_) => None,
+        }
+    }
+
+    pub fn previous_match_position(
+        &self,
+        query: &str,
+        start_row: usize,
+        start_column: usize,
+        page_width: usize,
+    ) -> Option<(usize, usize)> {
+        let content_width = page_width.saturating_sub(
+            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
+        );
+
+        match self {
+            Self::Editable(document) => document.previous_match_position(
+                query,
+                start_row,
+                start_column,
+                content_width.max(1),
+            ),
+            Self::LargeFile(_) => None,
+        }
+    }
+
     pub fn remove_display_range(
         &mut self,
-        display_row: usize,
+        start_row: usize,
         start_column: usize,
+        end_row: usize,
         end_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
@@ -321,8 +462,9 @@ impl Document {
 
         match self {
             Self::Editable(document) => document.remove_display_range(
-                display_row,
+                start_row,
                 start_column,
+                end_row,
                 end_column,
                 content_width.max(1),
             ),
@@ -350,6 +492,26 @@ impl Document {
             Self::Editable(document) => {
                 Some(document.current_line_text(display_row, content_width.max(1)))
             }
+            Self::LargeFile(_) => None,
+        }
+    }
+
+    pub fn matching_bracket_position(
+        &self,
+        display_row: usize,
+        display_column: usize,
+        page_width: usize,
+    ) -> Option<(usize, usize)> {
+        let content_width = page_width.saturating_sub(
+            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
+        );
+
+        match self {
+            Self::Editable(document) => document.matching_bracket_position(
+                display_row,
+                display_column,
+                content_width.max(1),
+            ),
             Self::LargeFile(_) => None,
         }
     }
@@ -394,9 +556,18 @@ fn build_status(page_width: usize, label: &str) -> String {
     format!("{label}{}", "-".repeat(width.saturating_sub(label.len())))
 }
 
-fn build_render_line(line_number: usize, gutter_marker: Option<char>, text: String) -> DocumentRenderLine {
+fn build_render_line(
+    diagnostic_marker: Option<DiagnosticSeverity>,
+    line_number: usize,
+    gutter_marker: Option<char>,
+    text: String,
+) -> DocumentRenderLine {
     DocumentRenderLine {
-        diagnostic_marker: " ".to_owned(),
+        diagnostic_marker: match diagnostic_marker {
+            Some(DiagnosticSeverity::Warning) => "W".to_owned(),
+            Some(DiagnosticSeverity::Error) => "E".to_owned(),
+            None => " ".to_owned(),
+        },
         line_number,
         gutter_marker: gutter_marker.unwrap_or(' ').to_string(),
         text,

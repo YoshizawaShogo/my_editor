@@ -57,30 +57,38 @@ impl ProjectFileCandidate {
 
 pub fn collect_project_file_candidates() -> Result<Vec<ProjectFileCandidate>> {
     let git_root = git_root()?;
-    let output = Command::new("git")
-        .current_dir(&git_root)
-        .args(["ls-files"])
-        .output()?;
+    let tracked = git_command_lines(&git_root, &["ls-files"])?;
+    let untracked = git_command_lines(&git_root, &["ls-files", "--others", "--exclude-standard"])?;
 
-    if !output.status.success() {
-        return Err(AppError::CommandFailed(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let candidates = stdout
-        .lines()
+    let candidates = tracked
+        .into_iter()
+        .chain(untracked)
         .filter(|line| !line.is_empty())
         .map(|relative_path| {
-            ProjectFileCandidate::new(git_root.join(relative_path), relative_path.to_owned())
+            ProjectFileCandidate::new(git_root.join(&relative_path), relative_path)
         })
         .collect();
 
     Ok(candidates)
 }
 
-fn git_root() -> Result<PathBuf> {
+pub fn collect_project_search_paths() -> Result<Vec<PathBuf>> {
+    let git_root = git_root()?;
+    let tracked = git_command_lines(&git_root, &["ls-files"])?;
+    let untracked = git_command_lines(&git_root, &["ls-files", "--others", "--exclude-standard"])?;
+
+    let mut paths = Vec::new();
+    for relative_path in tracked.into_iter().chain(untracked.into_iter()) {
+        if relative_path.is_empty() {
+            continue;
+        }
+        paths.push(git_root.join(relative_path));
+    }
+
+    Ok(paths)
+}
+
+pub fn git_root() -> Result<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()?;
@@ -92,4 +100,22 @@ fn git_root() -> Result<PathBuf> {
     }
 
     Ok(PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+}
+
+fn git_command_lines(git_root: &Path, args: &[&str]) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .current_dir(git_root)
+        .args(args)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(AppError::CommandFailed(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect())
 }
