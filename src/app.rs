@@ -5,37 +5,29 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
-    sync::{Arc, atomic::AtomicBool},
 };
 
 use crossterm::{
-    cursor::{self, SetCursorStyle},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    execute,
-    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal,
 };
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Layout, Position, Rect},
-    style::Style,
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
-};
-use signal_hook::{consts::signal::SIGTSTP, flag, low_level};
 
 use crate::{
     config,
-    color::AppColors,
     document::{DiagnosticSeverity, DiagnosticSummary, Document},
     error::Result,
     mode::Mode,
     open_candidate::{
-        OpenBufferCandidate, OpenCandidate, ProjectFileCandidate, collect_project_file_candidates,
-        collect_project_search_paths,
+        OpenCandidate, ProjectFileCandidate, collect_project_file_candidates, collect_project_search_paths,
     },
     picker_match,
 };
+
+mod render;
+mod terminal_session;
+mod workspace;
+
+use self::terminal_session::TerminalSession;
 
 pub struct App {
     pub mode: Mode,
@@ -60,13 +52,10 @@ pub struct App {
 
 #[derive(Clone, Copy)]
 pub enum ReplayableAction {
-    NextGitHunk,
-    PreviousGitHunk,
+    GitHunk { forward: bool },
     Find(FindKind, char),
-    OperatorFind(PendingOperator, FindKind, char),
-    ChangeLine,
-    DeleteLine,
-    YankLine,
+    Diagnostic { error_only: bool, forward: bool },
+    Search { forward: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -100,13 +89,13 @@ pub struct Workspace {
 pub struct DocumentEntry {
     pub path: PathBuf,
     pub document: Document,
+    pub view_state: BufferViewState,
 }
 
 pub struct PickerState {
     pub active: bool,
     pub query: String,
     pub candidates: Vec<OpenCandidate>,
-    pub selected_index: usize,
     pub scope: PickerScope,
 }
 
@@ -117,6 +106,13 @@ pub struct ShellState {
 pub struct CursorState {
     pub row: usize,
     pub column: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct BufferViewState {
+    pub row: usize,
+    pub column: usize,
+    pub viewport_row: usize,
 }
 
 pub struct GoInputState {
@@ -191,18 +187,24 @@ impl SearchScope {
 }
 
 impl App {
-    pub fn open(path: &Path) -> Result<Self> {
-        let document = Document::open(path)?;
+    pub fn open(path: Option<&Path>) -> Result<Self> {
         let rust_support = RustSupportState {
             rust_analyzer_available: rust_analyzer_available(),
             cargo_manifest_in_cwd: Path::new("Cargo.toml").exists(),
         };
-        let workspace = Workspace {
-            documents: vec![DocumentEntry {
-                path: path.to_path_buf(),
-                document,
-            }],
-            current_index: 0,
+        let workspace = match path {
+            Some(path) => Workspace {
+                documents: vec![DocumentEntry {
+                    path: path.to_path_buf(),
+                    document: Document::open(path)?,
+                    view_state: BufferViewState::default(),
+                }],
+                current_index: 0,
+            },
+            None => Workspace {
+                documents: Vec::new(),
+                current_index: 0,
+            },
         };
 
         let mut app = Self {
@@ -212,7 +214,6 @@ impl App {
                 active: false,
                 query: String::new(),
                 candidates: Vec::new(),
-                selected_index: 0,
                 scope: PickerScope::All,
             },
             shell: ShellState {
@@ -283,86 +284,52 @@ impl App {
         Ok(())
     }
 
-    fn render_frame(&self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
-        terminal.draw(|frame| {
-            let area = frame.area();
-            let layout = Layout::vertical([
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .split(area);
-            let command_hint = self.command_hint_text();
-            let pending_width = (command_hint.chars().count() as u16 + 2).min(layout[1].width);
-            let footer_layout = Layout::horizontal([
-                Constraint::Min(0),
-                Constraint::Length(pending_width),
-            ])
-            .split(layout[1]);
-            let footer = Paragraph::new(self.footer_line()).style(
-                Style::default().bg(AppColors::PANEL),
-            );
-
-            let background = Block::default().style(Style::default().bg(AppColors::BACKGROUND));
-            frame.render_widget(background, area);
-            self.render_content(frame, layout[0]);
-            frame.render_widget(footer, footer_layout[0]);
-
-            let pending = Paragraph::new(format!(" {command_hint} ")).style(
-                Style::default()
-                    .fg(AppColors::ACCENT)
-                    .bg(AppColors::PANEL),
-            );
-            frame.render_widget(pending, footer_layout[1]);
-
-            if self.go_input.active {
-                let popup = centered_rect(24, 3, area);
-                let input = Paragraph::new(format!("Go: {}", self.go_input.value))
-                    .block(
-                        Block::default()
-                            .title(" Go ")
-                            .borders(Borders::ALL)
-                            .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
-                    )
-                    .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
-                frame.render_widget(Clear, popup);
-                frame.render_widget(input, popup);
-            }
-
-            if self.search_input.active {
-                let popup = centered_rect(36, 3, area);
-                let input = Paragraph::new(self.search_input.value.clone())
-                .block(
-                    Block::default()
-                        .title(format!(" Search [{}]: ", self.search_input.scope.label()))
-                        .borders(Borders::ALL)
-                        .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
-                )
-                .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
-                frame.render_widget(Clear, popup);
-                frame.render_widget(input, popup);
-            }
-
-            if self.picker.active {
-                self.render_picker(frame, area);
-            }
-
-            let cursor_position = if self.go_input.active {
-                self.go_input_cursor_position(area)
-            } else if self.search_input.active {
-                self.search_input_cursor_position(area)
-            } else if self.picker.active {
-                self.picker_cursor_position(area)
-            } else {
-                self.cursor_position(layout[0])
+    fn save_current_buffer_view_state(&mut self) {
+        if let Some(entry) = self.workspace.documents.get_mut(self.workspace.current_index) {
+            entry.view_state = BufferViewState {
+                row: self.cursor.row,
+                column: self.cursor.column,
+                viewport_row: self.viewport_row,
             };
-            frame.set_cursor_position(cursor_position);
-        })?;
+        }
+    }
+
+    fn restore_current_buffer_view_state(&mut self) {
+        let Some(entry) = self.workspace.documents.get(self.workspace.current_index) else {
+            self.cursor = CursorState { row: 0, column: 0 };
+            self.viewport_row = 0;
+            return;
+        };
+
+        self.cursor.row = entry.view_state.row;
+        self.cursor.column = entry.view_state.column;
+        self.viewport_row = entry.view_state.viewport_row;
+        self.clamp_vertical_state();
+    }
+
+    fn make_document_current(&mut self, index: usize) {
+        self.save_current_buffer_view_state();
+        self.workspace.make_current(index);
+        self.restore_current_buffer_view_state();
+    }
+
+    fn select_current_document(&mut self, index: usize) {
+        self.save_current_buffer_view_state();
+        self.workspace.select_current(index);
+        self.restore_current_buffer_view_state();
+    }
+
+    fn open_document(&mut self, path: PathBuf) -> Result<()> {
+        self.save_current_buffer_view_state();
+        self.workspace.open_document(path)?;
+        self.restore_current_buffer_view_state();
         Ok(())
     }
 
     fn handle_event(&mut self, event: Event) -> Result<bool> {
         match event {
             Event::Key(key_event) => self.handle_key_event(key_event),
+            Event::Mouse(_) => Ok(false),
             _ => Ok(false),
         }
     }
@@ -391,7 +358,8 @@ impl App {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
         {
-            return Ok(true);
+            self.pending_normal_action = None;
+            return Ok(false);
         }
 
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
@@ -559,7 +527,11 @@ impl App {
                 Ok(false)
             }
             KeyCode::Char('r') => {
-                self.replay_last_action()?;
+                self.replay_last_action(false)?;
+                Ok(false)
+            }
+            KeyCode::Char('R') => {
+                self.replay_last_action(true)?;
                 Ok(false)
             }
             KeyCode::Char('t') => {
@@ -607,7 +579,7 @@ impl App {
                 }
                 KeyCode::Char('g') => {
                     self.jump_to_next_git_marker();
-                    self.last_replayable_action = Some(ReplayableAction::NextGitHunk);
+                    self.last_replayable_action = Some(ReplayableAction::GitHunk { forward: true });
                     Ok(false)
                 }
                 KeyCode::Char('w') => {
@@ -636,7 +608,7 @@ impl App {
                 }
                 KeyCode::Char('G') => {
                     self.jump_to_previous_git_marker();
-                    self.last_replayable_action = Some(ReplayableAction::PreviousGitHunk);
+                    self.last_replayable_action = Some(ReplayableAction::GitHunk { forward: false });
                     Ok(false)
                 }
                 _ => Ok(false),
@@ -695,6 +667,13 @@ impl App {
 
     fn handle_go_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('c'))
+        {
+            self.close_go_input();
+            return Ok(false);
+        }
+
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('j'))
         {
             self.submit_go_input()?;
@@ -737,6 +716,13 @@ impl App {
     }
 
     fn handle_search_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('c'))
+        {
+            self.close_search_input();
+            return Ok(false);
+        }
+
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('f'))
         {
@@ -791,6 +777,13 @@ impl App {
     }
 
     fn handle_insert_mode_key(&mut self, key_event: KeyEvent) -> Result<bool> {
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('c'))
+        {
+            self.leave_insert_mode(true);
+            return Ok(false);
+        }
+
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('s'))
         {
@@ -974,12 +967,6 @@ impl App {
             self.workspace.current_document_mut().end_undo_group();
         }
 
-        self.last_replayable_action = Some(ReplayableAction::OperatorFind(
-            operator,
-            find_kind,
-            target,
-        ));
-
         Ok(())
     }
 
@@ -1084,28 +1071,35 @@ impl App {
         Ok(None)
     }
 
-    fn replay_last_action(&mut self) -> Result<()> {
+    fn replay_last_action(&mut self, reverse: bool) -> Result<()> {
         let Some(action) = self.last_replayable_action else {
             return Ok(());
         };
 
         match action {
-            ReplayableAction::NextGitHunk => self.jump_to_next_git_marker(),
-            ReplayableAction::PreviousGitHunk => self.jump_to_previous_git_marker(),
+            ReplayableAction::GitHunk { forward } => {
+                if forward ^ reverse {
+                    self.jump_to_next_git_marker();
+                } else {
+                    self.jump_to_previous_git_marker();
+                }
+            }
             ReplayableAction::Find(find_kind, target) => {
-                self.run_find_motion(find_kind, target)?;
+                self.run_find_motion(invert_find_kind(find_kind, reverse), target)?;
             }
-            ReplayableAction::OperatorFind(operator, find_kind, target) => {
-                self.run_operator_find(operator, find_kind, target)?;
+            ReplayableAction::Diagnostic { error_only, forward } => {
+                if forward ^ reverse {
+                    self.jump_to_next_diagnostic(error_only);
+                } else {
+                    self.jump_to_previous_diagnostic(error_only);
+                }
             }
-            ReplayableAction::ChangeLine => {
-                self.change_current_line()?;
-            }
-            ReplayableAction::DeleteLine => {
-                self.delete_current_line()?;
-            }
-            ReplayableAction::YankLine => {
-                self.yank_current_line()?;
+            ReplayableAction::Search { forward } => {
+                if forward ^ reverse {
+                    self.repeat_search_forward()?;
+                } else {
+                    self.repeat_search_backward()?;
+                }
             }
         }
 
@@ -1247,7 +1241,6 @@ impl App {
             .current_line_text(self.cursor.row, width as usize)
         {
             self.yank_buffer = YankBuffer::Linewise(line_text);
-            self.last_replayable_action = Some(ReplayableAction::YankLine);
         }
 
         Ok(())
@@ -1268,7 +1261,6 @@ impl App {
             self.cursor.row = row;
             self.cursor.column = column;
             self.clamp_vertical_state();
-            self.last_replayable_action = Some(ReplayableAction::DeleteLine);
         }
         self.workspace.current_document_mut().end_undo_group();
 
@@ -1292,7 +1284,6 @@ impl App {
             self.mode = Mode::Insert;
             self.pending_insert_j = None;
             self.clamp_vertical_state();
-            self.last_replayable_action = Some(ReplayableAction::ChangeLine);
         } else {
             self.workspace.current_document_mut().end_undo_group();
         }
@@ -1375,7 +1366,6 @@ impl App {
             self.picker.scope = PickerScope::All;
         }
 
-        self.picker.selected_index = 0;
         self.refresh_picker_candidates()?;
         Ok(())
     }
@@ -1383,11 +1373,17 @@ impl App {
     fn close_picker(&mut self) {
         self.picker.active = false;
         self.picker.query.clear();
-        self.picker.selected_index = 0;
         self.picker.scope = PickerScope::All;
     }
 
     fn handle_picker_key(&mut self, key_event: KeyEvent) -> Result<bool> {
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('c'))
+        {
+            self.close_picker();
+            return Ok(false);
+        }
+
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('p'))
         {
@@ -1407,22 +1403,12 @@ impl App {
                 self.close_picker();
                 Ok(false)
             }
-            KeyCode::Enter => {
-                self.submit_picker_selection()?;
-                Ok(false)
-            }
             KeyCode::Backspace => {
                 self.picker.query.pop();
-                self.picker.selected_index = 0;
                 Ok(false)
             }
-            KeyCode::Up | KeyCode::Char('i') => {
-                self.picker.selected_index = self.picker.selected_index.saturating_sub(1);
-                Ok(false)
-            }
-            KeyCode::Down | KeyCode::Char('k') => {
-                let max_index = self.filtered_picker_matches().len().saturating_sub(1);
-                self.picker.selected_index = self.picker.selected_index.saturating_add(1).min(max_index);
+            KeyCode::Enter => {
+                self.submit_picker_selection()?;
                 Ok(false)
             }
             KeyCode::Char('w') if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1431,7 +1417,6 @@ impl App {
             }
             KeyCode::Char(ch) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.picker.query.push(ch);
-                self.picker.selected_index = 0;
                 Ok(false)
             }
             _ => Ok(false),
@@ -1439,6 +1424,13 @@ impl App {
     }
 
     fn filtered_picker_matches(&self) -> Vec<OpenCandidate> {
+        self.ranked_picker_matches()
+            .into_iter()
+            .map(|matched| matched.candidate)
+            .collect()
+    }
+
+    fn ranked_picker_matches(&self) -> Vec<picker_match::PickerMatch> {
         let candidates = match self.picker.scope {
             PickerScope::All => self.picker.candidates.clone(),
             PickerScope::Buffers => self
@@ -1450,12 +1442,12 @@ impl App {
                 .collect(),
         };
 
-        picker_match::sort_open_candidates(&candidates, &self.picker.query)
+        picker_match::ranked_open_candidates(&candidates, &self.picker.query)
     }
 
     fn submit_picker_selection(&mut self) -> Result<()> {
         let matches = self.filtered_picker_matches();
-        let Some(candidate) = matches.get(self.picker.selected_index).cloned() else {
+        let Some(candidate) = matches.first().cloned() else {
             self.close_picker();
             return Ok(());
         };
@@ -1463,17 +1455,14 @@ impl App {
         match candidate {
             OpenCandidate::OpenBuffer(candidate) => {
                 if let Some(index) = self.workspace.find_document_index(&candidate.path) {
-                    self.workspace.make_current(index);
+                    self.make_document_current(index);
                 }
             }
             OpenCandidate::ProjectFile(candidate) => {
-                self.workspace.open_document(candidate.path)?;
+                self.open_document(candidate.path)?;
             }
         }
 
-        self.viewport_row = 0;
-        self.cursor.row = 0;
-        self.cursor.column = 0;
         self.close_picker();
         self.refresh_picker_candidates()?;
         Ok(())
@@ -1503,7 +1492,7 @@ impl App {
         if let Ok(Some((document_index, row, column))) =
             self.search_current_file(&self.search_input.value, width as usize)
         {
-            self.workspace.current_index = document_index;
+            self.make_document_current(document_index);
             self.cursor.column = column;
             self.jump_with_context(row, width as usize);
         }
@@ -1535,7 +1524,7 @@ impl App {
 
         if let Some((document_index, row, column)) = result {
             if document_index != self.workspace.current_index {
-                self.workspace.current_index = document_index;
+                self.make_document_current(document_index);
             }
             self.push_jump_history();
             self.cursor.column = column;
@@ -1594,7 +1583,7 @@ impl App {
             }
 
             if let Some((line_number, column)) = first_matching_line_number(&path, query)? {
-                self.workspace.open_document(path.clone())?;
+                self.open_document(path.clone())?;
                 if let Some(row) = self.workspace.current_document().jump_row_for_line_number(line_number, page_width) {
                     return Ok(Some((self.workspace.current_index, row, column)));
                 }
@@ -1624,6 +1613,7 @@ impl App {
                     self.push_jump_history();
                     self.cursor.column = column;
                     self.jump_with_context(row, page_width);
+                    self.last_replayable_action = Some(ReplayableAction::Search { forward: true });
                 }
             }
             SearchScope::OpenBuffers => {
@@ -1636,9 +1626,10 @@ impl App {
                     true,
                 )? {
                     self.push_jump_history();
-                    self.workspace.current_index = document_index;
+                    self.make_document_current(document_index);
                     self.cursor.column = column;
                     self.jump_with_context(row, page_width);
+                    self.last_replayable_action = Some(ReplayableAction::Search { forward: true });
                 }
             }
             SearchScope::Project => {
@@ -1651,9 +1642,10 @@ impl App {
                     true,
                 )? {
                     self.push_jump_history();
-                    self.workspace.current_index = document_index;
+                    self.make_document_current(document_index);
                     self.cursor.column = column;
                     self.jump_with_context(row, page_width);
+                    self.last_replayable_action = Some(ReplayableAction::Search { forward: true });
                 }
             }
         }
@@ -1681,6 +1673,7 @@ impl App {
                     self.push_jump_history();
                     self.cursor.column = column;
                     self.jump_with_context(row, page_width);
+                    self.last_replayable_action = Some(ReplayableAction::Search { forward: false });
                 }
             }
             SearchScope::OpenBuffers => {
@@ -1693,9 +1686,10 @@ impl App {
                     false,
                 )? {
                     self.push_jump_history();
-                    self.workspace.current_index = document_index;
+                    self.make_document_current(document_index);
                     self.cursor.column = column;
                     self.jump_with_context(row, page_width);
+                    self.last_replayable_action = Some(ReplayableAction::Search { forward: false });
                 }
             }
             SearchScope::Project => {
@@ -1708,9 +1702,10 @@ impl App {
                     false,
                 )? {
                     self.push_jump_history();
-                    self.workspace.current_index = document_index;
+                    self.make_document_current(document_index);
                     self.cursor.column = column;
                     self.jump_with_context(row, page_width);
+                    self.last_replayable_action = Some(ReplayableAction::Search { forward: false });
                 }
             }
         }
@@ -1787,7 +1782,7 @@ impl App {
             }
 
             if let Some((line_number, column)) = first_matching_line_number(&path, query)? {
-                self.workspace.open_document(path.clone())?;
+                self.open_document(path.clone())?;
                 if let Some(row) = self
                     .workspace
                     .current_document()
@@ -1799,453 +1794,6 @@ impl App {
         }
 
         Ok(None)
-    }
-
-    fn footer_color(&self) -> ratatui::style::Color {
-        match self.effective_mode() {
-            Mode::Normal => AppColors::NORMAL_MODE,
-            Mode::Insert => AppColors::INSERT_MODE,
-            Mode::Command => AppColors::COMMAND_MODE,
-            Mode::Shell => AppColors::SHELL_MODE,
-        }
-    }
-
-    fn effective_mode(&self) -> Mode {
-        if self.layout_mode == LayoutMode::TerminalSplit && self.focused_pane == FocusedPane::Right {
-            Mode::Shell
-        } else {
-            self.mode
-        }
-    }
-
-    fn footer_line(&self) -> Line<'static> {
-        let mode = self.effective_mode().label();
-        let file_name = self.active_pane_label();
-        let status = self.active_pane_status();
-        let mode_bg = self.footer_color();
-        let footer_bg = AppColors::PANEL;
-
-        Line::from(vec![
-            powerline_segment(mode.to_owned(), AppColors::BACKGROUND, mode_bg),
-            powerline_separator_left(mode_bg, footer_bg),
-            powerline_segment(file_name, AppColors::ACCENT, footer_bg),
-            powerline_separator_right(mode_bg),
-            powerline_segment(status.to_owned(), AppColors::MUTED, footer_bg),
-            powerline_separator_right(mode_bg),
-        ])
-    }
-
-    fn active_pane_label(&self) -> String {
-        if self.layout_mode == LayoutMode::TerminalSplit && self.focused_pane == FocusedPane::Right {
-            return format!("terminal {}", self.shell.program);
-        }
-
-        self.active_document_name().unwrap_or_else(|| "nothing".to_owned())
-    }
-
-    fn active_pane_status(&self) -> String {
-        if self.layout_mode == LayoutMode::TerminalSplit && self.focused_pane == FocusedPane::Right {
-            return "TERMINAL".to_owned();
-        }
-
-        let base = self
-            .active_document()
-            .and_then(|document| {
-                document
-                    .render_first_page(self.viewport_row, 2, 80)
-                    .ok()
-                    .map(|render| render.status)
-            })
-            .unwrap_or_else(|| "NO BUFFER".to_owned());
-
-        match &self.last_save_feedback {
-            Some(feedback) => format!("{base} | {feedback}"),
-            None => base,
-        }
-    }
-
-    fn active_document_index(&self) -> Option<usize> {
-        if !self.workspace.has_documents() {
-            return None;
-        }
-
-        match self.layout_mode {
-            LayoutMode::TerminalSplit if self.focused_pane == FocusedPane::Right => None,
-            _ => Some(self.workspace.current_index),
-        }
-    }
-
-    fn active_document(&self) -> Option<&Document> {
-        self.active_document_index()
-            .and_then(|index| self.workspace.documents.get(index).map(|entry| &entry.document))
-    }
-
-    fn active_document_name(&self) -> Option<String> {
-        self.active_document_index()
-            .and_then(|index| self.workspace.documents.get(index))
-            .map(|entry| display_name(&entry.path))
-    }
-
-    fn render_content(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        if !self.workspace.has_documents() {
-            let empty = Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "No buffer is open.",
-                    Style::default().fg(AppColors::ACCENT),
-                )),
-                Line::from(""),
-                Line::from("Press Ctrl-P to open a file."),
-            ])
-            .style(Style::default().fg(AppColors::FOREGROUND).bg(AppColors::BACKGROUND));
-            frame.render_widget(empty, area);
-            return;
-        }
-
-        match self.layout_mode {
-            LayoutMode::Single => self.render_document_pane(
-                frame,
-                area,
-                self.workspace.current_index,
-                self.viewport_row,
-                self.focused_pane == FocusedPane::Left,
-            ),
-            LayoutMode::Dual => {
-                let panes = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(area);
-                let secondary_index = self.workspace.secondary_index();
-                let (left_index, right_index) = if self.focused_pane == FocusedPane::Right {
-                    (secondary_index, Some(self.workspace.current_index))
-                } else {
-                    (Some(self.workspace.current_index), secondary_index)
-                };
-                if let Some(index) = left_index {
-                    self.render_document_pane(
-                        frame,
-                        panes[0],
-                        index,
-                        if self.focused_pane == FocusedPane::Left {
-                            self.viewport_row
-                        } else {
-                            0
-                        },
-                        self.focused_pane == FocusedPane::Left,
-                    );
-                } else {
-                    self.render_placeholder_pane(frame, panes[0], "nothing", self.focused_pane == FocusedPane::Left);
-                }
-                if let Some(index) = right_index {
-                    self.render_document_pane(
-                        frame,
-                        panes[1],
-                        index,
-                        if self.focused_pane == FocusedPane::Right {
-                            self.viewport_row
-                        } else {
-                            0
-                        },
-                        self.focused_pane == FocusedPane::Right,
-                    );
-                } else {
-                    self.render_placeholder_pane(frame, panes[1], "nothing", self.focused_pane == FocusedPane::Right);
-                }
-            }
-            LayoutMode::TerminalSplit => {
-                let panes = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(area);
-                self.render_document_pane(
-                    frame,
-                    panes[0],
-                    self.workspace.current_index,
-                    self.viewport_row,
-                    self.focused_pane == FocusedPane::Left,
-                );
-                self.render_terminal_pane(frame, panes[1], self.focused_pane == FocusedPane::Right);
-            }
-        }
-    }
-
-    fn render_document_pane(
-        &self,
-        frame: &mut ratatui::Frame<'_>,
-        area: Rect,
-        document_index: usize,
-        viewport_row: usize,
-        focused: bool,
-    ) {
-        let Some(entry) = self.workspace.documents.get(document_index) else {
-            self.render_placeholder_pane(frame, area, "nothing", focused);
-            return;
-        };
-        let indent_width = entry.document.indent_width();
-        let render = entry
-            .document
-            .render_first_page(viewport_row, area.height as usize, area.width as usize)
-            .expect("document render should succeed during draw");
-        let search_query = if self.search_input.active && document_index == self.workspace.current_index {
-            Some(self.search_input.value.as_str())
-        } else {
-            None
-        };
-        let block = Block::default().borders(Borders::ALL).border_style(if focused {
-            Style::default().fg(AppColors::ACCENT)
-        } else {
-            Style::default().fg(AppColors::PANEL_ALT)
-        });
-        let content = Paragraph::new(format_render_lines(&render.lines, indent_width, search_query))
-            .block(block)
-            .style(Style::default().fg(AppColors::FOREGROUND).bg(AppColors::BACKGROUND));
-        frame.render_widget(content, area);
-    }
-
-    fn render_placeholder_pane(
-        &self,
-        frame: &mut ratatui::Frame<'_>,
-        area: Rect,
-        label: &str,
-        focused: bool,
-    ) {
-        let widget = Paragraph::new(label.to_owned())
-            .block(Block::default().borders(Borders::ALL).title(" Pane ").border_style(if focused {
-                Style::default().fg(AppColors::ACCENT)
-            } else {
-                Style::default().fg(AppColors::PANEL_ALT)
-            }))
-            .style(Style::default().fg(AppColors::MUTED).bg(AppColors::BACKGROUND));
-        frame.render_widget(widget, area);
-    }
-
-    fn render_terminal_pane(&self, frame: &mut ratatui::Frame<'_>, area: Rect, focused: bool) {
-        let widget = Paragraph::new(vec![
-            Line::from(Span::styled("terminal", Style::default().fg(AppColors::ACCENT))),
-            Line::from(""),
-            Line::from(format!("shell: {}", self.shell.program)),
-            Line::from(""),
-            Line::from("Interactive PTY is not wired yet."),
-        ])
-        .block(Block::default().borders(Borders::ALL).title(" Terminal ").border_style(if focused {
-            Style::default().fg(AppColors::SHELL_MODE)
-        } else {
-            Style::default().fg(AppColors::PANEL_ALT)
-        }))
-        .style(Style::default().fg(AppColors::FOREGROUND).bg(AppColors::BACKGROUND));
-        frame.render_widget(widget, area);
-    }
-
-    fn render_picker(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let popup = centered_rect(72, 12, area);
-        let matches = self.filtered_picker_matches();
-        let selected = self.picker.selected_index.min(matches.len().saturating_sub(1));
-        let scope = match self.picker.scope {
-            PickerScope::All => "all",
-            PickerScope::Buffers => "buffers",
-        };
-
-        let mut lines = vec![Line::from(self.picker.query.clone())];
-        for (index, candidate) in matches.into_iter().take(8).enumerate() {
-            let prefix = if index == selected { "> " } else { "  " };
-            let label = match candidate {
-                OpenCandidate::OpenBuffer(candidate) => format!("[buf] {}", candidate.display_name),
-                OpenCandidate::ProjectFile(candidate) => format!("[file] {}", candidate.display_name),
-            };
-            lines.push(Line::from(Span::styled(
-                format!("{prefix}{label}"),
-                if index == selected {
-                    Style::default().fg(AppColors::BACKGROUND).bg(AppColors::ACCENT)
-                } else {
-                    Style::default().fg(AppColors::FOREGROUND)
-                },
-            )));
-        }
-
-        let widget = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(format!(" Open [{scope}] "))
-                    .borders(Borders::ALL)
-                    .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
-            )
-            .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
-        frame.render_widget(Clear, popup);
-        frame.render_widget(widget, popup);
-    }
-
-    fn pending_input_text(&self) -> Option<String> {
-        match self.pending_normal_action {
-            Some(PendingNormalAction::GoPrefix) => Some("g".to_owned()),
-            Some(PendingNormalAction::Find(FindKind::Forward)) => Some("f".to_owned()),
-            Some(PendingNormalAction::Find(FindKind::Backward)) => Some("F".to_owned()),
-            Some(PendingNormalAction::Find(FindKind::TillForward)) => Some("t".to_owned()),
-            Some(PendingNormalAction::Find(FindKind::TillBackward)) => Some("T".to_owned()),
-            Some(PendingNormalAction::Operator(PendingOperator::Change)) => Some("c".to_owned()),
-            Some(PendingNormalAction::Operator(PendingOperator::Delete)) => Some("d".to_owned()),
-            Some(PendingNormalAction::Operator(PendingOperator::Yank)) => Some("y".to_owned()),
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Change, FindKind::Forward)) => {
-                Some("cf".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Change, FindKind::Backward)) => {
-                Some("cF".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Change, FindKind::TillForward)) => {
-                Some("ct".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Change, FindKind::TillBackward)) => {
-                Some("cT".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Delete, FindKind::Forward)) => {
-                Some("df".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Delete, FindKind::Backward)) => {
-                Some("dF".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Delete, FindKind::TillForward)) => {
-                Some("dt".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Delete, FindKind::TillBackward)) => {
-                Some("dT".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Yank, FindKind::Forward)) => {
-                Some("yf".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Yank, FindKind::Backward)) => {
-                Some("yF".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Yank, FindKind::TillForward)) => {
-                Some("yt".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Yank, FindKind::TillBackward)) => {
-                Some("yT".to_owned())
-            }
-            None => None,
-        }
-    }
-
-    fn replay_command_text(&self) -> Option<String> {
-        match self.last_replayable_action {
-            Some(ReplayableAction::NextGitHunk) => Some("gg".to_owned()),
-            Some(ReplayableAction::PreviousGitHunk) => Some("gG".to_owned()),
-            Some(ReplayableAction::Find(FindKind::Forward, target)) => Some(format!("f{target}")),
-            Some(ReplayableAction::Find(FindKind::Backward, target)) => Some(format!("F{target}")),
-            Some(ReplayableAction::Find(FindKind::TillForward, target)) => Some(format!("t{target}")),
-            Some(ReplayableAction::Find(FindKind::TillBackward, target)) => Some(format!("T{target}")),
-            Some(ReplayableAction::OperatorFind(PendingOperator::Change, FindKind::Forward, target)) => {
-                Some(format!("cf{target}"))
-            }
-            Some(ReplayableAction::OperatorFind(PendingOperator::Change, FindKind::Backward, target)) => {
-                Some(format!("cF{target}"))
-            }
-            Some(ReplayableAction::OperatorFind(PendingOperator::Change, FindKind::TillForward, target)) => {
-                Some(format!("ct{target}"))
-            }
-            Some(ReplayableAction::OperatorFind(PendingOperator::Change, FindKind::TillBackward, target)) => {
-                Some(format!("cT{target}"))
-            }
-            Some(ReplayableAction::OperatorFind(PendingOperator::Delete, FindKind::Forward, target)) => {
-                Some(format!("df{target}"))
-            }
-            Some(ReplayableAction::OperatorFind(PendingOperator::Delete, FindKind::Backward, target)) => {
-                Some(format!("dF{target}"))
-            }
-            Some(ReplayableAction::OperatorFind(PendingOperator::Delete, FindKind::TillForward, target)) => {
-                Some(format!("dt{target}"))
-            }
-            Some(ReplayableAction::OperatorFind(PendingOperator::Delete, FindKind::TillBackward, target)) => {
-                Some(format!("dT{target}"))
-            }
-            Some(ReplayableAction::OperatorFind(PendingOperator::Yank, FindKind::Forward, target)) => {
-                Some(format!("yf{target}"))
-            }
-            Some(ReplayableAction::OperatorFind(PendingOperator::Yank, FindKind::Backward, target)) => {
-                Some(format!("yF{target}"))
-            }
-            Some(ReplayableAction::OperatorFind(PendingOperator::Yank, FindKind::TillForward, target)) => {
-                Some(format!("yt{target}"))
-            }
-            Some(ReplayableAction::OperatorFind(PendingOperator::Yank, FindKind::TillBackward, target)) => {
-                Some(format!("yT{target}"))
-            }
-            Some(ReplayableAction::ChangeLine) => Some("cc".to_owned()),
-            Some(ReplayableAction::DeleteLine) => Some("dd".to_owned()),
-            Some(ReplayableAction::YankLine) => Some("yy".to_owned()),
-            None => None,
-        }
-    }
-
-    fn command_hint_text(&self) -> String {
-        if self.go_input.active {
-            return "<buffer|replay>".to_owned();
-        }
-
-        let buffer_label = match self.pending_input_text() {
-            Some(pending) => format!("buffer {pending}"),
-            None => "buffer".to_owned(),
-        };
-        let replay_label = match self.replay_command_text() {
-            Some(replay) => format!("replay {replay}"),
-            None => "replay".to_owned(),
-        };
-
-        format!("<{buffer_label}|{replay_label}>")
-    }
-
-    fn cursor_position(&self, area: ratatui::layout::Rect) -> Position {
-        if !self.workspace.has_documents() {
-            return Position::new(area.x.saturating_add(1), area.y.saturating_add(1));
-        }
-
-        let pane_area = match self.layout_mode {
-            LayoutMode::Single => area,
-            LayoutMode::Dual | LayoutMode::TerminalSplit => {
-                let panes =
-                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
-                match self.focused_pane {
-                    FocusedPane::Left => panes[0],
-                    FocusedPane::Right => panes[1],
-                }
-            }
-        };
-
-        if self.layout_mode == LayoutMode::TerminalSplit && self.focused_pane == FocusedPane::Right {
-            return Position::new(pane_area.x.saturating_add(1), pane_area.y.saturating_add(1));
-        }
-
-        let Ok((width, _)) = terminal::size() else {
-            return Position::new(pane_area.x.saturating_add(1), pane_area.y.saturating_add(1));
-        };
-        let line_width = self
-            .active_document()
-            .and_then(|document| document.display_line_width(self.cursor.row, width as usize).ok())
-            .unwrap_or(0);
-        let column = self.cursor.column.min(line_width);
-        let relative_row = self.cursor.row.saturating_sub(self.viewport_row);
-        Position::new(
-            pane_area.x.saturating_add(12).saturating_add(column as u16),
-            pane_area.y.saturating_add(1).saturating_add(relative_row as u16),
-        )
-    }
-
-    fn go_input_cursor_position(&self, area: Rect) -> Position {
-        let popup = centered_rect(24, 3, area);
-        Position::new(
-            popup.x.saturating_add(5 + self.go_input.value.chars().count() as u16),
-            popup.y.saturating_add(1),
-        )
-    }
-
-    fn search_input_cursor_position(&self, area: Rect) -> Position {
-        let popup = centered_rect(36, 3, area);
-        Position::new(
-            popup.x.saturating_add(1 + self.search_input.value.chars().count() as u16),
-            popup.y.saturating_add(1),
-        )
-    }
-
-    fn picker_cursor_position(&self, area: Rect) -> Position {
-        let popup = centered_rect(72, 12, area);
-        Position::new(
-            popup.x.saturating_add(1 + self.picker.query.chars().count() as u16),
-            popup.y.saturating_add(1),
-        )
     }
 
     fn move_cursor_up(&mut self) {
@@ -2478,6 +2026,10 @@ impl App {
         {
             self.push_jump_history();
             self.jump_with_context(row, width as usize);
+            self.last_replayable_action = Some(ReplayableAction::Diagnostic {
+                error_only,
+                forward: true,
+            });
         }
     }
 
@@ -2493,6 +2045,10 @@ impl App {
         {
             self.push_jump_history();
             self.jump_with_context(row, width as usize);
+            self.last_replayable_action = Some(ReplayableAction::Diagnostic {
+                error_only,
+                forward: false,
+            });
         }
     }
 
@@ -2564,15 +2120,17 @@ impl App {
             return;
         }
 
+        self.save_current_buffer_view_state();
         self.workspace.close_current();
         let _ = self.refresh_picker_candidates();
-        self.viewport_row = 0;
-        self.cursor.row = 0;
-        self.cursor.column = 0;
         if !self.workspace.has_documents() {
+            self.cursor = CursorState { row: 0, column: 0 };
+            self.viewport_row = 0;
             self.layout_mode = LayoutMode::Single;
             self.focused_pane = FocusedPane::Left;
             self.mode = Mode::Normal;
+        } else {
+            self.restore_current_buffer_view_state();
         }
     }
 
@@ -2590,7 +2148,7 @@ impl App {
 
         if self.layout_mode == LayoutMode::Dual && self.focused_pane == FocusedPane::Right {
             if let Some(other_index) = self.workspace.secondary_index() {
-                self.workspace.current_index = other_index;
+                self.select_current_document(other_index);
             } else {
                 self.focused_pane = FocusedPane::Left;
             }
@@ -2598,7 +2156,7 @@ impl App {
             && self.focused_pane == FocusedPane::Left
             && self.workspace.current_index != 0
         {
-            self.workspace.current_index = 0;
+            self.select_current_document(0);
         }
     }
 
@@ -2613,7 +2171,7 @@ impl App {
     fn collapse_to_single_pane(&mut self) {
         if self.layout_mode == LayoutMode::Dual && self.focused_pane == FocusedPane::Right {
             if let Some(other_index) = self.workspace.secondary_index() {
-                self.workspace.current_index = other_index;
+                self.select_current_document(other_index);
             }
         }
 
@@ -2703,375 +2261,11 @@ impl App {
     }
 }
 
-impl Workspace {
-    pub fn has_documents(&self) -> bool {
-        !self.documents.is_empty()
-    }
-
-    pub fn current_document(&self) -> &Document {
-        &self.documents[self.current_index].document
-    }
-
-    pub fn current_document_mut(&mut self) -> &mut Document {
-        &mut self.documents[self.current_index].document
-    }
-
-    pub fn try_current_document(&self) -> Option<&Document> {
-        self.documents.get(self.current_index).map(|entry| &entry.document)
-    }
-
-    pub fn try_current_document_mut(&mut self) -> Option<&mut Document> {
-        self.documents.get_mut(self.current_index).map(|entry| &mut entry.document)
-    }
-
-    pub fn open_buffer_candidates(&self) -> Vec<OpenCandidate> {
-        self.documents
-            .iter()
-            .map(|entry| {
-                OpenCandidate::OpenBuffer(OpenBufferCandidate::new(
-                    entry.path.clone(),
-                    display_name(&entry.path),
-                ))
-            })
-            .collect()
-    }
-
-    pub fn current_document_name(&self) -> Option<String> {
-        self.documents
-            .get(self.current_index)
-            .map(|entry| display_name(&entry.path))
-    }
-
-    pub fn current_document_path(&self) -> Option<&Path> {
-        self.documents.get(self.current_index).map(|entry| entry.path.as_path())
-    }
-
-    pub fn find_document_index(&self, path: &Path) -> Option<usize> {
-        self.documents.iter().position(|entry| entry.path == path)
-    }
-
-    pub fn make_current(&mut self, index: usize) {
-        if index >= self.documents.len() {
-            return;
-        }
-        if index != 0 {
-            let entry = self.documents.remove(index);
-            self.documents.insert(0, entry);
-        }
-        self.current_index = 0;
-    }
-
-    pub fn open_document(&mut self, path: PathBuf) -> Result<()> {
-        let document = Document::open(&path)?;
-        self.documents.insert(0, DocumentEntry { path, document });
-        self.current_index = 0;
-        Ok(())
-    }
-
-    pub fn close_current(&mut self) {
-        if self.documents.is_empty() {
-            return;
-        }
-        self.documents.remove(self.current_index);
-        if self.documents.is_empty() {
-            self.current_index = 0;
-        } else {
-            self.current_index = self.current_index.min(self.documents.len().saturating_sub(1));
-        }
-    }
-
-    pub fn secondary_index(&self) -> Option<usize> {
-        if self.documents.len() < 2 {
-            None
-        } else if self.current_index == 0 {
-            Some(1)
-        } else {
-            Some(0)
-        }
-    }
-}
-
-struct TerminalSession {
-    terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
-    suspend_signal_guard: SuspendSignalGuard,
-    active: bool,
-}
-
-impl TerminalSession {
-    fn enter() -> Result<Self> {
-        let mut stdout = std::io::stdout();
-        terminal::enable_raw_mode()?;
-        execute!(stdout, EnterAlternateScreen, cursor::Show, SetCursorStyle::SteadyBar)?;
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
-        Ok(Self {
-            terminal,
-            suspend_signal_guard: SuspendSignalGuard::enter(),
-            active: true,
-        })
-    }
-
-    fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<std::io::Stdout>> {
-        &mut self.terminal
-    }
-
-    fn leave(&mut self) -> Result<()> {
-        if !self.active {
-            return Ok(());
-        }
-
-        self.terminal.flush()?;
-        execute!(self.terminal.backend_mut(), cursor::Show, LeaveAlternateScreen)?;
-        terminal::disable_raw_mode()?;
-        self.active = false;
-        Ok(())
-    }
-}
-
-struct SuspendSignalGuard {
-    #[cfg(unix)]
-    signal_id: signal_hook::SigId,
-    _ignored: Arc<AtomicBool>,
-}
-
-impl SuspendSignalGuard {
-    fn enter() -> Self {
-        #[cfg(unix)]
-        {
-            let ignored = Arc::new(AtomicBool::new(false));
-            let signal_id = flag::register(SIGTSTP, Arc::clone(&ignored))
-                .expect("failed to register SIGTSTP handler");
-            Self {
-                signal_id,
-                _ignored: ignored,
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            Self {}
-        }
-    }
-}
-
-impl Drop for SuspendSignalGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        low_level::unregister(self.signal_id);
-    }
-}
-
-impl Drop for TerminalSession {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = self.terminal.flush();
-            let _ = execute!(self.terminal.backend_mut(), cursor::Show, LeaveAlternateScreen);
-            let _ = terminal::disable_raw_mode();
-        }
-    }
-}
-
 fn display_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| path.display().to_string())
-}
-
-fn format_render_lines(
-    lines: &[crate::document::DocumentRenderLine],
-    indent_width: usize,
-    search_query: Option<&str>,
-) -> Vec<Line<'static>> {
-    let mut formatted_lines = Vec::with_capacity(lines.len());
-    let mut previous_guide_width = 0usize;
-
-    for line in lines {
-        let current_guide_width = if line.text.is_empty() {
-            previous_guide_width
-        } else {
-            line.text.chars().take_while(|ch| *ch == ' ').count()
-        };
-
-        formatted_lines.push(format_render_line(
-            line,
-            indent_width,
-            current_guide_width,
-            search_query,
-        ));
-        previous_guide_width = current_guide_width;
-    }
-
-    formatted_lines
-}
-
-fn format_render_line(
-    line: &crate::document::DocumentRenderLine,
-    indent_width: usize,
-    empty_line_guide_width: usize,
-    search_query: Option<&str>,
-) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled(
-            format!("{:>1}", line.diagnostic_marker),
-            Style::default().fg(diagnostic_color(&line.diagnostic_marker)),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            format!("{:>6}", line.line_number),
-            Style::default().fg(AppColors::MUTED),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            format!("{:>1}", line.gutter_marker),
-            Style::default().fg(git_gutter_color(&line.gutter_marker)),
-        ),
-        Span::raw(" "),
-    ];
-    spans.extend(render_text_with_indent_guides(
-        &line.text,
-        indent_width,
-        empty_line_guide_width,
-        search_query,
-    ));
-    Line::from(spans)
-}
-
-fn render_text_with_indent_guides(
-    text: &str,
-    indent_width: usize,
-    empty_line_guide_width: usize,
-    search_query: Option<&str>,
-) -> Vec<Span<'static>> {
-    let leading_spaces = text.chars().take_while(|ch| *ch == ' ').count();
-    let guide_width = indent_width.max(1);
-
-    if leading_spaces == 0 && empty_line_guide_width == 0 {
-        return render_search_highlighted_text(text, search_query);
-    }
-
-    let mut spans = Vec::new();
-    let visual_indent_width = if leading_spaces == 0 {
-        empty_line_guide_width
-    } else {
-        leading_spaces
-    };
-    let guide_count = visual_indent_width / guide_width;
-    let trailing_spaces = visual_indent_width % guide_width;
-
-    for _ in 0..guide_count {
-        spans.push(Span::styled(
-            format!("\u{2502}{}", " ".repeat(guide_width.saturating_sub(1))),
-            Style::default().fg(AppColors::INDENT_GUIDE),
-        ));
-    }
-
-    if trailing_spaces > 0 {
-        spans.push(Span::raw(" ".repeat(trailing_spaces)));
-    }
-
-    if !text.is_empty() {
-        spans.extend(render_search_highlighted_text(
-            &text.chars().skip(leading_spaces).collect::<String>(),
-            search_query,
-        ));
-    }
-
-    spans
-}
-
-fn render_search_highlighted_text(text: &str, search_query: Option<&str>) -> Vec<Span<'static>> {
-    let Some(query) = search_query.filter(|query| !query.is_empty()) else {
-        return vec![Span::styled(
-            text.to_owned(),
-            Style::default().fg(AppColors::FOREGROUND),
-        )];
-    };
-
-    let mut spans = Vec::new();
-    let mut remaining = text;
-
-    while let Some(index) = remaining.find(query) {
-        if index > 0 {
-            spans.push(Span::styled(
-                remaining[..index].to_owned(),
-                Style::default().fg(AppColors::FOREGROUND),
-            ));
-        }
-
-        spans.push(Span::styled(
-            remaining[index..index + query.len()].to_owned(),
-            Style::default()
-                .fg(AppColors::BACKGROUND)
-                .bg(AppColors::SEARCH_HIGHLIGHT),
-        ));
-
-        remaining = &remaining[index + query.len()..];
-    }
-
-    if !remaining.is_empty() {
-        spans.push(Span::styled(
-            remaining.to_owned(),
-            Style::default().fg(AppColors::FOREGROUND),
-        ));
-    }
-
-    if spans.is_empty() {
-        spans.push(Span::styled(
-            text.to_owned(),
-            Style::default().fg(AppColors::FOREGROUND),
-        ));
-    }
-
-    spans
-}
-
-
-fn powerline_segment(
-    text: String,
-    foreground: ratatui::style::Color,
-    background: ratatui::style::Color,
-) -> Span<'static> {
-    Span::styled(
-        format!(" {text} "),
-        Style::default().fg(foreground).bg(background),
-    )
-}
-
-fn git_gutter_color(marker: &str) -> ratatui::style::Color {
-    match marker {
-        "A" => AppColors::GIT_ADDED,
-        "M" => AppColors::GIT_MODIFIED,
-        "D" => AppColors::GIT_REMOVED,
-        _ => AppColors::MUTED,
-    }
-}
-
-fn diagnostic_color(marker: &str) -> ratatui::style::Color {
-    match marker {
-        "W" => AppColors::DIAGNOSTIC_WARNING,
-        "E" => AppColors::DIAGNOSTIC_ERROR,
-        _ => AppColors::MUTED,
-    }
-}
-
-fn powerline_separator_left(
-    left_background: ratatui::style::Color,
-    right_background: ratatui::style::Color,
-) -> Span<'static> {
-    Span::styled(
-        "\u{e0b0}",
-        Style::default()
-            .fg(left_background)
-            .bg(right_background),
-    )
-}
-
-fn powerline_separator_right(foreground: ratatui::style::Color) -> Span<'static> {
-    Span::styled(
-        format!(" {} ", '\u{e0b1}'),
-        Style::default().fg(foreground).bg(AppColors::PANEL),
-    )
 }
 
 fn insert_escape_timeout() -> Duration {
@@ -3084,6 +2278,19 @@ fn motion_destination_column(find_kind: FindKind, found_column: usize) -> usize 
         FindKind::Backward => found_column,
         FindKind::TillForward => found_column,
         FindKind::TillBackward => found_column.saturating_add(1),
+    }
+}
+
+fn invert_find_kind(find_kind: FindKind, reverse: bool) -> FindKind {
+    if !reverse {
+        return find_kind;
+    }
+
+    match find_kind {
+        FindKind::Forward => FindKind::Backward,
+        FindKind::Backward => FindKind::Forward,
+        FindKind::TillForward => FindKind::TillBackward,
+        FindKind::TillBackward => FindKind::TillForward,
     }
 }
 
@@ -3118,12 +2325,6 @@ fn operator_range(
 
     (start_row < end_row || end_column > start_column)
         .then_some((start_row, start_column, end_row, end_column))
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
-    let y = area.y.saturating_add(area.height.saturating_sub(height) / 2);
-    Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
 fn first_matching_line_number(path: &Path, query: &str) -> Result<Option<(usize, usize)>> {

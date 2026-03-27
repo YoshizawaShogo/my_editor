@@ -13,13 +13,13 @@ mod picker_match;
 
 #[derive(Parser)]
 struct Args {
-    path: PathBuf,
+    path: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
 
-    match app::App::open(&args.path) {
+    match app::App::open(args.path.as_deref()) {
         Ok(mut app) => match app.run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

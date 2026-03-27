@@ -17,6 +17,9 @@ impl AppColors {
     pub const PANEL: Color = Color::Rgb(20, 22, 26);
     pub const PANEL_ALT: Color = Color::Rgb(28, 31, 36);
     pub const PANEL_SOFT: Color = Color::Rgb(36, 40, 46);
+    pub const EDITOR_PANE: Color = Color::Rgb(9, 12, 18);
+    pub const EDITOR_PANE_FOCUSED: Color = Color::Rgb(14, 20, 34);
+    pub const SPLIT_DIVIDER: Color = Color::Rgb(34, 40, 54);
     pub const NORMAL_MODE: Color = Color::Rgb(128, 143, 167);
     pub const INSERT_MODE: Color = Color::Rgb(162, 187, 152);
     pub const COMMAND_MODE: Color = Color::Rgb(204, 176, 138);
