@@ -2,7 +2,7 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Position, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
@@ -96,6 +96,10 @@ impl App {
                 self.render_picker(frame, area);
             }
 
+            if self.toast.message.is_some() {
+                self.render_toast(frame, layout[0]);
+            }
+
             let cursor_position = if self.go_input.active {
                 self.go_input_cursor_position(area)
             } else if self.rename_input.active {
@@ -120,13 +124,13 @@ impl App {
         match self.effective_mode() {
             Mode::Normal => AppColors::NORMAL_MODE,
             Mode::Insert => AppColors::INSERT_MODE,
-            Mode::Command => AppColors::COMMAND_MODE,
             Mode::Shell => AppColors::SHELL_MODE,
         }
     }
 
     fn effective_mode(&self) -> Mode {
-        if self.layout_mode == LayoutMode::TerminalSplit && self.focused_pane == FocusedPane::Right
+        if self.focused_pane == FocusedPane::Right
+            && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single)
         {
             Mode::Shell
         } else {
@@ -152,7 +156,8 @@ impl App {
     }
 
     fn active_pane_label(&self) -> String {
-        if self.layout_mode == LayoutMode::TerminalSplit && self.focused_pane == FocusedPane::Right
+        if self.focused_pane == FocusedPane::Right
+            && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single)
         {
             return format!("terminal {}", self.shell.program);
         }
@@ -162,7 +167,8 @@ impl App {
     }
 
     fn active_pane_status(&self) -> String {
-        if self.layout_mode == LayoutMode::TerminalSplit && self.focused_pane == FocusedPane::Right
+        if self.focused_pane == FocusedPane::Right
+            && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single)
         {
             return "TERMINAL".to_owned();
         }
@@ -190,6 +196,7 @@ impl App {
 
         match self.layout_mode {
             LayoutMode::TerminalSplit if self.focused_pane == FocusedPane::Right => None,
+            LayoutMode::Single if self.focused_pane == FocusedPane::Right => None,
             _ => Some(self.workspace.current_index),
         }
     }
@@ -206,20 +213,27 @@ impl App {
     }
 
     fn render_content(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        if !self.workspace.has_documents() {
-            self.render_title_screen(frame, area);
-            return;
-        }
-
         match self.layout_mode {
-            LayoutMode::Single => self.render_document_pane(
-                frame,
-                area,
-                self.workspace.current_index,
-                self.viewport_row,
-                self.focused_pane == FocusedPane::Left,
-            ),
+            LayoutMode::Single => {
+                if self.focused_pane == FocusedPane::Right {
+                    self.render_terminal_pane(frame, area, true);
+                } else if !self.workspace.has_documents() {
+                    self.render_title_screen(frame, area);
+                } else {
+                    self.render_document_pane(
+                        frame,
+                        area,
+                        self.workspace.current_index,
+                        self.viewport_row,
+                        true,
+                    );
+                }
+            }
             LayoutMode::Dual => {
+                if !self.workspace.has_documents() {
+                    self.render_title_screen(frame, area);
+                    return;
+                }
                 let panes = Layout::horizontal([
                     Constraint::Fill(1),
                     Constraint::Length(1),
@@ -278,13 +292,17 @@ impl App {
                 ])
                 .split(area);
                 self.render_split_divider(frame, panes[1]);
-                self.render_document_pane(
-                    frame,
-                    panes[0],
-                    self.workspace.current_index,
-                    self.viewport_row,
-                    self.focused_pane == FocusedPane::Left,
-                );
+                if self.workspace.has_documents() {
+                    self.render_document_pane(
+                        frame,
+                        panes[0],
+                        self.workspace.current_index,
+                        self.viewport_row,
+                        self.focused_pane == FocusedPane::Left,
+                    );
+                } else {
+                    self.render_title_screen(frame, panes[0]);
+                }
                 self.render_terminal_pane(frame, panes[2], self.focused_pane == FocusedPane::Right);
             }
         }
@@ -356,13 +374,8 @@ impl App {
     }
 
     fn render_terminal_pane(&self, frame: &mut ratatui::Frame<'_>, area: Rect, focused: bool) {
-        let widget = Paragraph::new(vec![
-            Line::from(Span::styled("terminal", Style::default().fg(AppColors::ACCENT))),
-            Line::from(""),
-            Line::from(format!("shell: {}", self.shell.program)),
-            Line::from(""),
-            Line::from("Interactive PTY is not wired yet."),
-        ])
+        let lines = self.terminal_screen_lines(area);
+        let widget = Paragraph::new(lines)
         .style(
             Style::default()
                 .fg(if focused {
@@ -499,9 +512,32 @@ impl App {
         frame.render_widget(widget, popup);
     }
 
+    fn render_toast(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let Some(message) = &self.toast.message else {
+            return;
+        };
+
+        let width = (message.chars().count() as u16 + 4).clamp(12, area.width.max(12));
+        let x = area
+            .x
+            .saturating_add(area.width.saturating_sub(width));
+        let y = area
+            .y
+            .saturating_add(area.height.saturating_sub(1));
+        let popup = Rect::new(x, y, width.min(area.width), 1);
+        let widget = Paragraph::new(format!(" {message} ")).style(
+            Style::default()
+                .fg(AppColors::ACCENT)
+                .bg(AppColors::PANEL_ALT),
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(widget, popup);
+    }
+
     fn pending_input_text(&self) -> Option<String> {
         match self.pending_normal_action {
             Some(PendingNormalAction::GoPrefix) => Some("g".to_owned()),
+            Some(PendingNormalAction::DiagnosticPrefix) => Some("e".to_owned()),
             Some(PendingNormalAction::Find(FindKind::Forward)) => Some("f".to_owned()),
             Some(PendingNormalAction::Find(FindKind::Backward)) => Some("F".to_owned()),
             Some(PendingNormalAction::Find(FindKind::TillForward)) => Some("t".to_owned()),
@@ -601,7 +637,10 @@ impl App {
     }
 
     fn cursor_position(&self, area: Rect) -> Position {
-        if !self.workspace.has_documents() {
+        if !self.workspace.has_documents()
+            && !(self.focused_pane == FocusedPane::Right
+                && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single))
+        {
             return Position::new(area.x.saturating_add(1), area.y.saturating_add(1));
         }
 
@@ -621,8 +660,17 @@ impl App {
             }
         };
 
-        if self.layout_mode == LayoutMode::TerminalSplit && self.focused_pane == FocusedPane::Right {
-            return Position::new(pane_area.x.saturating_add(1), pane_area.y.saturating_add(1));
+        if self.focused_pane == FocusedPane::Right
+            && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single)
+        {
+            let Some(parser) = &self.shell.parser else {
+                return Position::new(pane_area.x, pane_area.y);
+            };
+            let (row, col) = parser.screen().cursor_position();
+            return Position::new(
+                pane_area.x.saturating_add(col.min(pane_area.width.saturating_sub(1))),
+                pane_area.y.saturating_add(row.min(pane_area.height.saturating_sub(1))),
+            );
         }
 
         let line_width = self
@@ -685,6 +733,99 @@ impl App {
     fn hover_popup_cursor_position(&self, area: Rect) -> Position {
         let popup = centered_rect(72, 3, area);
         Position::new(popup.x.saturating_add(1), popup.y.saturating_add(1))
+    }
+
+    fn terminal_screen_lines(&self, area: Rect) -> Vec<Line<'static>> {
+        let Some(parser) = &self.shell.parser else {
+            return vec![Line::from("")];
+        };
+
+        let screen = parser.screen();
+        let rows = area.height.max(1);
+        let cols = area.width.max(1);
+        let mut lines = Vec::with_capacity(rows as usize);
+
+        for row in 0..rows {
+            let mut spans = Vec::new();
+            let mut current_text = String::new();
+            let mut current_style = None::<Style>;
+
+            for col in 0..cols {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+
+                let mut style = vt100_cell_style(cell);
+                if style.fg.is_none() {
+                    style = style.fg(AppColors::FOREGROUND);
+                }
+                if style.bg.is_none() {
+                    style = style.bg(AppColors::BACKGROUND);
+                }
+                let text = if cell.has_contents() {
+                    cell.contents()
+                } else {
+                    " ".to_owned()
+                };
+
+                if current_style == Some(style) {
+                    current_text.push_str(&text);
+                } else {
+                    if !current_text.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut current_text), current_style.unwrap_or_default()));
+                    }
+                    current_text = text;
+                    current_style = Some(style);
+                }
+            }
+
+            if !current_text.is_empty() {
+                spans.push(Span::styled(current_text, current_style.unwrap_or_default()));
+            }
+            if spans.is_empty() {
+                spans.push(Span::raw(" "));
+            }
+            lines.push(Line::from(spans));
+        }
+
+        lines
+    }
+}
+
+fn vt100_cell_style(cell: &vt100::Cell) -> Style {
+    let mut fg = vt100_to_ratatui_color(cell.fgcolor());
+    let mut bg = vt100_to_ratatui_color(cell.bgcolor());
+    if cell.inverse() {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+
+    let mut style = Style::default();
+    if let Some(fg) = fg {
+        style = style.fg(fg);
+    }
+    if let Some(bg) = bg {
+        style = style.bg(bg);
+    }
+    if cell.bold() {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if cell.italic() {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if cell.underline() {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    style
+}
+
+fn vt100_to_ratatui_color(color: vt100::Color) -> Option<ratatui::style::Color> {
+    match color {
+        vt100::Color::Default => None,
+        vt100::Color::Idx(index) => Some(ratatui::style::Color::Indexed(index)),
+        vt100::Color::Rgb(r, g, b) => Some(ratatui::style::Color::Rgb(r, g, b)),
     }
 }
 

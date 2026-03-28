@@ -9,6 +9,7 @@ pub enum ReplayableAction {
 #[derive(Clone, Copy)]
 pub enum PendingNormalAction {
     GoPrefix,
+    DiagnosticPrefix,
     Find(FindKind),
     Operator(PendingOperator),
     OperatorFind(PendingOperator, FindKind),

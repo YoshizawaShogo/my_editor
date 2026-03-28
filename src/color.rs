@@ -23,6 +23,5 @@ impl AppColors {
     pub const SPLIT_DIVIDER: Color = Color::Rgb(34, 40, 54);
     pub const NORMAL_MODE: Color = Color::Rgb(128, 143, 167);
     pub const INSERT_MODE: Color = Color::Rgb(162, 187, 152);
-    pub const COMMAND_MODE: Color = Color::Rgb(204, 176, 138);
     pub const SHELL_MODE: Color = Color::Rgb(176, 154, 196);
 }

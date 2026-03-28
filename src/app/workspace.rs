@@ -57,7 +57,14 @@ impl Workspace {
     }
 
     pub fn find_document_index(&self, path: &Path) -> Option<usize> {
-        self.documents.iter().position(|entry| entry.path == path)
+        let normalized = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        };
+        self.documents
+            .iter()
+            .position(|entry| entry.path == normalized)
     }
 
     pub fn make_current(&mut self, index: usize) {
@@ -79,6 +86,11 @@ impl Workspace {
     }
 
     pub fn open_document(&mut self, path: PathBuf) -> Result<()> {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()?.join(path)
+        };
         let document = Document::open(&path)?;
         self.documents.insert(
             0,

@@ -34,6 +34,8 @@ enum NormalAction {
     OpenPicker,
     OpenSearch,
     OpenDiagnosticPopup,
+    OpenDiagnosticList { error_only: bool },
+    OpenWorkspaceDiagnosticList { error_only: bool },
     OpenScratchTarget,
     OpenHoverPopup,
     OpenRenameInput,
@@ -45,6 +47,7 @@ enum NormalAction {
     EnterInsertAppend,
     EnterInsertAtCursor,
     JumpBack,
+    JumpForward,
     PageDownHalf,
     PageUpHalf,
     MoveUp,
@@ -141,7 +144,8 @@ fn transition_normal_input(
         (None, In::Char('a')) => Dec::Action(Act::EnterInsertAppend),
         (None, In::Char('h')) => Dec::Action(Act::EnterInsertAtCursor),
         (None, In::Char('b')) => Dec::Action(Act::JumpBack),
-        (None, In::Char('e')) => Dec::Action(Act::OpenDiagnosticPopup),
+        (None, In::Char('B')) => Dec::Action(Act::JumpForward),
+        (None, In::Char('e')) => Dec::SetPending(State::DiagnosticPrefix),
         (None, In::Char('K')) => Dec::Action(Act::OpenHoverPopup),
         (None, In::Char('i')) => Dec::Action(Act::MoveUp),
         (None, In::Char('j')) => Dec::Action(Act::MoveLeft),
@@ -192,6 +196,20 @@ fn transition_normal_input(
             Dec::Action(Act::Goto { kind: super::GotoKind::Implementation })
         }
         (Some(State::GoPrefix), In::Char('r')) => Dec::Action(Act::ShowReferences),
+
+        (Some(State::DiagnosticPrefix), In::Char('d')) => Dec::Action(Act::OpenDiagnosticPopup),
+        (Some(State::DiagnosticPrefix), In::Char('w')) => {
+            Dec::Action(Act::OpenDiagnosticList { error_only: false })
+        }
+        (Some(State::DiagnosticPrefix), In::Char('e')) => {
+            Dec::Action(Act::OpenDiagnosticList { error_only: true })
+        }
+        (Some(State::DiagnosticPrefix), In::Char('W')) => {
+            Dec::Action(Act::OpenWorkspaceDiagnosticList { error_only: false })
+        }
+        (Some(State::DiagnosticPrefix), In::Char('E')) => {
+            Dec::Action(Act::OpenWorkspaceDiagnosticList { error_only: true })
+        }
 
         (Some(State::Find(kind)), In::Char(target)) => {
             Dec::Action(Act::FindMotion { kind, target })
@@ -259,10 +277,19 @@ impl App {
             return self.handle_picker_key(key_event);
         }
 
+        if self.focused_pane == super::FocusedPane::Right
+            && matches!(
+                self.layout_mode,
+                super::LayoutMode::TerminalSplit | super::LayoutMode::Single
+            )
+        {
+            return self.handle_shell_mode_key(key_event);
+        }
+
         match self.mode {
             Mode::Normal => self.handle_normal_mode_key(key_event),
             Mode::Insert => self.handle_insert_mode_key(key_event),
-            Mode::Command | Mode::Shell => Ok(false),
+            Mode::Shell => self.handle_shell_mode_key(key_event),
         }
     }
 
@@ -300,6 +327,12 @@ impl App {
             NormalAction::OpenPicker => self.open_or_cycle_picker()?,
             NormalAction::OpenSearch => self.open_or_cycle_search_input(),
             NormalAction::OpenDiagnosticPopup => self.open_current_diagnostic_popup(),
+            NormalAction::OpenDiagnosticList { error_only } => {
+                self.open_diagnostic_list(error_only);
+            }
+            NormalAction::OpenWorkspaceDiagnosticList { error_only } => {
+                self.request_workspace_diagnostic_list(error_only)?;
+            }
             NormalAction::OpenScratchTarget => {
                 if self.workspace.has_documents() && self.workspace.current_document().is_scratch() {
                     self.open_scratch_target_under_cursor()?;
@@ -318,7 +351,7 @@ impl App {
             NormalAction::CloseCurrentBuffer => self.close_current_buffer(),
             NormalAction::AdvanceLayoutOrFocus => self.advance_layout_or_focus(),
             NormalAction::CollapseToSinglePane => self.collapse_to_single_pane(),
-            NormalAction::ToggleTerminalSplit => self.toggle_terminal_split(),
+            NormalAction::ToggleTerminalSplit => self.toggle_terminal_split()?,
             NormalAction::Save => {
                 if self.workspace.has_documents() {
                     self.save_current_document()?;
@@ -341,6 +374,7 @@ impl App {
                 }
             }
             NormalAction::JumpBack => self.jump_back(),
+            NormalAction::JumpForward => self.jump_forward(),
             NormalAction::PageDownHalf => {
                 if self.workspace.has_documents() {
                     self.page_down_half();
@@ -483,6 +517,14 @@ impl App {
             }
             KeyCode::Char('e') if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_diagnostic_list(true);
+                Ok(false)
+            }
+            KeyCode::Char('W') if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.request_workspace_diagnostic_list(false)?;
+                Ok(false)
+            }
+            KeyCode::Char('E') if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.request_workspace_diagnostic_list(true)?;
                 Ok(false)
             }
             _ => Ok(false),
@@ -737,7 +779,7 @@ impl App {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('p'))
         {
-            self.open_or_cycle_picker()?;
+            self.close_picker();
             return Ok(false);
         }
 

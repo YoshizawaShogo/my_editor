@@ -9,6 +9,7 @@ impl App {
             column: self.cursor.column,
             viewport_row: self.viewport_row,
         });
+        self.jump_forward_history.clear();
     }
 
     pub(super) fn jump_back(&mut self) {
@@ -16,9 +17,32 @@ impl App {
             return;
         };
 
+        self.jump_forward_history.push(super::JumpPosition {
+            row: self.cursor.row,
+            column: self.cursor.column,
+            viewport_row: self.viewport_row,
+        });
+
         self.cursor.row = previous.row;
         self.cursor.column = previous.column;
         self.viewport_row = previous.viewport_row;
+        self.clamp_vertical_state();
+    }
+
+    pub(super) fn jump_forward(&mut self) {
+        let Some(next) = self.jump_forward_history.pop() else {
+            return;
+        };
+
+        self.jump_history.push(super::JumpPosition {
+            row: self.cursor.row,
+            column: self.cursor.column,
+            viewport_row: self.viewport_row,
+        });
+
+        self.cursor.row = next.row;
+        self.cursor.column = next.column;
+        self.viewport_row = next.viewport_row;
         self.clamp_vertical_state();
     }
 

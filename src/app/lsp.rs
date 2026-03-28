@@ -7,10 +7,14 @@ use std::{
 
 use lsp_server::{Message, Notification, Request, RequestId};
 use lsp_types::{
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    GotoDefinitionParams, Hover, HoverContents, HoverParams, Location, Position,
-    ReferenceContext, ReferenceParams, RenameParams, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Uri, WorkDoneProgressParams, WorkspaceEdit, notification, request,
+    ClientCapabilities, DiagnosticClientCapabilities, DiagnosticWorkspaceClientCapabilities,
+    DidChangeConfigurationParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, GotoDefinitionParams, Hover, HoverContents, HoverParams, Location,
+    Position, ReferenceContext, ReferenceParams, RenameParams, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, TextDocumentClientCapabilities, Uri,
+    WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceDiagnosticParams,
+    WorkspaceDiagnosticReportResult, WorkspaceDocumentDiagnosticReport, WorkspaceEdit,
+    notification, request,
 };
 use lsp_types::notification::Notification as LspNotificationTrait;
 use lsp_types::request::Request as LspRequestTrait;
@@ -68,6 +72,10 @@ pub enum LspEvent {
         path: PathBuf,
         diagnostics: HashMap<usize, Vec<DiagnosticEntry>>,
     },
+    WorkspaceDiagnosticsResult {
+        error_only: bool,
+        items: Vec<WorkspaceDiagnosticItem>,
+    },
     GotoResult {
         kind: GotoKind,
         locations: Vec<Location>,
@@ -82,6 +90,15 @@ pub enum LspEvent {
         edit: Option<WorkspaceEdit>,
     },
     Failed(String),
+}
+
+#[derive(Clone)]
+pub struct WorkspaceDiagnosticItem {
+    pub path: PathBuf,
+    pub line_number: usize,
+    pub column: usize,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
 }
 
 enum LspCommand {
@@ -115,6 +132,9 @@ enum LspCommand {
         position: Position,
         new_name: String,
     },
+    WorkspaceDiagnostics {
+        error_only: bool,
+    },
 }
 
 enum PendingRequest {
@@ -122,6 +142,9 @@ enum PendingRequest {
     References,
     Hover,
     Rename,
+    WorkspaceDiagnostics {
+        error_only: bool,
+    },
 }
 
 pub struct RustLspClient {
@@ -129,12 +152,14 @@ pub struct RustLspClient {
     rx: Receiver<LspEvent>,
     pending_events: Vec<LspEvent>,
     opened_documents: HashSet<PathBuf>,
+    workspace_diagnostics_supported: bool,
 }
 
 impl RustLspClient {
     pub fn start(root_path: &Path) -> Result<Self> {
         let (tx, rx_commands) = unbounded_channel();
         let (tx_events, rx) = mpsc::channel();
+        let (tx_init, rx_init) = mpsc::channel();
         let root_path = root_path.to_path_buf();
 
         thread::spawn(move || {
@@ -142,21 +167,32 @@ impl RustLspClient {
             let runtime = match runtime {
                 Ok(runtime) => runtime,
                 Err(error) => {
+                    let _ = tx_init.send(Err(AppError::CommandFailed(format!(
+                        "failed to build tokio runtime: {error}"
+                    ))));
                     let _ = tx_events.send(LspEvent::Failed(format!("failed to build tokio runtime: {error}")));
                     return;
                 }
             };
 
-            if let Err(error) = runtime.block_on(run_lsp_worker(root_path, rx_commands, tx_events.clone())) {
+            if let Err(error) =
+                runtime.block_on(run_lsp_worker(root_path, rx_commands, tx_events.clone(), tx_init.clone()))
+            {
+                let _ = tx_init.send(Err(AppError::CommandFailed(format!("{error:?}"))));
                 let _ = tx_events.send(LspEvent::Failed(format!("{error:?}")));
             }
         });
+
+        let workspace_diagnostics_supported = rx_init
+            .recv()
+            .map_err(|_| AppError::CommandFailed("failed to receive LSP init result".to_owned()))??;
 
         Ok(Self {
             tx,
             rx,
             pending_events: Vec::new(),
             opened_documents: HashSet::new(),
+            workspace_diagnostics_supported,
         })
     }
 
@@ -231,6 +267,19 @@ impl RustLspClient {
         })
     }
 
+    pub fn workspace_diagnostics(&mut self, error_only: bool) -> Result<()> {
+        if !self.workspace_diagnostics_supported {
+            return Err(AppError::CommandFailed(
+                "workspace diagnostics unsupported by rust-analyzer".to_owned(),
+            ));
+        }
+        self.send(LspCommand::WorkspaceDiagnostics { error_only })
+    }
+
+    pub fn supports_workspace_diagnostics(&self) -> bool {
+        self.workspace_diagnostics_supported
+    }
+
     fn send(&self, command: LspCommand) -> Result<()> {
         self.tx
             .send(command)
@@ -250,6 +299,7 @@ async fn run_lsp_worker(
     root_path: PathBuf,
     mut rx_commands: UnboundedReceiver<LspCommand>,
     tx_events: Sender<LspEvent>,
+    tx_init: Sender<Result<bool>>,
 ) -> Result<()> {
     let mut child = Command::new("rust-analyzer")
         .current_dir(&root_path)
@@ -271,7 +321,9 @@ async fn run_lsp_worker(
     let mut next_request_id = 1;
     let mut pending_requests = HashMap::<RequestId, PendingRequest>::new();
 
-    initialize_server(&mut writer, &mut reader, &root_path, &mut next_request_id).await?;
+    let workspace_diagnostics_supported =
+        initialize_server(&mut writer, &mut reader, &root_path, &mut next_request_id).await?;
+    let _ = tx_init.send(Ok(workspace_diagnostics_supported));
 
     loop {
         select! {
@@ -303,7 +355,13 @@ async fn initialize_server(
     reader: &mut BufReader<ChildStdout>,
     root_path: &Path,
     next_request_id: &mut i32,
-) -> Result<()> {
+) -> Result<bool> {
+    let rust_analyzer_settings = serde_json::json!({
+        "checkOnSave": true,
+        "check": {
+            "command": "check"
+        }
+    });
     let root_uri = path_to_uri(root_path)?;
     let workspace_folders = Some(vec![lsp_types::WorkspaceFolder {
         uri: root_uri,
@@ -313,10 +371,30 @@ async fn initialize_server(
             .unwrap_or(".")
             .to_owned(),
     }]);
+    let capabilities = ClientCapabilities {
+        workspace: Some(WorkspaceClientCapabilities {
+            workspace_folders: Some(true),
+            configuration: Some(true),
+            diagnostic: Some(DiagnosticWorkspaceClientCapabilities {
+                refresh_support: Some(true),
+            }),
+            ..Default::default()
+        }),
+        text_document: Some(TextDocumentClientCapabilities {
+            diagnostic: Some(DiagnosticClientCapabilities {
+                dynamic_registration: Some(false),
+                related_document_support: Some(false),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
     let initialize_params = lsp_types::InitializeParams {
         process_id: Some(std::process::id()),
         workspace_folders,
-        capabilities: lsp_types::ClientCapabilities::default(),
+        capabilities,
+        initialization_options: Some(rust_analyzer_settings.clone()),
         ..Default::default()
     };
 
@@ -330,12 +408,24 @@ async fn initialize_server(
     )
     .await?;
 
-    loop {
+    let workspace_diagnostics_supported = loop {
         match read_message(reader).await? {
-            Message::Response(response) if response.id == request_id => break,
+            Message::Response(response) if response.id == request_id => {
+                if let Some(error) = response.error {
+                    return Err(AppError::CommandFailed(format!(
+                        "LSP initialize failed {}: {}",
+                        error.code, error.message
+                    )));
+                }
+                let result: lsp_types::InitializeResult = serde_json::from_value(
+                    response.result.unwrap_or(Value::Null),
+                )
+                .map_err(|error| AppError::CommandFailed(error.to_string()))?;
+                break supports_workspace_diagnostics(&result.capabilities);
+            }
             Message::Notification(_) | Message::Request(_) | Message::Response(_) => {}
         }
-    }
+    };
 
     send_notification(
         writer,
@@ -344,7 +434,20 @@ async fn initialize_server(
     )
     .await?;
 
-    Ok(())
+    let configuration = DidChangeConfigurationParams {
+        settings: serde_json::json!({
+            "rust-analyzer": rust_analyzer_settings,
+        }),
+    };
+    send_notification(
+        writer,
+        notification::DidChangeConfiguration::METHOD,
+        serde_json::to_value(configuration)
+            .map_err(|error| AppError::CommandFailed(error.to_string()))?,
+    )
+    .await?;
+
+    Ok(workspace_diagnostics_supported)
 }
 
 async fn handle_command(
@@ -507,6 +610,24 @@ async fn handle_command(
             )
             .await?;
         }
+        LspCommand::WorkspaceDiagnostics { error_only } => {
+            let params = WorkspaceDiagnosticParams {
+                identifier: None,
+                previous_result_ids: Vec::new(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: Default::default(),
+            };
+            let id = next_request_id_value(next_request_id);
+            pending_requests.insert(id.clone(), PendingRequest::WorkspaceDiagnostics { error_only });
+            send_request(
+                writer,
+                id,
+                request::WorkspaceDiagnosticRequest::METHOD,
+                serde_json::to_value(params)
+                    .map_err(|error| AppError::CommandFailed(error.to_string()))?,
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -579,6 +700,14 @@ fn process_message(
                     let edit = serde_json::from_value(response.result.unwrap_or(Value::Null))
                         .map_err(|error| AppError::CommandFailed(error.to_string()))?;
                     send_event(tx_events, LspEvent::RenameResult { edit });
+                }
+                PendingRequest::WorkspaceDiagnostics { error_only } => {
+                    let items =
+                        parse_workspace_diagnostics_response(response.result, error_only)?;
+                    send_event(
+                        tx_events,
+                        LspEvent::WorkspaceDiagnosticsResult { error_only, items },
+                    );
                 }
             }
         }
@@ -703,6 +832,75 @@ fn parse_locations_response(result: Option<Value>) -> Result<Vec<Location>> {
     Err(AppError::CommandFailed(
         "failed to parse LSP locations".to_owned(),
     ))
+}
+
+fn parse_workspace_diagnostics_response(
+    result: Option<Value>,
+    error_only: bool,
+) -> Result<Vec<WorkspaceDiagnosticItem>> {
+    let Some(value) = result else {
+        return Ok(Vec::new());
+    };
+
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let report: WorkspaceDiagnosticReportResult =
+        serde_json::from_value(value).map_err(|error| AppError::CommandFailed(error.to_string()))?;
+    let reports = match report {
+        WorkspaceDiagnosticReportResult::Report(report) => report.items,
+        WorkspaceDiagnosticReportResult::Partial(report) => report.items,
+    };
+
+    let mut items = Vec::new();
+    for report in reports {
+        let WorkspaceDocumentDiagnosticReport::Full(report) = report else {
+            continue;
+        };
+        let Some(path) = uri_to_path(&report.uri) else {
+            continue;
+        };
+
+        for diagnostic in report.full_document_diagnostic_report.items {
+            let severity = match diagnostic.severity {
+                Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
+                Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
+                _ => DiagnosticSeverity::Warning,
+            };
+            if error_only && severity != DiagnosticSeverity::Error {
+                continue;
+            }
+
+            items.push(WorkspaceDiagnosticItem {
+                path: path.clone(),
+                line_number: diagnostic.range.start.line as usize + 1,
+                column: diagnostic.range.start.character as usize,
+                severity,
+                message: diagnostic.message,
+            });
+        }
+    }
+
+    items.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.line_number.cmp(&right.line_number))
+            .then(left.column.cmp(&right.column))
+    });
+    Ok(items)
+}
+
+fn supports_workspace_diagnostics(capabilities: &lsp_types::ServerCapabilities) -> bool {
+    match &capabilities.diagnostic_provider {
+        Some(lsp_types::DiagnosticServerCapabilities::Options(options)) => {
+            options.workspace_diagnostics
+        }
+        Some(lsp_types::DiagnosticServerCapabilities::RegistrationOptions(options)) => {
+            options.diagnostic_options.workspace_diagnostics
+        }
+        None => false,
+    }
 }
 
 pub fn path_to_uri(path: &Path) -> Result<Uri> {
