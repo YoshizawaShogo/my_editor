@@ -6,6 +6,7 @@ impl AppColors {
     pub const BACKGROUND: Color = Color::Rgb(8, 8, 10);
     pub const FOREGROUND: Color = Color::Rgb(196, 198, 204);
     pub const MUTED: Color = Color::Rgb(146, 151, 162);
+    pub const CURRENT_LINE_NUMBER: Color = Color::Rgb(182, 186, 194);
     pub const INDENT_GUIDE: Color = Color::Rgb(78, 84, 94);
     pub const ACCENT: Color = Color::Rgb(166, 189, 214);
     pub const SEARCH_HIGHLIGHT: Color = Color::Rgb(180, 155, 92);

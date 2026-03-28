@@ -4,12 +4,15 @@ use crate::{config, error::Result};
 
 pub mod editable;
 pub mod large_file;
+pub mod scratch;
 
 pub use editable::{DiagnosticSeverity, DiagnosticSummary};
+pub use scratch::{DiagnosticEntry, ScratchDocument, ScratchRow, ScratchTarget};
 
 pub enum Document {
     Editable(editable::EditableDocument),
     LargeFile(large_file::LargeFileDocument),
+    Scratch(scratch::ScratchDocument),
 }
 
 const DIAGNOSTIC_WIDTH: usize = 1;
@@ -89,6 +92,7 @@ impl Document {
                 let status = build_status(page_width, status);
                 Ok(DocumentRender { lines, status })
             }
+            Self::Scratch(document) => Ok(document.render_first_page(viewport_row, page_height)),
         }
     }
 
@@ -100,6 +104,7 @@ impl Document {
         match self {
             Self::Editable(document) => Some(document.total_rows(content_width)),
             Self::LargeFile(_) => None,
+            Self::Scratch(document) => Some(document.total_rows()),
         }
     }
 
@@ -107,6 +112,7 @@ impl Document {
         match self {
             Self::Editable(document) => document.indent_width(),
             Self::LargeFile(_) => 4,
+            Self::Scratch(_) => 4,
         }
     }
 
@@ -124,6 +130,7 @@ impl Document {
         match self {
             Self::Editable(_) => Ok(None),
             Self::LargeFile(document) => Ok(Some(document.jump_to_bottom(page_height, content_width)?)),
+            Self::Scratch(document) => Ok(Some(document.total_rows().saturating_sub(page_height.max(1)))),
         }
     }
 
@@ -131,6 +138,7 @@ impl Document {
         match self {
             Self::Editable(document) => document.save(path),
             Self::LargeFile(_) => Ok(()),
+            Self::Scratch(_) => Ok(()),
         }
     }
 
@@ -138,6 +146,7 @@ impl Document {
         match self {
             Self::Editable(document) => document.undo(),
             Self::LargeFile(_) => false,
+            Self::Scratch(_) => false,
         }
     }
 
@@ -145,6 +154,7 @@ impl Document {
         match self {
             Self::Editable(document) => document.redo(),
             Self::LargeFile(_) => false,
+            Self::Scratch(_) => false,
         }
     }
 
@@ -179,6 +189,7 @@ impl Document {
                 ch,
             )),
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -199,6 +210,7 @@ impl Document {
                 content_width.max(1),
             )),
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -219,6 +231,7 @@ impl Document {
                 content_width.max(1),
             ),
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -239,6 +252,7 @@ impl Document {
                 content_width.max(1),
             )),
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -259,6 +273,7 @@ impl Document {
                 content_width.max(1),
             ),
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -270,6 +285,7 @@ impl Document {
         match self {
             Self::Editable(document) => document.next_git_marker_row(current_row, content_width.max(1)),
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -283,6 +299,7 @@ impl Document {
                 document.previous_git_marker_row(current_row, content_width.max(1))
             }
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -301,6 +318,7 @@ impl Document {
                 document.next_diagnostic_row(current_row, content_width.max(1), error_only)
             }
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -319,12 +337,13 @@ impl Document {
                 document.previous_diagnostic_row(current_row, content_width.max(1), error_only)
             }
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
     pub fn set_rust_diagnostics(
         &mut self,
-        diagnostics: std::collections::HashMap<usize, DiagnosticSeverity>,
+        diagnostics: std::collections::HashMap<usize, Vec<DiagnosticEntry>>,
     ) {
         if let Self::Editable(document) = self {
             document.set_diagnostics(diagnostics);
@@ -335,6 +354,7 @@ impl Document {
         match self {
             Self::Editable(document) => document.diagnostic_summary(),
             Self::LargeFile(_) => DiagnosticSummary::default(),
+            Self::Scratch(_) => DiagnosticSummary::default(),
         }
     }
 
@@ -353,6 +373,7 @@ impl Document {
                     .map(|row| row.text.chars().count())
                     .unwrap_or(0))
             }
+            Self::Scratch(document) => Ok(document.display_line_width(cursor_row)),
         }
     }
 
@@ -373,6 +394,7 @@ impl Document {
                     .map(|row| row.text.clone())
                     .unwrap_or_default())
             }
+            Self::Scratch(document) => Ok(document.display_line_text(cursor_row)),
         }
     }
 
@@ -386,6 +408,7 @@ impl Document {
                 document.jump_row_for_line_number(line_number, content_width.max(1))
             }
             Self::LargeFile(_) => None,
+            Self::Scratch(document) => document.jump_row_for_line_number(line_number),
         }
     }
 
@@ -401,6 +424,7 @@ impl Document {
         match self {
             Self::Editable(document) => document.first_match_position(query, content_width.max(1)),
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -423,6 +447,7 @@ impl Document {
                 content_width.max(1),
             ),
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -445,6 +470,7 @@ impl Document {
                 content_width.max(1),
             ),
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -469,6 +495,7 @@ impl Document {
                 content_width.max(1),
             ),
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -480,6 +507,7 @@ impl Document {
         match self {
             Self::Editable(document) => Some(document.open_below(display_row, content_width.max(1))),
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -493,6 +521,7 @@ impl Document {
                 Some(document.current_line_text(display_row, content_width.max(1)))
             }
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -513,6 +542,7 @@ impl Document {
                 content_width.max(1),
             ),
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -530,6 +560,7 @@ impl Document {
                 document.clear_current_line(display_row, content_width.max(1))
             }
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
         }
     }
 
@@ -547,6 +578,42 @@ impl Document {
                 document.delete_current_line(display_row, content_width.max(1))
             }
             Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
+        }
+    }
+
+    pub fn is_scratch(&self) -> bool {
+        matches!(self, Self::Scratch(_))
+    }
+
+    pub fn scratch_target_at_row(&self, row: usize) -> Option<ScratchTarget> {
+        match self {
+            Self::Scratch(document) => document.target_at_row(row),
+            _ => None,
+        }
+    }
+
+    pub fn diagnostics_for_display_row(
+        &self,
+        display_row: usize,
+        page_width: usize,
+    ) -> Vec<DiagnosticEntry> {
+        let content_width = page_width.saturating_sub(
+            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
+        );
+
+        match self {
+            Self::Editable(document) => {
+                document.diagnostics_for_display_row(display_row, content_width.max(1))
+            }
+            Self::LargeFile(_) | Self::Scratch(_) => Vec::new(),
+        }
+    }
+
+    pub fn collect_diagnostics(&self) -> Vec<(usize, Vec<DiagnosticEntry>)> {
+        match self {
+            Self::Editable(document) => document.collect_diagnostics(),
+            Self::LargeFile(_) | Self::Scratch(_) => Vec::new(),
         }
     }
 }

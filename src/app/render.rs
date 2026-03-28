@@ -1,4 +1,3 @@
-use crossterm::terminal;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -71,12 +70,18 @@ impl App {
                 frame.render_widget(input, popup);
             }
 
+            if self.diagnostic_popup.active {
+                self.render_diagnostic_popup(frame, area);
+            }
+
             if self.picker.active {
                 self.render_picker(frame, area);
             }
 
             let cursor_position = if self.go_input.active {
                 self.go_input_cursor_position(area)
+            } else if self.diagnostic_popup.active {
+                self.diagnostic_popup_cursor_position(area)
             } else if self.search_input.active {
                 self.search_input_cursor_position(area)
             } else if self.picker.active {
@@ -290,7 +295,18 @@ impl App {
         } else {
             AppColors::EDITOR_PANE
         };
-        let content = Paragraph::new(format_render_lines(&render.lines, indent_width, search_query)).style(
+        let current_row_in_view = if focused && document_index == self.workspace.current_index {
+            self.cursor.row.checked_sub(viewport_row)
+        } else {
+            None
+        };
+        let content = Paragraph::new(format_render_lines(
+            &render.lines,
+            indent_width,
+            search_query,
+            current_row_in_view,
+        ))
+        .style(
             Style::default()
                 .fg(AppColors::FOREGROUND)
                 .bg(pane_background),
@@ -403,6 +419,31 @@ impl App {
             .block(
                 Block::default()
                     .title(format!(" Open [{scope}] "))
+                    .borders(Borders::ALL)
+                    .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
+            )
+            .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
+        frame.render_widget(Clear, popup);
+        frame.render_widget(widget, popup);
+    }
+
+    fn render_diagnostic_popup(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let height = (self.diagnostic_popup.lines.len() as u16 + 2).clamp(3, 10);
+        let popup = centered_rect(72, height, area);
+        let mut lines = self
+            .diagnostic_popup
+            .lines
+            .iter()
+            .map(|line| Line::from(line.clone()))
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+
+        let widget = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Diagnostics ")
                     .borders(Borders::ALL)
                     .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
             )
@@ -537,12 +578,13 @@ impl App {
             return Position::new(pane_area.x.saturating_add(1), pane_area.y.saturating_add(1));
         }
 
-        let Ok((width, _)) = terminal::size() else {
-            return Position::new(pane_area.x.saturating_add(1), pane_area.y.saturating_add(1));
-        };
         let line_width = self
             .active_document()
-            .and_then(|document| document.display_line_width(self.cursor.row, width as usize).ok())
+            .and_then(|document| {
+                document
+                    .display_line_width(self.cursor.row, self.current_page_width())
+                    .ok()
+            })
             .unwrap_or(0);
         let column = self.cursor.column.min(line_width);
         let relative_row = self.cursor.row.saturating_sub(self.viewport_row);
@@ -578,17 +620,23 @@ impl App {
             popup.y.saturating_add(1),
         )
     }
+
+    fn diagnostic_popup_cursor_position(&self, area: Rect) -> Position {
+        let popup = centered_rect(72, 3, area);
+        Position::new(popup.x.saturating_add(1), popup.y.saturating_add(1))
+    }
 }
 
 fn format_render_lines(
     lines: &[DocumentRenderLine],
     indent_width: usize,
     search_query: Option<&str>,
+    current_row_in_view: Option<usize>,
 ) -> Vec<Line<'static>> {
     let mut formatted_lines = Vec::with_capacity(lines.len());
     let mut previous_guide_width = 0usize;
 
-    for line in lines {
+    for (index, line) in lines.iter().enumerate() {
         let current_guide_width = if line.text.is_empty() {
             previous_guide_width
         } else {
@@ -600,6 +648,7 @@ fn format_render_lines(
             indent_width,
             current_guide_width,
             search_query,
+            current_row_in_view == Some(index),
         ));
         previous_guide_width = current_guide_width;
     }
@@ -612,6 +661,7 @@ fn format_render_line(
     indent_width: usize,
     empty_line_guide_width: usize,
     search_query: Option<&str>,
+    current_row: bool,
 ) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
@@ -621,7 +671,11 @@ fn format_render_line(
         Span::raw(" "),
         Span::styled(
             format!("{:>6}", line.line_number),
-            Style::default().fg(AppColors::MUTED),
+            Style::default().fg(if current_row {
+                AppColors::CURRENT_LINE_NUMBER
+            } else {
+                AppColors::MUTED
+            }),
         ),
         Span::raw(" "),
         Span::styled(

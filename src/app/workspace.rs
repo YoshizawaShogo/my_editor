@@ -34,6 +34,7 @@ impl Workspace {
     pub fn open_buffer_candidates(&self) -> Vec<OpenCandidate> {
         self.documents
             .iter()
+            .filter(|entry| !entry.document.is_scratch())
             .map(|entry| {
                 OpenCandidate::OpenBuffer(OpenBufferCandidate::new(
                     entry.path.clone(),

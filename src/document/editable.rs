@@ -8,7 +8,10 @@ use std::{
 
 use ropey::Rope;
 
-use crate::error::Result;
+use crate::{
+    document::DiagnosticEntry,
+    error::Result,
+};
 
 pub struct EditableDocument {
     pub path: PathBuf,
@@ -16,7 +19,7 @@ pub struct EditableDocument {
     pub indent_width: usize,
     pub use_hard_tabs: bool,
     pub git_gutter_markers: HashMap<usize, char>,
-    pub diagnostics: HashMap<usize, DiagnosticSeverity>,
+    pub diagnostics: HashMap<usize, Vec<DiagnosticEntry>>,
     pub undo_stack: Vec<Rope>,
     pub redo_stack: Vec<Rope>,
     pub undo_group_active: bool,
@@ -135,7 +138,20 @@ impl EditableDocument {
     }
 
     pub fn diagnostic_marker(&self, line_number: usize) -> Option<DiagnosticSeverity> {
-        self.diagnostics.get(&line_number).copied()
+        let entries = self.diagnostics.get(&line_number)?;
+        if entries
+            .iter()
+            .any(|entry| entry.severity == DiagnosticSeverity::Error)
+        {
+            Some(DiagnosticSeverity::Error)
+        } else if entries
+            .iter()
+            .any(|entry| entry.severity == DiagnosticSeverity::Warning)
+        {
+            Some(DiagnosticSeverity::Warning)
+        } else {
+            None
+        }
     }
 
     pub fn next_diagnostic_row(
@@ -148,8 +164,13 @@ impl EditableDocument {
         let mut line_numbers: Vec<usize> = self
             .diagnostics
             .iter()
-            .filter(|(_, severity)| !error_only || **severity == DiagnosticSeverity::Error)
-            .map(|(line_number, _)| *line_number)
+            .filter(|(_, entries)| {
+                !error_only
+                    || entries
+                        .iter()
+                        .any(|entry| entry.severity == DiagnosticSeverity::Error)
+            })
+            .map(|(line_number, _entries)| *line_number)
             .collect();
         line_numbers.sort_unstable();
         line_numbers
@@ -168,8 +189,13 @@ impl EditableDocument {
         let mut line_numbers: Vec<usize> = self
             .diagnostics
             .iter()
-            .filter(|(_, severity)| !error_only || **severity == DiagnosticSeverity::Error)
-            .map(|(line_number, _)| *line_number)
+            .filter(|(_, entries)| {
+                !error_only
+                    || entries
+                        .iter()
+                        .any(|entry| entry.severity == DiagnosticSeverity::Error)
+            })
+            .map(|(line_number, _entries)| *line_number)
             .collect();
         line_numbers.sort_unstable();
         line_numbers
@@ -179,19 +205,40 @@ impl EditableDocument {
             .map(|line_number| self.display_row_for_line_number(line_number, page_width))
     }
 
-    pub fn set_diagnostics(&mut self, diagnostics: HashMap<usize, DiagnosticSeverity>) {
+    pub fn set_diagnostics(&mut self, diagnostics: HashMap<usize, Vec<DiagnosticEntry>>) {
         self.diagnostics = diagnostics;
     }
 
     pub fn diagnostic_summary(&self) -> DiagnosticSummary {
         let mut summary = DiagnosticSummary::default();
-        for severity in self.diagnostics.values() {
-            match severity {
-                DiagnosticSeverity::Warning => summary.warnings += 1,
-                DiagnosticSeverity::Error => summary.errors += 1,
+        for entries in self.diagnostics.values() {
+            for entry in entries {
+                match entry.severity {
+                    DiagnosticSeverity::Warning => summary.warnings += 1,
+                    DiagnosticSeverity::Error => summary.errors += 1,
+                }
             }
         }
         summary
+    }
+
+    pub fn diagnostics_for_display_row(
+        &self,
+        display_row: usize,
+        page_width: usize,
+    ) -> Vec<DiagnosticEntry> {
+        let line_number = self.line_number_for_display_row(display_row, page_width.max(1));
+        self.diagnostics.get(&line_number).cloned().unwrap_or_default()
+    }
+
+    pub fn collect_diagnostics(&self) -> Vec<(usize, Vec<DiagnosticEntry>)> {
+        let mut diagnostics = self
+            .diagnostics
+            .iter()
+            .map(|(line_number, entries)| (*line_number, entries.clone()))
+            .collect::<Vec<_>>();
+        diagnostics.sort_by_key(|(line_number, _)| *line_number);
+        diagnostics
     }
 
     pub fn next_git_marker_row(&self, current_row: usize, page_width: usize) -> Option<usize> {
