@@ -21,6 +21,7 @@ pub struct EditableDocument {
     pub use_hard_tabs: bool,
     pub git_gutter_markers: HashMap<usize, char>,
     pub diagnostics: HashMap<usize, Vec<DiagnosticEntry>>,
+    pub semantic_tokens: HashMap<usize, Vec<SyntaxTokenSpan>>,
     pub undo_stack: Vec<Rope>,
     pub redo_stack: Vec<Rope>,
     pub undo_group_active: bool,
@@ -39,6 +40,29 @@ pub struct DiagnosticSummary {
     pub errors: usize,
 }
 
+#[derive(Clone, Copy)]
+pub enum SyntaxHighlightKind {
+    Keyword,
+    String,
+    Comment,
+    Type,
+    Function,
+    Variable,
+    Parameter,
+    Number,
+    Operator,
+    Macro,
+    Namespace,
+    Property,
+}
+
+#[derive(Clone)]
+pub struct SyntaxTokenSpan {
+    pub start: usize,
+    pub length: usize,
+    pub kind: SyntaxHighlightKind,
+}
+
 impl EditableDocument {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
@@ -49,6 +73,7 @@ impl EditableDocument {
             use_hard_tabs: uses_hard_tabs(path),
             git_gutter_markers: load_git_gutter_markers(path),
             diagnostics: HashMap::new(),
+            semantic_tokens: HashMap::new(),
             rope,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -79,16 +104,39 @@ impl EditableDocument {
         for (line_index, line) in self.rope.lines().enumerate() {
             let text = line.to_string();
             let line = text.trim_end_matches('\n').trim_end_matches('\r');
+            let wrapped = wrap_visible_segments(line, page_width);
+            let line_tokens = self
+                .semantic_tokens
+                .get(&(line_index + 1))
+                .cloned()
+                .unwrap_or_default();
 
-            for piece in wrap_visible_segments(line, page_width) {
+            for (row_in_line, piece) in wrapped.into_iter().enumerate() {
                 if skipped_rows < start_row {
                     skipped_rows += 1;
                     continue;
                 }
 
+                let piece_start = row_in_line.saturating_mul(page_width);
+                let piece_end = piece_start.saturating_add(piece.chars().count());
+
                 rows.push(EditableRow {
                     line_number: line_index + 1,
                     text: piece,
+                    syntax_spans: line_tokens
+                        .iter()
+                        .filter_map(|token| {
+                            let token_start = token.start;
+                            let token_end = token.start.saturating_add(token.length);
+                            let overlap_start = token_start.max(piece_start);
+                            let overlap_end = token_end.min(piece_end);
+                            (overlap_start < overlap_end).then(|| SyntaxTokenSpan {
+                                start: overlap_start.saturating_sub(piece_start),
+                                length: overlap_end.saturating_sub(overlap_start),
+                                kind: token.kind,
+                            })
+                        })
+                        .collect(),
                 });
                 if rows.len() >= page_height {
                     return Ok(EditablePage { rows });
@@ -100,6 +148,7 @@ impl EditableDocument {
             rows.push(EditableRow {
                 line_number: 1,
                 text: String::new(),
+                syntax_spans: Vec::new(),
             });
         }
 
@@ -208,6 +257,10 @@ impl EditableDocument {
 
     pub fn set_diagnostics(&mut self, diagnostics: HashMap<usize, Vec<DiagnosticEntry>>) {
         self.diagnostics = diagnostics;
+    }
+
+    pub fn set_semantic_tokens(&mut self, semantic_tokens: HashMap<usize, Vec<SyntaxTokenSpan>>) {
+        self.semantic_tokens = semantic_tokens;
     }
 
     pub fn diagnostic_summary(&self) -> DiagnosticSummary {
@@ -385,6 +438,23 @@ impl EditableDocument {
 
     pub fn full_text(&self) -> String {
         self.rope.to_string()
+    }
+
+    pub fn replace_all(&mut self, find: &str, replace: &str) -> usize {
+        if find.is_empty() {
+            return 0;
+        }
+
+        let text = self.rope.to_string();
+        let count = text.match_indices(find).count();
+        if count == 0 {
+            return 0;
+        }
+
+        self.push_undo_snapshot();
+        self.rope = Rope::from_str(&text.replace(find, replace));
+        self.reload_git_gutter_markers();
+        count
     }
 
     pub fn lsp_position_for_display_position(
@@ -565,6 +635,18 @@ impl EditableDocument {
         self.rope.insert_char(insert_char_idx, '\n');
         self.reload_git_gutter_markers();
         self.display_position_for_char_index(insert_char_idx.saturating_add(1), page_width)
+    }
+
+    pub fn open_above(&mut self, display_row: usize, page_width: usize) -> (usize, usize) {
+        let page_width = page_width.max(1);
+        let line_number = self.line_number_for_display_row(display_row, page_width);
+        let line_index = line_number.saturating_sub(1);
+        let insert_char_idx = self.rope.line_to_char(line_index);
+
+        self.push_undo_snapshot();
+        self.rope.insert_char(insert_char_idx, '\n');
+        self.reload_git_gutter_markers();
+        self.display_position_for_char_index(insert_char_idx, page_width)
     }
 
     pub fn current_line_text(&self, display_row: usize, page_width: usize) -> String {
@@ -886,6 +968,7 @@ pub struct EditablePage {
 pub struct EditableRow {
     pub line_number: usize,
     pub text: String,
+    pub syntax_spans: Vec<SyntaxTokenSpan>,
 }
 
 fn wrap_visible_segments(line: &str, page_width: usize) -> Vec<String> {

@@ -29,6 +29,7 @@ mod action;
 mod keymap;
 mod lsp;
 mod navigation;
+mod replace;
 mod render;
 mod search;
 mod shell;
@@ -54,6 +55,8 @@ pub struct App {
     pub last_replayable_action: Option<ReplayableAction>,
     pub go_input: GoInputState,
     pub search_input: SearchInputState,
+    pub replace_input: ReplaceInputState,
+    pub selection_input: SelectionInputState,
     pub diagnostic_popup: DiagnosticPopupState,
     pub last_search: Option<SearchState>,
     pub yank_buffer: YankBuffer,
@@ -129,6 +132,41 @@ pub struct SearchInputState {
     pub scope: SearchScope,
 }
 
+pub struct ReplaceInputState {
+    pub active: bool,
+    pub find: String,
+    pub replace: String,
+    pub scope: SearchScope,
+    pub field: ReplaceField,
+}
+
+pub struct SelectionInputState {
+    pub active: bool,
+    pub operator: Option<PendingOperator>,
+    pub ranges: Vec<DisplayRange>,
+    pub current_index: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct DisplayRange {
+    pub start_row: usize,
+    pub start_column: usize,
+    pub end_row: usize,
+    pub end_column: usize,
+}
+
+impl SelectionInputState {
+    pub fn current_range(&self) -> Option<DisplayRange> {
+        self.ranges.get(self.current_index).copied()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceField {
+    Find,
+    Replace,
+}
+
 pub struct DiagnosticPopupState {
     pub active: bool,
     pub lines: Vec<String>,
@@ -168,8 +206,9 @@ pub struct SearchState {
     pub scope: SearchScope,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct JumpPosition {
+    pub path: Option<PathBuf>,
     pub row: usize,
     pub column: usize,
     pub viewport_row: usize,
@@ -246,6 +285,19 @@ impl App {
                 active: false,
                 value: String::new(),
                 scope: SearchScope::CurrentFile,
+            },
+            replace_input: ReplaceInputState {
+                active: false,
+                find: String::new(),
+                replace: String::new(),
+                scope: SearchScope::CurrentFile,
+                field: ReplaceField::Find,
+            },
+            selection_input: SelectionInputState {
+                active: false,
+                operator: None,
+                ranges: Vec::new(),
+                current_index: 0,
             },
             diagnostic_popup: DiagnosticPopupState {
                 active: false,
@@ -487,6 +539,13 @@ impl App {
                             .set_rust_diagnostics(diagnostics);
                     }
                 }
+                LspEvent::PublishSemanticTokens { path, tokens } => {
+                    if let Some(index) = self.workspace.find_document_index(&path) {
+                        self.workspace.documents[index]
+                            .document
+                            .set_semantic_tokens(tokens);
+                    }
+                }
                 LspEvent::WorkspaceDiagnosticsResult { error_only, items } => {
                     self.open_workspace_diagnostic_list(error_only, items);
                 }
@@ -512,6 +571,9 @@ impl App {
                     if let Some(edit) = edit {
                         let _ = self.apply_workspace_edit(edit);
                     }
+                }
+                LspEvent::SelectionRangeResult { operator, ranges } => {
+                    let _ = self.open_selection_input(operator, ranges);
                 }
                 LspEvent::Failed(message) => {
                     self.last_save_feedback = Some(message.clone());
@@ -825,6 +887,23 @@ impl App {
         Ok(())
     }
 
+    fn paste_before_cursor(&mut self) -> Result<()> {
+        self.workspace.current_document_mut().begin_undo_group();
+
+        match self.yank_buffer_clone() {
+            YankBuffer::Empty => {}
+            YankBuffer::Charwise(yank_text) => {
+                self.insert_text_at(self.cursor.row, self.cursor.column, &yank_text);
+            }
+            YankBuffer::Linewise(line_text) => {
+                self.open_line_above_with_text(&line_text);
+            }
+        }
+
+        self.workspace.current_document_mut().end_undo_group();
+        Ok(())
+    }
+
     fn insert_text_at(&mut self, mut row: usize, mut column: usize, text: &str) {
         let page_width = self.current_page_width();
         for ch in text.chars() {
@@ -872,6 +951,19 @@ impl App {
             .workspace
             .current_document_mut()
             .open_below(self.cursor.row, page_width)
+        {
+            self.cursor.row = row;
+            self.cursor.column = column;
+            self.insert_text_at(row, column, text);
+        }
+    }
+
+    fn open_line_above_with_text(&mut self, text: &str) {
+        let page_width = self.current_page_width();
+        if let Some((row, column)) = self
+            .workspace
+            .current_document_mut()
+            .open_above(self.cursor.row, page_width)
         {
             self.cursor.row = row;
             self.cursor.column = column;
@@ -1005,7 +1097,7 @@ impl App {
                         text: format!(
                             "{:<7} {}:{}:{} {}",
                             diagnostic_label(diagnostic.severity),
-                            entry.path.display(),
+                            workspace_relative_display(&entry.path),
                             line_number,
                             1,
                             diagnostic.message
@@ -1314,7 +1406,7 @@ impl App {
                 Some(ScratchRow {
                     text: format!(
                         "{}:{}:{}",
-                        path.display(),
+                        workspace_relative_display(&path),
                         location.range.start.line + 1,
                         location.range.start.character + 1
                     ),
@@ -1378,6 +1470,128 @@ impl App {
             self.current_page_width(),
         )?;
         Some((path, position))
+    }
+
+    fn request_selection_range_operator(&mut self, operator: PendingOperator) -> Result<()> {
+        self.ensure_lsp_for_current_document()?;
+        let Some((path, position)) = self.current_rust_lsp_position() else {
+            self.show_toast("LSP syntax range unavailable");
+            return Ok(());
+        };
+
+        self.show_toast("LSP syntax range");
+        if let LspClientState::Ready(client) = &mut self.lsp {
+            client.selection_range(&path, position, operator)?;
+        } else {
+            self.show_toast("LSP syntax range unavailable");
+        }
+        Ok(())
+    }
+
+    fn open_selection_input(
+        &mut self,
+        operator: PendingOperator,
+        ranges: Vec<lsp_types::Range>,
+    ) -> Result<()> {
+        let page_width = self.current_page_width();
+        let display_ranges = ranges
+            .into_iter()
+            .filter_map(|range| {
+                let (start_row, start_column) = self
+                    .workspace
+                    .current_document()
+                    .display_position_for_lsp_position(range.start, page_width)?;
+                let (end_row, end_column) = self
+                    .workspace
+                    .current_document()
+                    .display_position_for_lsp_position(range.end, page_width)?;
+                Some(DisplayRange {
+                    start_row,
+                    start_column,
+                    end_row,
+                    end_column,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if display_ranges.is_empty() {
+            self.show_toast("No syntax range");
+            return Ok(());
+        }
+
+        self.selection_input.active = true;
+        self.selection_input.operator = Some(operator);
+        self.selection_input.ranges = display_ranges;
+        self.selection_input.current_index = 0;
+        self.show_toast("Syntax range: i expand, Enter confirm");
+        Ok(())
+    }
+
+    fn close_selection_input(&mut self) {
+        self.selection_input.active = false;
+        self.selection_input.operator = None;
+        self.selection_input.ranges.clear();
+        self.selection_input.current_index = 0;
+    }
+
+    fn expand_selection_input(&mut self) {
+        if !self.selection_input.active {
+            return;
+        }
+        let last = self.selection_input.ranges.len().saturating_sub(1);
+        self.selection_input.current_index = (self.selection_input.current_index + 1).min(last);
+    }
+
+    fn submit_selection_input(&mut self) -> Result<()> {
+        let Some(operator) = self.selection_input.operator else {
+            self.close_selection_input();
+            return Ok(());
+        };
+        let Some(range) = self.selection_input.current_range() else {
+            self.close_selection_input();
+            self.show_toast("No syntax range");
+            return Ok(());
+        };
+        self.close_selection_input();
+
+        if matches!(operator, PendingOperator::Yank) {
+            self.yank_range(
+                range.start_row,
+                range.start_column,
+                range.end_row,
+                range.end_column,
+            )?;
+            self.show_toast("Yanked syntax range");
+            return Ok(());
+        }
+
+        let page_width = self.current_page_width();
+        self.workspace.current_document_mut().begin_undo_group();
+        let Some((row, column)) = self.workspace.current_document_mut().remove_display_range(
+            range.start_row,
+            range.start_column,
+            range.end_row,
+            range.end_column,
+            page_width,
+        ) else {
+            self.workspace.current_document_mut().end_undo_group();
+            self.show_toast("Empty syntax range");
+            return Ok(());
+        };
+
+        self.cursor.row = row;
+        self.cursor.column = column;
+        self.clamp_vertical_state();
+
+        if matches!(operator, PendingOperator::Change) {
+            self.mode = Mode::Insert;
+            self.pending_insert_j = None;
+            self.show_toast("Changed syntax range");
+        } else {
+            self.workspace.current_document_mut().end_undo_group();
+            self.show_toast("Deleted syntax range");
+        }
+        Ok(())
     }
 
     fn apply_workspace_edit(&mut self, edit: lsp_types::WorkspaceEdit) -> Result<()> {

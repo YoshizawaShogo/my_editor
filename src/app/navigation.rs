@@ -5,6 +5,7 @@ use super::{App, ReplayableAction};
 impl App {
     pub(super) fn push_jump_history(&mut self) {
         self.jump_history.push(super::JumpPosition {
+            path: self.workspace.current_document_path().map(|path| path.to_path_buf()),
             row: self.cursor.row,
             column: self.cursor.column,
             viewport_row: self.viewport_row,
@@ -18,11 +19,19 @@ impl App {
         };
 
         self.jump_forward_history.push(super::JumpPosition {
+            path: self.workspace.current_document_path().map(|path| path.to_path_buf()),
             row: self.cursor.row,
             column: self.cursor.column,
             viewport_row: self.viewport_row,
         });
 
+        if let Some(path) = &previous.path {
+            if let Some(index) = self.workspace.find_document_index(path) {
+                self.make_document_current(index);
+            } else if self.open_document(path.clone()).is_err() {
+                return;
+            }
+        }
         self.cursor.row = previous.row;
         self.cursor.column = previous.column;
         self.viewport_row = previous.viewport_row;
@@ -35,11 +44,19 @@ impl App {
         };
 
         self.jump_history.push(super::JumpPosition {
+            path: self.workspace.current_document_path().map(|path| path.to_path_buf()),
             row: self.cursor.row,
             column: self.cursor.column,
             viewport_row: self.viewport_row,
         });
 
+        if let Some(path) = &next.path {
+            if let Some(index) = self.workspace.find_document_index(path) {
+                self.make_document_current(index);
+            } else if self.open_document(path.clone()).is_err() {
+                return;
+            }
+        }
         self.cursor.row = next.row;
         self.cursor.column = next.column;
         self.viewport_row = next.viewport_row;

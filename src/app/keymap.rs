@@ -33,6 +33,7 @@ enum NormalAction {
     OpenGoInput,
     OpenPicker,
     OpenSearch,
+    OpenReplace,
     OpenDiagnosticPopup,
     OpenDiagnosticList { error_only: bool },
     OpenWorkspaceDiagnosticList { error_only: bool },
@@ -59,6 +60,7 @@ enum NormalAction {
     JumpMatchingBracket,
     OpenLineBelow,
     Paste,
+    PasteBefore,
     Replay { reverse: bool },
     Undo,
     Redo,
@@ -76,6 +78,9 @@ enum NormalAction {
         operator: PendingOperator,
         find_kind: FindKind,
         target: char,
+    },
+    OperatorSelectionRange {
+        operator: PendingOperator,
     },
     ChangeCurrentLine,
     DeleteCurrentLine,
@@ -123,6 +128,7 @@ fn transition_normal_input(
         (None, In::Ctrl('g')) => Dec::Action(Act::OpenGoInput),
         (None, In::Ctrl('p')) => Dec::Action(Act::OpenPicker),
         (None, In::Ctrl('f')) => Dec::Action(Act::OpenSearch),
+        (None, In::Ctrl('h')) => Dec::Action(Act::OpenReplace),
         (None, In::Ctrl('w')) => Dec::Action(Act::CloseCurrentBuffer),
         (None, In::Ctrl('l')) => Dec::Action(Act::AdvanceLayoutOrFocus),
         (None, In::Ctrl('o')) => Dec::Action(Act::CollapseToSinglePane),
@@ -154,6 +160,7 @@ fn transition_normal_input(
         (None, In::Char('%')) => Dec::Action(Act::JumpMatchingBracket),
         (None, In::Char('o')) => Dec::Action(Act::OpenLineBelow),
         (None, In::Char('p')) => Dec::Action(Act::Paste),
+        (None, In::Char('P')) => Dec::Action(Act::PasteBefore),
         (None, In::Char('r')) => Dec::Action(Act::Replay { reverse: false }),
         (None, In::Char('R')) => Dec::Action(Act::Replay { reverse: true }),
         (None, In::Char('u')) => Dec::Action(Act::Undo),
@@ -230,6 +237,9 @@ fn transition_normal_input(
         (Some(State::Operator(operator)), In::Char('T')) => {
             Dec::SetPending(State::OperatorFind(operator, FindKind::TillBackward))
         }
+        (Some(State::Operator(operator)), In::Char('i')) => {
+            Dec::Action(Act::OperatorSelectionRange { operator })
+        }
 
         (Some(State::OperatorFind(operator, find_kind)), In::Char(target)) => {
             Dec::Action(Act::OperatorFind {
@@ -265,12 +275,20 @@ impl App {
             return self.handle_hover_popup_key(key_event);
         }
 
+        if self.selection_input.active {
+            return self.handle_selection_input_key(key_event);
+        }
+
         if self.diagnostic_popup.active {
             return self.handle_diagnostic_popup_key(key_event);
         }
 
         if self.search_input.active {
             return self.handle_search_input_key(key_event);
+        }
+
+        if self.replace_input.active {
+            return self.handle_replace_input_key(key_event);
         }
 
         if self.picker.active {
@@ -326,6 +344,7 @@ impl App {
             NormalAction::OpenGoInput => self.open_go_input(),
             NormalAction::OpenPicker => self.open_or_cycle_picker()?,
             NormalAction::OpenSearch => self.open_or_cycle_search_input(),
+            NormalAction::OpenReplace => self.open_or_cycle_replace_input(),
             NormalAction::OpenDiagnosticPopup => self.open_current_diagnostic_popup(),
             NormalAction::OpenDiagnosticList { error_only } => {
                 self.open_diagnostic_list(error_only);
@@ -430,6 +449,11 @@ impl App {
                     self.paste_after_cursor()?;
                 }
             }
+            NormalAction::PasteBefore => {
+                if self.workspace.has_documents() {
+                    self.paste_before_cursor()?;
+                }
+            }
             NormalAction::Replay { reverse } => {
                 if self.workspace.has_documents() {
                     self.replay_last_action(reverse)?;
@@ -483,6 +507,9 @@ impl App {
                 target,
             } => {
                 self.run_operator_find(operator, find_kind, target)?;
+            }
+            NormalAction::OperatorSelectionRange { operator } => {
+                self.request_selection_range_operator(operator)?;
             }
             NormalAction::ChangeCurrentLine => {
                 self.change_current_line()?;
@@ -636,6 +663,53 @@ impl App {
             KeyCode::Char(ch) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.search_input.value.push(ch);
                 self.incremental_search_current_file();
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn handle_replace_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('c'))
+        {
+            self.close_replace_input();
+            return Ok(false);
+        }
+
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('h'))
+        {
+            self.cycle_replace_scope();
+            return Ok(false);
+        }
+
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('j') | KeyCode::Char('m'))
+        {
+            self.submit_replace_input()?;
+            return Ok(false);
+        }
+
+        match key_event.code {
+            KeyCode::Esc => {
+                self.close_replace_input();
+                Ok(false)
+            }
+            KeyCode::Enter => {
+                self.submit_replace_input()?;
+                Ok(false)
+            }
+            KeyCode::Tab => {
+                self.switch_replace_field();
+                Ok(false)
+            }
+            KeyCode::Backspace => {
+                self.pop_replace_char();
+                Ok(false)
+            }
+            KeyCode::Char(ch) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.append_replace_char(ch);
                 Ok(false)
             }
             _ => Ok(false),
@@ -826,6 +900,38 @@ impl App {
         match key_event.code {
             KeyCode::Esc => {
                 self.close_hover_popup();
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn handle_selection_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('c'))
+        {
+            self.close_selection_input();
+            return Ok(false);
+        }
+
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('j') | KeyCode::Char('m'))
+        {
+            self.submit_selection_input()?;
+            return Ok(false);
+        }
+
+        match key_event.code {
+            KeyCode::Esc => {
+                self.close_selection_input();
+                Ok(false)
+            }
+            KeyCode::Enter => {
+                self.submit_selection_input()?;
+                Ok(false)
+            }
+            KeyCode::Char('i') if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.expand_selection_input();
                 Ok(false)
             }
             _ => Ok(false),

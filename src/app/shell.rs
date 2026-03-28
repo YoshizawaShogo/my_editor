@@ -23,6 +23,7 @@ use super::{App, FocusedPane, LayoutMode};
 
 impl App {
     pub(super) fn ensure_shell_started(&mut self) -> Result<()> {
+        self.reap_exited_shell();
         if self.shell.child.is_some() {
             return Ok(());
         }
@@ -86,6 +87,7 @@ impl App {
     }
 
     pub(super) fn poll_shell_output(&mut self) {
+        self.reap_exited_shell();
         let Some(rx) = &self.shell.output_rx else {
             return;
         };
@@ -183,6 +185,16 @@ impl App {
     }
 
     pub(super) fn toggle_terminal_split(&mut self) -> Result<()> {
+        self.reap_exited_shell();
+        if self.shell.child.is_none()
+            && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single)
+        {
+            self.ensure_shell_started()?;
+            self.focused_pane = FocusedPane::Right;
+            self.sync_shell_size()?;
+            return Ok(());
+        }
+
         self.ensure_shell_started()?;
         self.layout_mode = match self.layout_mode {
             LayoutMode::TerminalSplit => LayoutMode::Single,
@@ -236,6 +248,25 @@ impl App {
             pty.flush()?;
         }
         Ok(())
+    }
+
+    fn reap_exited_shell(&mut self) {
+        let exited = match self.shell.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(_status)) => true,
+                Ok(None) => false,
+                Err(_) => true,
+            },
+            None => false,
+        };
+
+        if exited {
+            self.shell.child = None;
+            self.shell.pty = None;
+            self.shell.output_rx = None;
+            self.shell.parser = None;
+            self.show_toast("Shell exited");
+        }
     }
 }
 

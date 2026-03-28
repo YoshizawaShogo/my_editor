@@ -8,7 +8,7 @@ pub mod editable;
 pub mod large_file;
 pub mod scratch;
 
-pub use editable::{DiagnosticSeverity, DiagnosticSummary};
+pub use editable::{DiagnosticSeverity, DiagnosticSummary, SyntaxHighlightKind, SyntaxTokenSpan};
 pub use scratch::{DiagnosticEntry, ScratchDocument, ScratchRow, ScratchTarget};
 
 pub enum Document {
@@ -31,6 +31,7 @@ pub struct DocumentRenderLine {
     pub line_number: usize,
     pub gutter_marker: String,
     pub text: String,
+    pub syntax_spans: Vec<SyntaxTokenSpan>,
 }
 
 impl Document {
@@ -71,6 +72,7 @@ impl Document {
                             row.line_number,
                             document.git_gutter_marker(row.line_number),
                             row.text,
+                            row.syntax_spans,
                         )
                     })
                     .collect();
@@ -83,7 +85,7 @@ impl Document {
                     .rows
                     .into_iter()
                     .map(|row| {
-                        build_render_line(None, row.line_number, None, row.text)
+                        build_render_line(None, row.line_number, None, row.text, Vec::new())
                     })
                     .collect();
                 let status = if page.next_byte_offset >= document.file_size_bytes {
@@ -352,6 +354,15 @@ impl Document {
         }
     }
 
+    pub fn set_semantic_tokens(
+        &mut self,
+        semantic_tokens: std::collections::HashMap<usize, Vec<SyntaxTokenSpan>>,
+    ) {
+        if let Self::Editable(document) = self {
+            document.set_semantic_tokens(semantic_tokens);
+        }
+    }
+
     pub fn diagnostic_summary(&self) -> DiagnosticSummary {
         match self {
             Self::Editable(document) => document.diagnostic_summary(),
@@ -508,6 +519,18 @@ impl Document {
 
         match self {
             Self::Editable(document) => Some(document.open_below(display_row, content_width.max(1))),
+            Self::LargeFile(_) => None,
+            Self::Scratch(_) => None,
+        }
+    }
+
+    pub fn open_above(&mut self, display_row: usize, page_width: usize) -> Option<(usize, usize)> {
+        let content_width = page_width.saturating_sub(
+            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
+        );
+
+        match self {
+            Self::Editable(document) => Some(document.open_above(display_row, content_width.max(1))),
             Self::LargeFile(_) => None,
             Self::Scratch(_) => None,
         }
@@ -674,6 +697,13 @@ impl Document {
             Self::LargeFile(_) | Self::Scratch(_) => false,
         }
     }
+
+    pub fn replace_all(&mut self, find: &str, replace: &str) -> Option<usize> {
+        match self {
+            Self::Editable(document) => Some(document.replace_all(find, replace)),
+            Self::LargeFile(_) | Self::Scratch(_) => None,
+        }
+    }
 }
 
 fn build_status(page_width: usize, label: &str) -> String {
@@ -686,6 +716,7 @@ fn build_render_line(
     line_number: usize,
     gutter_marker: Option<char>,
     text: String,
+    syntax_spans: Vec<SyntaxTokenSpan>,
 ) -> DocumentRenderLine {
     DocumentRenderLine {
         diagnostic_marker: match diagnostic_marker {
@@ -696,5 +727,6 @@ fn build_render_line(
         line_number,
         gutter_marker: gutter_marker.unwrap_or(' ').to_string(),
         text,
+        syntax_spans,
     }
 }

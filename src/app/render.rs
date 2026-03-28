@@ -4,14 +4,19 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-use crate::{color::AppColors, document::DocumentRenderLine, error::Result, mode::Mode};
+use crate::{
+    color::AppColors,
+    document::{DocumentRenderLine, SyntaxHighlightKind, SyntaxTokenSpan},
+    error::Result,
+    mode::Mode,
+};
 
 use super::{
     App, FindKind, FocusedPane, LayoutMode, PendingNormalAction, PendingOperator, PickerScope,
-    ReplayableAction,
+    ReplaceField, ReplayableAction,
 };
 
 impl App {
@@ -88,6 +93,10 @@ impl App {
                 frame.render_widget(input, popup);
             }
 
+            if self.replace_input.active {
+                self.render_replace_popup(frame, area);
+            }
+
             if self.diagnostic_popup.active {
                 self.render_diagnostic_popup(frame, area);
             }
@@ -106,10 +115,14 @@ impl App {
                 self.rename_input_cursor_position(area)
             } else if self.hover_popup.active {
                 self.hover_popup_cursor_position(area)
+            } else if self.selection_input.active {
+                self.cursor_position(layout[0])
             } else if self.diagnostic_popup.active {
                 self.diagnostic_popup_cursor_position(area)
             } else if self.search_input.active {
                 self.search_input_cursor_position(area)
+            } else if self.replace_input.active {
+                self.replace_input_cursor_position(area)
             } else if self.picker.active {
                 self.picker_cursor_position(area)
             } else {
@@ -340,11 +353,17 @@ impl App {
         } else {
             None
         };
+        let selection_range = if focused && document_index == self.workspace.current_index {
+            self.current_selection_range_in_view(viewport_row)
+        } else {
+            None
+        };
         let content = Paragraph::new(format_render_lines(
             &render.lines,
             indent_width,
             search_query,
             current_row_in_view,
+            selection_range,
         ))
         .style(
             Style::default()
@@ -460,6 +479,61 @@ impl App {
             .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
         frame.render_widget(Clear, popup);
         frame.render_widget(widget, popup);
+    }
+
+    fn render_replace_popup(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let popup = centered_rect(64, 9, area);
+        let inner = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .split(popup);
+        let find_style = if self.replace_input.field == ReplaceField::Find {
+            Style::default().fg(AppColors::ACCENT)
+        } else {
+            Style::default().fg(AppColors::FOREGROUND)
+        };
+        let replace_style = if self.replace_input.field == ReplaceField::Replace {
+            Style::default().fg(AppColors::ACCENT)
+        } else {
+            Style::default().fg(AppColors::FOREGROUND)
+        };
+        let frame_widget = Block::default()
+            .title(format!(" Replace [{}] ", self.replace_input.scope.label()))
+            .borders(Borders::ALL)
+            .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT));
+        frame.render_widget(Clear, popup);
+        frame.render_widget(frame_widget, popup);
+
+        let from = Paragraph::new(self.replace_input.find.clone())
+            .block(
+                Block::default()
+                    .title(" From ")
+                    .borders(Borders::ALL)
+                    .style(Style::default().bg(AppColors::PANEL).fg(if self.replace_input.field == ReplaceField::Find {
+                        AppColors::ACCENT
+                    } else {
+                        AppColors::MUTED
+                    })),
+            )
+            .style(find_style.bg(AppColors::PANEL))
+            .wrap(Wrap { trim: false });
+        let to = Paragraph::new(self.replace_input.replace.clone())
+            .block(
+                Block::default()
+                    .title(" To ")
+                    .borders(Borders::ALL)
+                    .style(Style::default().bg(AppColors::PANEL).fg(if self.replace_input.field == ReplaceField::Replace {
+                        AppColors::ACCENT
+                    } else {
+                        AppColors::MUTED
+                    })),
+            )
+            .style(replace_style.bg(AppColors::PANEL))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(from, inner[0]);
+        frame.render_widget(to, inner[1]);
     }
 
     fn render_diagnostic_popup(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -707,6 +781,30 @@ impl App {
         )
     }
 
+    fn replace_input_cursor_position(&self, area: Rect) -> Position {
+        let popup = centered_rect(64, 9, area);
+        let inner = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .split(popup);
+        let content_width = inner[0].width.saturating_sub(2).max(1);
+        match self.replace_input.field {
+            ReplaceField::Find => wrapped_text_cursor_position(inner[0], &self.replace_input.find, content_width),
+            ReplaceField::Replace => {
+                wrapped_text_cursor_position(inner[1], &self.replace_input.replace, content_width)
+            }
+        }
+    }
+
+    fn current_selection_range_in_view(&self, viewport_row: usize) -> Option<(usize, usize, usize, usize)> {
+        let range = self.selection_input.current_range()?;
+        let start_row = range.start_row.checked_sub(viewport_row)?;
+        let end_row = range.end_row.checked_sub(viewport_row)?;
+        Some((start_row, range.start_column, end_row, range.end_column))
+    }
+
     fn rename_input_cursor_position(&self, area: Rect) -> Position {
         let popup = centered_rect(36, 3, area);
         Position::new(
@@ -834,6 +932,7 @@ fn format_render_lines(
     indent_width: usize,
     search_query: Option<&str>,
     current_row_in_view: Option<usize>,
+    selection_range: Option<(usize, usize, usize, usize)>,
 ) -> Vec<Line<'static>> {
     let mut formatted_lines = Vec::with_capacity(lines.len());
     let mut previous_guide_width = 0usize;
@@ -851,6 +950,10 @@ fn format_render_lines(
             current_guide_width,
             search_query,
             current_row_in_view == Some(index),
+            selection_range.map(|(start_row, start_col, end_row, end_col)| {
+                (index, start_row, start_col, end_row, end_col)
+            }),
+            &line.syntax_spans,
         ));
         previous_guide_width = current_guide_width;
     }
@@ -864,6 +967,8 @@ fn format_render_line(
     empty_line_guide_width: usize,
     search_query: Option<&str>,
     current_row: bool,
+    selection_context: Option<(usize, usize, usize, usize, usize)>,
+    syntax_spans: &[SyntaxTokenSpan],
 ) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
@@ -891,6 +996,8 @@ fn format_render_line(
         indent_width,
         empty_line_guide_width,
         search_query,
+        selection_context,
+        syntax_spans,
     ));
     Line::from(spans)
 }
@@ -900,12 +1007,14 @@ fn render_text_with_indent_guides(
     indent_width: usize,
     empty_line_guide_width: usize,
     search_query: Option<&str>,
+    selection_context: Option<(usize, usize, usize, usize, usize)>,
+    syntax_spans: &[SyntaxTokenSpan],
 ) -> Vec<Span<'static>> {
     let leading_spaces = text.chars().take_while(|ch| *ch == ' ').count();
     let guide_width = indent_width.max(1);
 
     if leading_spaces == 0 && empty_line_guide_width == 0 {
-        return render_search_highlighted_text(text, search_query);
+        return render_search_highlighted_text(text, search_query, selection_context, syntax_spans);
     }
 
     let mut spans = Vec::new();
@@ -932,56 +1041,145 @@ fn render_text_with_indent_guides(
         spans.extend(render_search_highlighted_text(
             &text.chars().skip(leading_spaces).collect::<String>(),
             search_query,
+            selection_context.map(|(index, start_row, start_col, end_row, end_col)| {
+                let selection = adjusted_selection_for_trimmed_prefix(
+                    index,
+                    start_row,
+                    start_col,
+                    end_row,
+                    end_col,
+                    leading_spaces,
+                );
+                selection
+            }),
+            syntax_spans,
         ));
     }
 
     spans
 }
 
-fn render_search_highlighted_text(text: &str, search_query: Option<&str>) -> Vec<Span<'static>> {
-    let Some(query) = search_query.filter(|query| !query.is_empty()) else {
-        return vec![Span::styled(
-            text.to_owned(),
-            Style::default().fg(AppColors::FOREGROUND),
-        )];
-    };
-
+fn render_search_highlighted_text(
+    text: &str,
+    search_query: Option<&str>,
+    selection_context: Option<(usize, usize, usize, usize, usize)>,
+    syntax_spans: &[SyntaxTokenSpan],
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    let mut remaining = text;
-
-    while let Some(index) = remaining.find(query) {
-        if index > 0 {
-            spans.push(Span::styled(
-                remaining[..index].to_owned(),
-                Style::default().fg(AppColors::FOREGROUND),
-            ));
+    let mut search_matches = Vec::<(usize, usize)>::new();
+    if let Some(query) = search_query.filter(|query| !query.is_empty()) {
+        let mut offset = 0usize;
+        let mut remaining = text;
+        while let Some(index) = remaining.find(query) {
+            let start = offset + index;
+            let end = start + query.len();
+            search_matches.push((start, end));
+            offset = end;
+            remaining = &text[offset..];
         }
-
-        spans.push(Span::styled(
-            remaining[index..index + query.len()].to_owned(),
-            Style::default()
-                .fg(AppColors::BACKGROUND)
-                .bg(AppColors::SEARCH_HIGHLIGHT),
-        ));
-
-        remaining = &remaining[index + query.len()..];
     }
 
-    if !remaining.is_empty() {
+    let selection_bounds = selection_context.and_then(selection_bounds_for_row);
+    let chars: Vec<char> = text.chars().collect();
+    let mut current = String::new();
+    let mut current_style = None::<Style>;
+
+    for (index, ch) in chars.iter().enumerate() {
+        let in_search = search_matches
+            .iter()
+            .any(|(start, end)| index >= *start && index < *end);
+        let in_selection = selection_bounds
+            .is_some_and(|(start, end)| index >= start && index < end);
+        let syntax_kind = syntax_spans.iter().find_map(|span| {
+            let end = span.start.saturating_add(span.length);
+            (index >= span.start && index < end).then_some(span.kind)
+        });
+
+        let mut style = Style::default().fg(syntax_color(syntax_kind));
+        if in_selection {
+            style = style.bg(AppColors::SELECTION_HIGHLIGHT);
+        }
+        if in_search {
+            style = style.fg(AppColors::BACKGROUND).bg(AppColors::SEARCH_HIGHLIGHT);
+        }
+
+        match current_style {
+            Some(existing) if existing == style => current.push(*ch),
+            Some(existing) => {
+                spans.push(Span::styled(std::mem::take(&mut current), existing));
+                current.push(*ch);
+                current_style = Some(style);
+            }
+            None => {
+                current.push(*ch);
+                current_style = Some(style);
+            }
+        }
+    }
+
+    if !current.is_empty() {
         spans.push(Span::styled(
-            remaining.to_owned(),
-            Style::default().fg(AppColors::FOREGROUND),
+            current,
+            current_style.unwrap_or_else(|| Style::default().fg(AppColors::FOREGROUND)),
         ));
     }
 
     if spans.is_empty() {
-        spans.push(Span::styled(
-            text.to_owned(),
-            Style::default().fg(AppColors::FOREGROUND),
-        ));
+        spans.push(Span::styled(text.to_owned(), Style::default().fg(AppColors::FOREGROUND)));
     }
 
     spans
+}
+
+fn adjusted_selection_for_trimmed_prefix(
+    index: usize,
+    start_row: usize,
+    start_col: usize,
+    end_row: usize,
+    end_col: usize,
+    leading_spaces: usize,
+) -> (usize, usize, usize, usize, usize) {
+    let start_col = if index == start_row {
+        start_col.saturating_sub(leading_spaces)
+    } else {
+        start_col
+    };
+    let end_col = if index == end_row {
+        end_col.saturating_sub(leading_spaces)
+    } else {
+        end_col
+    };
+    (index, start_row, start_col, end_row, end_col)
+}
+
+fn selection_bounds_for_row(
+    selection_context: (usize, usize, usize, usize, usize),
+) -> Option<(usize, usize)> {
+    let (index, start_row, start_col, end_row, end_col) = selection_context;
+    if index < start_row || index > end_row {
+        return None;
+    }
+    if start_row == end_row {
+        return Some((start_col, end_col));
+    }
+    if index == start_row {
+        return Some((start_col, usize::MAX));
+    }
+    if index == end_row {
+        return Some((0, end_col));
+    }
+    Some((0, usize::MAX))
+}
+
+fn wrapped_text_cursor_position(area: Rect, text: &str, content_width: u16) -> Position {
+    let width = content_width.max(1) as usize;
+    let chars = text.chars().count();
+    let wrapped_row = chars / width;
+    let wrapped_col = chars % width;
+    Position::new(
+        area.x.saturating_add(1 + wrapped_col as u16),
+        area.y.saturating_add(1 + wrapped_row as u16).min(area.y.saturating_add(area.height.saturating_sub(2))),
+    )
 }
 
 fn highlight_fuzzy_match(text: &str, indices: &[usize]) -> Vec<Span<'static>> {
@@ -1060,6 +1258,24 @@ fn diagnostic_color(marker: &str) -> ratatui::style::Color {
         "W" => AppColors::DIAGNOSTIC_WARNING,
         "E" => AppColors::DIAGNOSTIC_ERROR,
         _ => AppColors::MUTED,
+    }
+}
+
+fn syntax_color(kind: Option<SyntaxHighlightKind>) -> ratatui::style::Color {
+    match kind {
+        Some(SyntaxHighlightKind::Keyword) => AppColors::SYNTAX_KEYWORD,
+        Some(SyntaxHighlightKind::String) => AppColors::SYNTAX_STRING,
+        Some(SyntaxHighlightKind::Comment) => AppColors::SYNTAX_COMMENT,
+        Some(SyntaxHighlightKind::Type) => AppColors::SYNTAX_TYPE,
+        Some(SyntaxHighlightKind::Function) => AppColors::SYNTAX_FUNCTION,
+        Some(SyntaxHighlightKind::Variable) => AppColors::SYNTAX_VARIABLE,
+        Some(SyntaxHighlightKind::Parameter) => AppColors::SYNTAX_PARAMETER,
+        Some(SyntaxHighlightKind::Number) => AppColors::SYNTAX_NUMBER,
+        Some(SyntaxHighlightKind::Operator) => AppColors::SYNTAX_OPERATOR,
+        Some(SyntaxHighlightKind::Macro) => AppColors::SYNTAX_MACRO,
+        Some(SyntaxHighlightKind::Namespace) => AppColors::SYNTAX_NAMESPACE,
+        Some(SyntaxHighlightKind::Property) => AppColors::SYNTAX_PROPERTY,
+        None => AppColors::FOREGROUND,
     }
 }
 

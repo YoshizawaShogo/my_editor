@@ -47,6 +47,7 @@ impl ScratchDocument {
                 line_number: viewport_row.saturating_add(offset).saturating_add(1),
                 gutter_marker: " ".to_owned(),
                 text: row.text.clone(),
+                syntax_spans: Vec::new(),
             })
             .collect::<Vec<_>>();
 
@@ -56,6 +57,7 @@ impl ScratchDocument {
                 line_number: 1,
                 gutter_marker: " ".to_owned(),
                 text: String::new(),
+                syntax_spans: Vec::new(),
             });
         }
 

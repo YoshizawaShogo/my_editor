@@ -10,6 +10,7 @@ impl AppColors {
     pub const INDENT_GUIDE: Color = Color::Rgb(78, 84, 94);
     pub const ACCENT: Color = Color::Rgb(166, 189, 214);
     pub const SEARCH_HIGHLIGHT: Color = Color::Rgb(180, 155, 92);
+    pub const SELECTION_HIGHLIGHT: Color = Color::Rgb(64, 84, 128);
     pub const GIT_ADDED: Color = Color::Rgb(137, 178, 141);
     pub const GIT_MODIFIED: Color = Color::Rgb(122, 162, 247);
     pub const GIT_REMOVED: Color = Color::Rgb(191, 121, 121);
@@ -24,4 +25,16 @@ impl AppColors {
     pub const NORMAL_MODE: Color = Color::Rgb(128, 143, 167);
     pub const INSERT_MODE: Color = Color::Rgb(162, 187, 152);
     pub const SHELL_MODE: Color = Color::Rgb(176, 154, 196);
+    pub const SYNTAX_KEYWORD: Color = Color::Rgb(168, 149, 214);
+    pub const SYNTAX_STRING: Color = Color::Rgb(156, 194, 140);
+    pub const SYNTAX_COMMENT: Color = Color::Rgb(104, 111, 122);
+    pub const SYNTAX_TYPE: Color = Color::Rgb(118, 170, 202);
+    pub const SYNTAX_FUNCTION: Color = Color::Rgb(214, 186, 126);
+    pub const SYNTAX_VARIABLE: Color = Color::Rgb(196, 198, 204);
+    pub const SYNTAX_PARAMETER: Color = Color::Rgb(224, 177, 118);
+    pub const SYNTAX_NUMBER: Color = Color::Rgb(210, 151, 116);
+    pub const SYNTAX_OPERATOR: Color = Color::Rgb(148, 155, 168);
+    pub const SYNTAX_MACRO: Color = Color::Rgb(199, 146, 234);
+    pub const SYNTAX_NAMESPACE: Color = Color::Rgb(128, 162, 196);
+    pub const SYNTAX_PROPERTY: Color = Color::Rgb(124, 193, 173);
 }
