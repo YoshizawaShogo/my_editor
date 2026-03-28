@@ -10,6 +10,7 @@ use lsp_types::{Position, TextEdit};
 use ropey::Rope;
 
 use crate::{
+    app::semantic::slice_wrapped_syntax_spans,
     document::DiagnosticEntry,
     error::Result,
 };
@@ -123,20 +124,11 @@ impl EditableDocument {
                 rows.push(EditableRow {
                     line_number: line_index + 1,
                     text: piece,
-                    syntax_spans: line_tokens
-                        .iter()
-                        .filter_map(|token| {
-                            let token_start = token.start;
-                            let token_end = token.start.saturating_add(token.length);
-                            let overlap_start = token_start.max(piece_start);
-                            let overlap_end = token_end.min(piece_end);
-                            (overlap_start < overlap_end).then(|| SyntaxTokenSpan {
-                                start: overlap_start.saturating_sub(piece_start),
-                                length: overlap_end.saturating_sub(overlap_start),
-                                kind: token.kind,
-                            })
-                        })
-                        .collect(),
+                    syntax_spans: slice_wrapped_syntax_spans(
+                        &line_tokens,
+                        piece_start,
+                        piece_end.saturating_sub(piece_start),
+                    ),
                 });
                 if rows.len() >= page_height {
                     return Ok(EditablePage { rows });

@@ -312,6 +312,34 @@ impl App {
     }
 
     fn handle_normal_mode_key(&mut self, key_event: KeyEvent) -> Result<bool> {
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('c'))
+        {
+            if self.workspace.has_documents() && self.workspace.current_document().is_scratch() {
+                self.close_current_buffer();
+            } else {
+                self.pending_normal_action = None;
+            }
+            return Ok(false);
+        }
+
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('j'))
+            && self.workspace.has_documents()
+            && self.workspace.current_document().is_scratch()
+        {
+            self.open_scratch_target_under_cursor()?;
+            return Ok(false);
+        }
+
+        if matches!(key_event.code, KeyCode::Esc)
+            && self.workspace.has_documents()
+            && self.workspace.current_document().is_scratch()
+        {
+            self.close_current_buffer();
+            return Ok(false);
+        }
+
         if !self.workspace.has_documents() {
             return match transition_normal_input(None, normalize_normal_input(key_event)) {
                 NormalDecision::Quit => Ok(true),
@@ -554,7 +582,10 @@ impl App {
                 self.request_workspace_diagnostic_list(true)?;
                 Ok(false)
             }
-            _ => Ok(false),
+            _ => {
+                self.close_diagnostic_popup();
+                Ok(false)
+            },
         }
     }
 

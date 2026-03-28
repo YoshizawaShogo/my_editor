@@ -55,7 +55,7 @@ impl Document {
         page_height: usize,
         page_width: usize,
     ) -> Result<DocumentRender> {
-        let content_height = page_height.saturating_sub(1);
+        let content_height = page_height;
         let content_width = page_width.saturating_sub(
             DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
         );

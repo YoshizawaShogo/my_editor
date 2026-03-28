@@ -86,10 +86,10 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn poll_shell_output(&mut self) {
-        self.reap_exited_shell();
+    pub(super) fn poll_shell_output(&mut self) -> bool {
+        let mut changed = self.reap_exited_shell();
         let Some(rx) = &self.shell.output_rx else {
-            return;
+            return changed;
         };
 
         let mut chunks = Vec::new();
@@ -101,7 +101,10 @@ impl App {
             if let Some(parser) = &mut self.shell.parser {
                 parser.process(&chunk);
             }
+            changed = true;
         }
+
+        changed
     }
 
     pub(super) fn shutdown_shell(&mut self) {
@@ -190,6 +193,9 @@ impl App {
             && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single)
         {
             self.ensure_shell_started()?;
+            if self.layout_mode == LayoutMode::Single {
+                self.layout_mode = LayoutMode::TerminalSplit;
+            }
             self.focused_pane = FocusedPane::Right;
             self.sync_shell_size()?;
             return Ok(());
@@ -250,7 +256,7 @@ impl App {
         Ok(())
     }
 
-    fn reap_exited_shell(&mut self) {
+    fn reap_exited_shell(&mut self) -> bool {
         let exited = match self.shell.child.as_mut() {
             Some(child) => match child.try_wait() {
                 Ok(Some(_status)) => true,
@@ -265,8 +271,16 @@ impl App {
             self.shell.pty = None;
             self.shell.output_rx = None;
             self.shell.parser = None;
+            if matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single) {
+                self.layout_mode = LayoutMode::Single;
+                self.focused_pane = FocusedPane::Left;
+                self.mode = Mode::Normal;
+            }
             self.show_toast("Shell exited");
+            return true;
         }
+
+        false
     }
 }
 

@@ -11,10 +11,12 @@ use lsp_types::{
     DidChangeConfigurationParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, GotoDefinitionParams, Hover, HoverContents, HoverParams, Location,
     Position, ReferenceContext, ReferenceParams, RenameParams, SelectionRange,
-    SelectionRangeParams, SemanticTokens, SemanticTokensParams,
+    SelectionRangeParams, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
+    SemanticTokensFullOptions, SemanticTokensParams, SelectionRangeClientCapabilities,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
     TextDocumentClientCapabilities, Uri,
-    WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceDiagnosticParams,
+    TokenFormat, WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceDiagnosticParams,
     WorkspaceDiagnosticReportResult, WorkspaceDocumentDiagnosticReport, WorkspaceEdit,
     notification, request,
 };
@@ -30,10 +32,11 @@ use tokio::{
 };
 
 use crate::{
-    document::{DiagnosticEntry, DiagnosticSeverity, SyntaxHighlightKind, SyntaxTokenSpan},
+    document::{DiagnosticEntry, DiagnosticSeverity, SyntaxTokenSpan},
     error::{AppError, Result},
 };
 use super::PendingOperator;
+use super::semantic::decode_semantic_tokens_response;
 
 pub enum LspClientState {
     NotAvailable,
@@ -180,6 +183,9 @@ pub struct RustLspClient {
     workspace_diagnostics_supported: bool,
 }
 
+fn append_tmp_log(_message: impl AsRef<str>) {
+}
+
 impl RustLspClient {
     pub fn start(root_path: &Path) -> Result<Self> {
         let (tx, rx_commands) = unbounded_channel();
@@ -258,6 +264,12 @@ impl RustLspClient {
         }
 
         self.send(LspCommand::DidClose {
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub fn request_semantic_tokens(&mut self, path: &Path) -> Result<()> {
+        self.send(LspCommand::SemanticTokens {
             path: path.to_path_buf(),
         })
     }
@@ -378,7 +390,13 @@ async fn run_lsp_worker(
             }
             message = read_message(&mut reader) => {
                 let message = message?;
-                process_message(message, &mut pending_requests, &tx_events, &semantic_token_legend)?;
+                process_message(
+                    message,
+                    &mut writer,
+                    &mut pending_requests,
+                    &tx_events,
+                    &semantic_token_legend,
+                ).await?;
             }
         }
     }
@@ -422,6 +440,58 @@ async fn initialize_server(
             diagnostic: Some(DiagnosticClientCapabilities {
                 dynamic_registration: Some(false),
                 related_document_support: Some(false),
+            }),
+            selection_range: Some(SelectionRangeClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
+            semantic_tokens: Some(SemanticTokensClientCapabilities {
+                dynamic_registration: Some(false),
+                requests: SemanticTokensClientCapabilitiesRequests {
+                    range: Some(false),
+                    full: Some(SemanticTokensFullOptions::Bool(true)),
+                },
+                token_types: vec![
+                    SemanticTokenType::NAMESPACE,
+                    SemanticTokenType::TYPE,
+                    SemanticTokenType::CLASS,
+                    SemanticTokenType::ENUM,
+                    SemanticTokenType::INTERFACE,
+                    SemanticTokenType::STRUCT,
+                    SemanticTokenType::TYPE_PARAMETER,
+                    SemanticTokenType::PARAMETER,
+                    SemanticTokenType::VARIABLE,
+                    SemanticTokenType::PROPERTY,
+                    SemanticTokenType::ENUM_MEMBER,
+                    SemanticTokenType::EVENT,
+                    SemanticTokenType::FUNCTION,
+                    SemanticTokenType::METHOD,
+                    SemanticTokenType::MACRO,
+                    SemanticTokenType::KEYWORD,
+                    SemanticTokenType::MODIFIER,
+                    SemanticTokenType::COMMENT,
+                    SemanticTokenType::STRING,
+                    SemanticTokenType::NUMBER,
+                    SemanticTokenType::REGEXP,
+                    SemanticTokenType::OPERATOR,
+                    SemanticTokenType::DECORATOR,
+                ],
+                token_modifiers: vec![
+                    SemanticTokenModifier::DECLARATION,
+                    SemanticTokenModifier::DEFINITION,
+                    SemanticTokenModifier::READONLY,
+                    SemanticTokenModifier::STATIC,
+                    SemanticTokenModifier::DEPRECATED,
+                    SemanticTokenModifier::ABSTRACT,
+                    SemanticTokenModifier::ASYNC,
+                    SemanticTokenModifier::MODIFICATION,
+                    SemanticTokenModifier::DOCUMENTATION,
+                    SemanticTokenModifier::DEFAULT_LIBRARY,
+                ],
+                formats: vec![TokenFormat::RELATIVE],
+                overlapping_token_support: Some(false),
+                multiline_token_support: Some(false),
+                server_cancel_support: Some(false),
+                augments_syntax_tokens: Some(true),
             }),
             ..Default::default()
         }),
@@ -518,13 +588,6 @@ async fn handle_command(
                     .map_err(|error| AppError::CommandFailed(error.to_string()))?,
             )
             .await?;
-            send_semantic_tokens_request(
-                writer,
-                next_request_id,
-                pending_requests,
-                path,
-            )
-            .await?;
         }
         LspCommand::DidSave { path, text } => {
             let params = DidSaveTextDocumentParams {
@@ -538,13 +601,6 @@ async fn handle_command(
                 notification::DidSaveTextDocument::METHOD,
                 serde_json::to_value(params)
                     .map_err(|error| AppError::CommandFailed(error.to_string()))?,
-            )
-            .await?;
-            send_semantic_tokens_request(
-                writer,
-                next_request_id,
-                pending_requests,
-                path,
             )
             .await?;
         }
@@ -715,8 +771,9 @@ async fn handle_command(
     Ok(())
 }
 
-fn process_message(
+async fn process_message(
     message: Message,
+    writer: &mut ChildStdin,
     pending_requests: &mut HashMap<RequestId, PendingRequest>,
     tx_events: &Sender<LspEvent>,
     semantic_token_legend: &[String],
@@ -751,15 +808,33 @@ fn process_message(
         }
         Message::Response(response) => {
             let Some(pending) = pending_requests.remove(&response.id) else {
+                append_tmp_log(format!(
+                    "[lsp] unmatched response id={:?}",
+                    response.id
+                ));
                 return Ok(());
             };
 
             if let Some(error) = response.error {
-                send_event(
-                    tx_events,
-                    LspEvent::Failed(format!("LSP error {}: {}", error.code, error.message)),
-                );
-                return Ok(());
+                match pending {
+                    PendingRequest::SemanticTokens { path } => {
+                        append_tmp_log(format!(
+                            "[lsp] semantic error id={:?} path={} code={} message={}",
+                            response.id,
+                            path.display(),
+                            error.code,
+                            error.message
+                        ));
+                        return Ok(());
+                    }
+                    _ => {
+                        send_event(
+                            tx_events,
+                            LspEvent::Failed(format!("LSP error {}: {}", error.code, error.message)),
+                        );
+                        return Ok(());
+                    }
+                }
             }
 
             match pending {
@@ -786,7 +861,15 @@ fn process_message(
                 }
                 PendingRequest::SemanticTokens { path } => {
                     let tokens =
-                        parse_semantic_tokens_response(response.result, semantic_token_legend)?;
+                        decode_semantic_tokens_response(response.result, semantic_token_legend)?;
+                    let token_count: usize = tokens.values().map(Vec::len).sum();
+                    append_tmp_log(format!(
+                        "[lsp] semantic response id={:?} path={} lines={} spans={}",
+                        response.id,
+                        path.display(),
+                        tokens.len(),
+                        token_count
+                    ));
                     send_event(tx_events, LspEvent::PublishSemanticTokens { path, tokens });
                 }
                 PendingRequest::SelectionRange { operator } => {
@@ -806,7 +889,26 @@ fn process_message(
                 }
             }
         }
-        Message::Request(_) => {}
+        Message::Request(request) => {
+            let result = if request.method == request::WorkspaceConfiguration::METHOD {
+                serde_json::json!([{
+                    "checkOnSave": true,
+                    "check": { "command": "check" }
+                }])
+            } else {
+                Value::Null
+            };
+
+            send_message(
+                writer,
+                Message::Response(lsp_server::Response {
+                    id: request.id,
+                    result: Some(result),
+                    error: None,
+                }),
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -822,6 +924,10 @@ async fn send_semantic_tokens_request(
     pending_requests: &mut HashMap<RequestId, PendingRequest>,
     path: PathBuf,
 ) -> Result<()> {
+    append_tmp_log(format!(
+        "[lsp] semantic request path={}",
+        path.display()
+    ));
     let params = SemanticTokensParams {
         work_done_progress_params: WorkDoneProgressParams::default(),
         partial_result_params: Default::default(),
@@ -830,6 +936,11 @@ async fn send_semantic_tokens_request(
         },
     };
     let id = next_request_id_value(next_request_id);
+    append_tmp_log(format!(
+        "[lsp] semantic request id={:?} path={}",
+        id,
+        path.display()
+    ));
     pending_requests.insert(id.clone(), PendingRequest::SemanticTokens { path });
     send_request(
         writer,
@@ -980,60 +1091,6 @@ fn flatten_selection_ranges(selections: Vec<SelectionRange>) -> Vec<lsp_types::R
     ranges
 }
 
-fn parse_semantic_tokens_response(
-    result: Option<Value>,
-    legend: &[String],
-) -> Result<HashMap<usize, Vec<SyntaxTokenSpan>>> {
-    let Some(value) = result else {
-        return Ok(HashMap::new());
-    };
-    if value.is_null() {
-        return Ok(HashMap::new());
-    }
-
-    let semantic_tokens = match serde_json::from_value::<SemanticTokens>(value.clone()) {
-        Ok(tokens) => tokens,
-        Err(_) => {
-            let result = serde_json::from_value::<lsp_types::SemanticTokensResult>(value)
-                .map_err(|error| AppError::CommandFailed(error.to_string()))?;
-            match result {
-                lsp_types::SemanticTokensResult::Tokens(tokens) => tokens,
-                lsp_types::SemanticTokensResult::Partial(partial) => SemanticTokens {
-                    result_id: None,
-                    data: partial.data,
-                },
-            }
-        }
-    };
-
-    let mut by_line = HashMap::<usize, Vec<SyntaxTokenSpan>>::new();
-    let mut line = 0u32;
-    let mut start = 0u32;
-    for token in semantic_tokens.data {
-        line = line.saturating_add(token.delta_line);
-        if token.delta_line == 0 {
-            start = start.saturating_add(token.delta_start);
-        } else {
-            start = token.delta_start;
-        }
-
-        let Some(kind_name) = legend.get(token.token_type as usize) else {
-            continue;
-        };
-        let Some(kind) = map_semantic_kind(kind_name) else {
-            continue;
-        };
-
-        by_line.entry(line as usize + 1).or_default().push(SyntaxTokenSpan {
-            start: start as usize,
-            length: token.length as usize,
-            kind,
-        });
-    }
-
-    Ok(by_line)
-}
-
 fn parse_workspace_diagnostics_response(
     result: Option<Value>,
     error_only: bool,
@@ -1113,24 +1170,6 @@ fn semantic_token_legend(capabilities: &lsp_types::ServerCapabilities) -> Vec<St
         }
         None => Vec::new(),
     }
-}
-
-fn map_semantic_kind(kind: &str) -> Option<SyntaxHighlightKind> {
-    Some(match kind {
-        "keyword" => SyntaxHighlightKind::Keyword,
-        "string" => SyntaxHighlightKind::String,
-        "comment" => SyntaxHighlightKind::Comment,
-        "type" | "struct" | "enum" | "interface" | "typeParameter" => SyntaxHighlightKind::Type,
-        "function" | "method" => SyntaxHighlightKind::Function,
-        "variable" => SyntaxHighlightKind::Variable,
-        "parameter" => SyntaxHighlightKind::Parameter,
-        "number" => SyntaxHighlightKind::Number,
-        "operator" => SyntaxHighlightKind::Operator,
-        "macro" => SyntaxHighlightKind::Macro,
-        "namespace" => SyntaxHighlightKind::Namespace,
-        "property" | "field" => SyntaxHighlightKind::Property,
-        _ => return None,
-    })
 }
 
 pub fn path_to_uri(path: &Path) -> Result<Uri> {

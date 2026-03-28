@@ -20,6 +20,18 @@ use super::{
 };
 
 impl App {
+    fn viewport_for_document(&self, document_index: usize) -> usize {
+        if document_index == self.workspace.current_index {
+            self.viewport_row
+        } else {
+            self.workspace
+                .documents
+                .get(document_index)
+                .map(|entry| entry.view_state.viewport_row)
+                .unwrap_or(0)
+        }
+    }
+
     pub(super) fn render_frame(
         &self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
@@ -105,8 +117,8 @@ impl App {
                 self.render_picker(frame, area);
             }
 
-            if self.toast.message.is_some() {
-                self.render_toast(frame, layout[0]);
+            if !self.toast.transient_messages.is_empty() || self.toast.persistent_message.is_some() {
+                self.render_toasts(frame, layout[0]);
             }
 
             let cursor_position = if self.go_input.active {
@@ -261,11 +273,7 @@ impl App {
                         frame,
                         panes[0],
                         index,
-                        if self.focused_pane == FocusedPane::Left {
-                            self.viewport_row
-                        } else {
-                            0
-                        },
+                        self.viewport_for_document(index),
                         self.focused_pane == FocusedPane::Left,
                     );
                 } else {
@@ -281,11 +289,7 @@ impl App {
                         frame,
                         panes[2],
                         index,
-                        if self.focused_pane == FocusedPane::Right {
-                            self.viewport_row
-                        } else {
-                            0
-                        },
+                        self.viewport_for_document(index),
                         self.focused_pane == FocusedPane::Right,
                     );
                 } else {
@@ -358,12 +362,18 @@ impl App {
         } else {
             None
         };
+        let current_word = if focused && document_index == self.workspace.current_index {
+            current_word_in_render(&render.lines, current_row_in_view, self.cursor.column)
+        } else {
+            None
+        };
         let content = Paragraph::new(format_render_lines(
             &render.lines,
             indent_width,
             search_query,
             current_row_in_view,
             selection_range,
+            current_word.as_ref(),
         ))
         .style(
             Style::default()
@@ -586,26 +596,62 @@ impl App {
         frame.render_widget(widget, popup);
     }
 
-    fn render_toast(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let Some(message) = &self.toast.message else {
+    fn render_toasts(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        if area.width < 12 || area.height == 0 {
             return;
-        };
+        }
 
-        let width = (message.chars().count() as u16 + 4).clamp(12, area.width.max(12));
-        let x = area
-            .x
-            .saturating_add(area.width.saturating_sub(width));
-        let y = area
-            .y
-            .saturating_add(area.height.saturating_sub(1));
-        let popup = Rect::new(x, y, width.min(area.width), 1);
-        let widget = Paragraph::new(format!(" {message} ")).style(
-            Style::default()
-                .fg(AppColors::ACCENT)
-                .bg(AppColors::PANEL_ALT),
-        );
-        frame.render_widget(Clear, popup);
-        frame.render_widget(widget, popup);
+        let popup_width = area.width.clamp(24, 56);
+        let inner_width = popup_width.saturating_sub(2).max(1) as usize;
+        let mut rendered_height = 0u16;
+
+        let mut messages = Vec::new();
+        if let Some(message) = &self.toast.persistent_message {
+            messages.push((message.as_str(), true));
+        }
+        for toast in self.toast.transient_messages.iter().rev() {
+            messages.push((toast.message.as_str(), false));
+        }
+
+        for (message, persistent) in messages {
+            let wrapped = wrap_toast_message(message, inner_width);
+            let height = wrapped.len() as u16 + 2;
+            if rendered_height.saturating_add(height) > area.height {
+                break;
+            }
+
+            let x = area.x + area.width.saturating_sub(popup_width);
+            let y = area.y + area.height.saturating_sub(rendered_height + height);
+            let popup = Rect::new(x, y, popup_width, height);
+            let widget = Paragraph::new(
+                wrapped
+                    .into_iter()
+                    .map(Line::from)
+                    .collect::<Vec<_>>(),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .style(Style::default().bg(AppColors::PANEL_ALT).fg(if persistent {
+                        AppColors::ACCENT
+                    } else {
+                        AppColors::FOREGROUND
+                    })),
+            )
+            .style(
+                Style::default()
+                    .fg(if persistent {
+                        AppColors::ACCENT
+                    } else {
+                        AppColors::FOREGROUND
+                    })
+                    .bg(AppColors::PANEL_ALT),
+            )
+            .wrap(Wrap { trim: false });
+            frame.render_widget(Clear, popup);
+            frame.render_widget(widget, popup);
+            rendered_height = rendered_height.saturating_add(height);
+        }
     }
 
     fn pending_input_text(&self) -> Option<String> {
@@ -933,6 +979,7 @@ fn format_render_lines(
     search_query: Option<&str>,
     current_row_in_view: Option<usize>,
     selection_range: Option<(usize, usize, usize, usize)>,
+    current_word: Option<&CurrentWordHighlight>,
 ) -> Vec<Line<'static>> {
     let mut formatted_lines = Vec::with_capacity(lines.len());
     let mut previous_guide_width = 0usize;
@@ -954,6 +1001,13 @@ fn format_render_lines(
                 (index, start_row, start_col, end_row, end_col)
             }),
             &line.syntax_spans,
+            current_word.map(|highlight| CurrentWordHighlight {
+                row: highlight.row,
+                start: if highlight.row == index { highlight.start } else { 0 },
+                end: if highlight.row == index { highlight.end } else { 0 },
+                word: highlight.word.clone(),
+                jumpable: highlight.jumpable && highlight.row == index,
+            }).as_ref(),
         ));
         previous_guide_width = current_guide_width;
     }
@@ -969,6 +1023,7 @@ fn format_render_line(
     current_row: bool,
     selection_context: Option<(usize, usize, usize, usize, usize)>,
     syntax_spans: &[SyntaxTokenSpan],
+    current_word: Option<&CurrentWordHighlight>,
 ) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
@@ -998,6 +1053,7 @@ fn format_render_line(
         search_query,
         selection_context,
         syntax_spans,
+        current_word,
     ));
     Line::from(spans)
 }
@@ -1009,12 +1065,19 @@ fn render_text_with_indent_guides(
     search_query: Option<&str>,
     selection_context: Option<(usize, usize, usize, usize, usize)>,
     syntax_spans: &[SyntaxTokenSpan],
+    current_word: Option<&CurrentWordHighlight>,
 ) -> Vec<Span<'static>> {
     let leading_spaces = text.chars().take_while(|ch| *ch == ' ').count();
     let guide_width = indent_width.max(1);
 
     if leading_spaces == 0 && empty_line_guide_width == 0 {
-        return render_search_highlighted_text(text, search_query, selection_context, syntax_spans);
+        return render_search_highlighted_text(
+            text,
+            search_query,
+            selection_context,
+            syntax_spans,
+            current_word,
+        );
     }
 
     let mut spans = Vec::new();
@@ -1038,6 +1101,20 @@ fn render_text_with_indent_guides(
     }
 
     if !text.is_empty() {
+        let trimmed_syntax_spans = syntax_spans
+            .iter()
+            .filter_map(|span| {
+                let start = span.start;
+                let end = span.start.saturating_add(span.length);
+                let overlap_start = start.max(leading_spaces);
+                let overlap_end = end;
+                (overlap_start < overlap_end).then_some(SyntaxTokenSpan {
+                    start: overlap_start.saturating_sub(leading_spaces),
+                    length: overlap_end.saturating_sub(overlap_start),
+                    kind: span.kind,
+                })
+            })
+            .collect::<Vec<_>>();
         spans.extend(render_search_highlighted_text(
             &text.chars().skip(leading_spaces).collect::<String>(),
             search_query,
@@ -1052,7 +1129,14 @@ fn render_text_with_indent_guides(
                 );
                 selection
             }),
-            syntax_spans,
+            &trimmed_syntax_spans,
+            current_word.map(|highlight| CurrentWordHighlight {
+                row: highlight.row,
+                start: highlight.start.saturating_sub(leading_spaces),
+                end: highlight.end.saturating_sub(leading_spaces),
+                word: highlight.word.clone(),
+                jumpable: highlight.jumpable,
+            }).as_ref(),
         ));
     }
 
@@ -1064,6 +1148,7 @@ fn render_search_highlighted_text(
     search_query: Option<&str>,
     selection_context: Option<(usize, usize, usize, usize, usize)>,
     syntax_spans: &[SyntaxTokenSpan],
+    current_word: Option<&CurrentWordHighlight>,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut search_matches = Vec::<(usize, usize)>::new();
@@ -1080,6 +1165,10 @@ fn render_search_highlighted_text(
     }
 
     let selection_bounds = selection_context.and_then(selection_bounds_for_row);
+    let word_matches = current_word
+        .filter(|highlight| !highlight.word.is_empty())
+        .map(|highlight| find_word_matches(text, &highlight.word))
+        .unwrap_or_default();
     let chars: Vec<char> = text.chars().collect();
     let mut current = String::new();
     let mut current_style = None::<Style>;
@@ -1090,17 +1179,29 @@ fn render_search_highlighted_text(
             .any(|(start, end)| index >= *start && index < *end);
         let in_selection = selection_bounds
             .is_some_and(|(start, end)| index >= start && index < end);
+        let in_word_match = word_matches
+            .iter()
+            .any(|(start, end)| index >= *start && index < *end);
         let syntax_kind = syntax_spans.iter().find_map(|span| {
             let end = span.start.saturating_add(span.length);
             (index >= span.start && index < end).then_some(span.kind)
         });
+        let underline_current_word = current_word.is_some_and(|highlight| {
+            highlight.jumpable && index >= highlight.start && index < highlight.end
+        });
 
         let mut style = Style::default().fg(syntax_color(syntax_kind));
+        if in_word_match {
+            style = style.bg(AppColors::WORD_HIGHLIGHT);
+        }
         if in_selection {
             style = style.bg(AppColors::SELECTION_HIGHLIGHT);
         }
         if in_search {
             style = style.fg(AppColors::BACKGROUND).bg(AppColors::SEARCH_HIGHLIGHT);
+        }
+        if underline_current_word {
+            style = style.add_modifier(Modifier::UNDERLINED);
         }
 
         match current_style {
@@ -1279,6 +1380,102 @@ fn syntax_color(kind: Option<SyntaxHighlightKind>) -> ratatui::style::Color {
     }
 }
 
+#[derive(Clone)]
+struct CurrentWordHighlight {
+    row: usize,
+    start: usize,
+    end: usize,
+    word: String,
+    jumpable: bool,
+}
+
+fn current_word_in_render(
+    lines: &[DocumentRenderLine],
+    current_row_in_view: Option<usize>,
+    cursor_column: usize,
+) -> Option<CurrentWordHighlight> {
+    let row = current_row_in_view?;
+    let line = lines.get(row)?;
+    let chars: Vec<char> = line.text.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+
+    let mut pivot = cursor_column.min(chars.len().saturating_sub(1));
+    if !is_word_char(chars[pivot]) && pivot > 0 && is_word_char(chars[pivot - 1]) {
+        pivot -= 1;
+    }
+    if !is_word_char(chars[pivot]) {
+        return None;
+    }
+
+    let mut start = pivot;
+    while start > 0 && is_word_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = pivot + 1;
+    while end < chars.len() && is_word_char(chars[end]) {
+        end += 1;
+    }
+
+    let word: String = chars[start..end].iter().collect();
+    let jumpable = line.syntax_spans.iter().any(|span| {
+        let span_end = span.start.saturating_add(span.length);
+        start < span_end
+            && end > span.start
+            && matches!(
+                span.kind,
+                SyntaxHighlightKind::Type
+                    | SyntaxHighlightKind::Function
+                    | SyntaxHighlightKind::Variable
+                    | SyntaxHighlightKind::Parameter
+                    | SyntaxHighlightKind::Macro
+                    | SyntaxHighlightKind::Namespace
+                    | SyntaxHighlightKind::Property
+            )
+    });
+
+    Some(CurrentWordHighlight {
+        row,
+        start,
+        end,
+        word,
+        jumpable,
+    })
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn find_word_matches(text: &str, word: &str) -> Vec<(usize, usize)> {
+    if word.is_empty() {
+        return Vec::new();
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let word_chars: Vec<char> = word.chars().collect();
+    if word_chars.len() > chars.len() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+
+    for start in 0..=chars.len().saturating_sub(word_chars.len()) {
+        if chars[start..start + word_chars.len()] != word_chars[..] {
+            continue;
+        }
+
+        let left_ok = start == 0 || !is_word_char(chars[start - 1]);
+        let right_index = start + word_chars.len();
+        let right_ok = right_index == chars.len() || !is_word_char(chars[right_index]);
+        if left_ok && right_ok {
+            matches.push((start, right_index));
+        }
+    }
+
+    matches
+}
+
 fn powerline_separator_left(
     left_background: ratatui::style::Color,
     right_background: ratatui::style::Color,
@@ -1294,6 +1491,33 @@ fn powerline_separator_right(foreground: ratatui::style::Color) -> Span<'static>
         format!(" {} ", '\u{e0b1}'),
         Style::default().fg(foreground).bg(AppColors::PANEL),
     )
+}
+
+fn wrap_toast_message(message: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    for raw_line in message.lines() {
+        let chars: Vec<char> = raw_line.chars().collect();
+        if chars.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut start = 0usize;
+        while start < chars.len() {
+            let end = (start + width).min(chars.len());
+            lines.push(chars[start..end].iter().collect());
+            start = end;
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
