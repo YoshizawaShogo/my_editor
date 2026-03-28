@@ -9,6 +9,7 @@ use super::{App, FindKind, PendingNormalAction, PendingOperator, ReplayableActio
 #[derive(Clone, Copy)]
 enum NormalInput {
     Enter,
+    F2,
     Up,
     Left,
     Down,
@@ -34,6 +35,8 @@ enum NormalAction {
     OpenSearch,
     OpenDiagnosticPopup,
     OpenScratchTarget,
+    OpenHoverPopup,
+    OpenRenameInput,
     CloseCurrentBuffer,
     AdvanceLayoutOrFocus,
     CollapseToSinglePane,
@@ -63,6 +66,8 @@ enum NormalAction {
     JumpNextDiagnostic { error_only: bool },
     JumpPreviousDiagnostic { error_only: bool },
     RepeatSearch { forward: bool },
+    Goto { kind: super::GotoKind },
+    ShowReferences,
     FindMotion { kind: FindKind, target: char },
     OperatorFind {
         operator: PendingOperator,
@@ -86,6 +91,7 @@ fn normalize_normal_input(key_event: KeyEvent) -> NormalInput {
 
     match key_event.code {
         KeyCode::Up => NormalInput::Up,
+        KeyCode::F(2) => NormalInput::F2,
         KeyCode::Enter => NormalInput::Enter,
         KeyCode::Left => NormalInput::Left,
         KeyCode::Down => NormalInput::Down,
@@ -123,6 +129,7 @@ fn transition_normal_input(
         (None, In::Ctrl('u')) => Dec::Action(Act::PageUpHalf),
         (None, In::Ctrl('z')) | (None, In::Ctrl('y')) => Dec::Ignore,
 
+        (None, In::F2) => Dec::Action(Act::OpenRenameInput),
         (None, In::Enter) => Dec::Action(Act::OpenScratchTarget),
         (None, In::Up) => Dec::Action(Act::MoveUp),
         (None, In::Left) => Dec::Action(Act::MoveLeft),
@@ -135,6 +142,7 @@ fn transition_normal_input(
         (None, In::Char('h')) => Dec::Action(Act::EnterInsertAtCursor),
         (None, In::Char('b')) => Dec::Action(Act::JumpBack),
         (None, In::Char('e')) => Dec::Action(Act::OpenDiagnosticPopup),
+        (None, In::Char('K')) => Dec::Action(Act::OpenHoverPopup),
         (None, In::Char('i')) => Dec::Action(Act::MoveUp),
         (None, In::Char('j')) => Dec::Action(Act::MoveLeft),
         (None, In::Char('k')) => Dec::Action(Act::MoveDown),
@@ -174,6 +182,16 @@ fn transition_normal_input(
         }
         (Some(State::GoPrefix), In::Char('f')) => Dec::Action(Act::RepeatSearch { forward: true }),
         (Some(State::GoPrefix), In::Char('F')) => Dec::Action(Act::RepeatSearch { forward: false }),
+        (Some(State::GoPrefix), In::Char('d')) => {
+            Dec::Action(Act::Goto { kind: super::GotoKind::Definition })
+        }
+        (Some(State::GoPrefix), In::Char('D')) => {
+            Dec::Action(Act::Goto { kind: super::GotoKind::Declaration })
+        }
+        (Some(State::GoPrefix), In::Char('i')) => {
+            Dec::Action(Act::Goto { kind: super::GotoKind::Implementation })
+        }
+        (Some(State::GoPrefix), In::Char('r')) => Dec::Action(Act::ShowReferences),
 
         (Some(State::Find(kind)), In::Char(target)) => {
             Dec::Action(Act::FindMotion { kind, target })
@@ -219,6 +237,14 @@ impl App {
     fn handle_key_event(&mut self, key_event: KeyEvent) -> Result<bool> {
         if self.go_input.active {
             return self.handle_go_input_key(key_event);
+        }
+
+        if self.rename_input.active {
+            return self.handle_rename_input_key(key_event);
+        }
+
+        if self.hover_popup.active {
+            return self.handle_hover_popup_key(key_event);
         }
 
         if self.diagnostic_popup.active {
@@ -277,6 +303,16 @@ impl App {
             NormalAction::OpenScratchTarget => {
                 if self.workspace.has_documents() && self.workspace.current_document().is_scratch() {
                     self.open_scratch_target_under_cursor()?;
+                }
+            }
+            NormalAction::OpenHoverPopup => {
+                if self.workspace.has_documents() {
+                    self.open_hover_popup()?;
+                }
+            }
+            NormalAction::OpenRenameInput => {
+                if self.workspace.has_documents() {
+                    self.open_rename_input();
                 }
             }
             NormalAction::CloseCurrentBuffer => self.close_current_buffer(),
@@ -397,6 +433,12 @@ impl App {
                 } else {
                     self.repeat_search_backward()?;
                 }
+            }
+            NormalAction::Goto { kind } => {
+                self.goto_symbol(kind)?;
+            }
+            NormalAction::ShowReferences => {
+                self.show_references()?;
             }
             NormalAction::FindMotion { kind, target } => {
                 self.run_find_motion(kind, target)?;
@@ -725,6 +767,66 @@ impl App {
             }
             KeyCode::Char(ch) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.picker.query.push(ch);
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn handle_hover_popup_key(&mut self, key_event: KeyEvent) -> Result<bool> {
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('c'))
+        {
+            self.close_hover_popup();
+            return Ok(false);
+        }
+
+        match key_event.code {
+            KeyCode::Esc => {
+                self.close_hover_popup();
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn handle_rename_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('c'))
+        {
+            self.close_rename_input();
+            return Ok(false);
+        }
+
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('j'))
+        {
+            self.submit_rename_input()?;
+            return Ok(false);
+        }
+
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('h'))
+        {
+            self.rename_input.value.pop();
+            return Ok(false);
+        }
+
+        match key_event.code {
+            KeyCode::Esc => {
+                self.close_rename_input();
+                Ok(false)
+            }
+            KeyCode::Enter => {
+                self.submit_rename_input()?;
+                Ok(false)
+            }
+            KeyCode::Backspace => {
+                self.rename_input.value.pop();
+                Ok(false)
+            }
+            KeyCode::Char(ch) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.rename_input.value.push(ch);
                 Ok(false)
             }
             _ => Ok(false),

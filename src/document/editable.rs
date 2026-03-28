@@ -6,6 +6,7 @@ use std::{
     process::Command,
 };
 
+use lsp_types::{Position, TextEdit};
 use ropey::Rope;
 
 use crate::{
@@ -382,6 +383,70 @@ impl EditableDocument {
         String::new()
     }
 
+    pub fn full_text(&self) -> String {
+        self.rope.to_string()
+    }
+
+    pub fn lsp_position_for_display_position(
+        &self,
+        display_row: usize,
+        display_column: usize,
+        page_width: usize,
+    ) -> Position {
+        let char_index =
+            self.char_index_for_display_position(display_row, display_column, page_width.max(1));
+        let line_index = self.rope.char_to_line(char_index);
+        let line_start = self.rope.line_to_char(line_index);
+        let character = char_index.saturating_sub(line_start) as u32;
+        Position::new(line_index as u32, character)
+    }
+
+    pub fn display_position_for_lsp_position(
+        &self,
+        line: u32,
+        character: u32,
+        page_width: usize,
+    ) -> Option<(usize, usize)> {
+        let line_index = usize::try_from(line).ok()?;
+        if line_index >= self.rope.len_lines() {
+            return None;
+        }
+
+        let line_start = self.rope.line_to_char(line_index);
+        let line_text = self.rope.line(line_index).to_string();
+        let trimmed_len = trimmed_line_char_len(&line_text);
+        let char_index = line_start.saturating_add((character as usize).min(trimmed_len));
+        Some(self.display_position_for_char_index(char_index, page_width.max(1)))
+    }
+
+    pub fn apply_text_edits(&mut self, edits: &[TextEdit]) {
+        if edits.is_empty() {
+            return;
+        }
+
+        self.begin_undo_group();
+        self.push_undo_snapshot();
+
+        let mut edits = edits.to_vec();
+        edits.sort_by(|left, right| {
+            let left_line = left.range.start.line;
+            let right_line = right.range.start.line;
+            right_line
+                .cmp(&left_line)
+                .then(right.range.start.character.cmp(&left.range.start.character))
+        });
+
+        for edit in edits {
+            let start = self.char_index_for_lsp_position(edit.range.start);
+            let end = self.char_index_for_lsp_position(edit.range.end);
+            self.rope.remove(start..end);
+            self.rope.insert(start, &edit.new_text);
+        }
+
+        self.end_undo_group();
+        self.reload_git_gutter_markers();
+    }
+
     pub fn insert_char(
         &mut self,
         display_row: usize,
@@ -659,6 +724,16 @@ impl EditableDocument {
         }
 
         self.rope.len_chars()
+    }
+
+    fn char_index_for_lsp_position(&self, position: Position) -> usize {
+        let line_index = usize::try_from(position.line)
+            .unwrap_or(usize::MAX)
+            .min(self.rope.len_lines().saturating_sub(1));
+        let line_start = self.rope.line_to_char(line_index);
+        let line_text = self.rope.line(line_index).to_string();
+        let trimmed_len = trimmed_line_char_len(&line_text);
+        line_start.saturating_add((position.character as usize).min(trimmed_len))
     }
 
     fn display_position_for_char_index(&self, char_index: usize, page_width: usize) -> (usize, usize) {

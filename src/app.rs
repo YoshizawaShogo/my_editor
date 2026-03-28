@@ -1,17 +1,18 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
 
 use crossterm::{event, terminal};
+use lsp_types::{Location, Position, TextEdit};
 
 use crate::{
     config,
     document::{
-        DiagnosticEntry, DiagnosticSeverity, DiagnosticSummary, Document, ScratchDocument,
-        ScratchRow, ScratchTarget,
+        DiagnosticSeverity, DiagnosticSummary, Document, ScratchDocument, ScratchRow,
+        ScratchTarget,
     },
     error::Result,
     mode::Mode,
@@ -23,6 +24,7 @@ use crate::{
 
 mod action;
 mod keymap;
+mod lsp;
 mod navigation;
 mod render;
 mod search;
@@ -30,6 +32,10 @@ mod terminal_session;
 mod workspace;
 
 use self::action::{FindKind, PendingNormalAction, PendingOperator, ReplayableAction};
+use self::lsp::{
+    GotoKind, HoverPopupState, LspClientState, LspEvent, RenameInputState, RustLspClient,
+    uri_to_path,
+};
 use self::terminal_session::TerminalSession;
 
 pub struct App {
@@ -50,8 +56,10 @@ pub struct App {
     pub jump_history: Vec<JumpPosition>,
     pub layout_mode: LayoutMode,
     pub focused_pane: FocusedPane,
-    pub rust_support: RustSupportState,
     pub last_save_feedback: Option<String>,
+    pub hover_popup: HoverPopupState,
+    pub rename_input: RenameInputState,
+    pub lsp: LspClientState,
 }
 
 pub struct Workspace {
@@ -63,6 +71,8 @@ pub struct DocumentEntry {
     pub path: PathBuf,
     pub document: Document,
     pub view_state: BufferViewState,
+    pub version: i32,
+    pub lsp_open: bool,
 }
 
 pub struct PickerState {
@@ -110,7 +120,6 @@ pub struct DiagnosticPopupState {
     pub active: bool,
     pub lines: Vec<String>,
 }
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PickerScope {
     All,
@@ -149,11 +158,6 @@ pub enum YankBuffer {
     Linewise(String),
 }
 
-pub struct RustSupportState {
-    pub rust_analyzer_available: bool,
-    pub cargo_manifest_in_cwd: bool,
-}
-
 impl SearchScope {
     fn label(self) -> &'static str {
         match self {
@@ -166,16 +170,17 @@ impl SearchScope {
 
 impl App {
     pub fn open(path: Option<&Path>) -> Result<Self> {
-        let rust_support = RustSupportState {
-            rust_analyzer_available: rust_analyzer_available(),
-            cargo_manifest_in_cwd: Path::new("Cargo.toml").exists(),
-        };
+         
+        let rust_analyzer_available = rust_analyzer_available();
+        let cargo_manifest_in_cwd = Path::new("Cargo.toml").exists();
         let workspace = match path {
             Some(path) => Workspace {
                 documents: vec![DocumentEntry {
                     path: path.to_path_buf(),
                     document: Document::open(path)?,
                     view_state: BufferViewState::default(),
+                    version: 1,
+                    lsp_open: false,
                 }],
                 current_index: 0,
             },
@@ -220,9 +225,22 @@ impl App {
             jump_history: Vec::new(),
             layout_mode: LayoutMode::Single,
             focused_pane: FocusedPane::Left,
-            rust_support,
             last_save_feedback: None,
+            hover_popup: HoverPopupState {
+                active: false,
+                lines: Vec::new(),
+            },
+            rename_input: RenameInputState {
+                active: false,
+                value: String::new(),
+            },
+            lsp: if rust_analyzer_available && cargo_manifest_in_cwd {
+                LspClientState::Inactive
+            } else {
+                LspClientState::NotAvailable
+            },
         };
+        let _ = app.ensure_lsp_for_current_document();
         app.refresh_picker_candidates()?;
         Ok(app)
     }
@@ -231,10 +249,13 @@ impl App {
         let mut terminal_session = TerminalSession::enter()?;
 
         loop {
+            self.poll_lsp();
             self.render_frame(terminal_session.terminal())?;
 
-            if self.handle_event(event::read()?)? {
-                break;
+            if event::poll(Duration::from_millis(50))? {
+                if self.handle_event(event::read()?)? {
+                    break;
+                }
             }
         }
 
@@ -312,19 +333,176 @@ impl App {
         self.save_current_buffer_view_state();
         self.workspace.make_current(index);
         self.restore_current_buffer_view_state();
+        let _ = self.ensure_lsp_for_current_document();
     }
 
     fn select_current_document(&mut self, index: usize) {
         self.save_current_buffer_view_state();
         self.workspace.select_current(index);
         self.restore_current_buffer_view_state();
+        let _ = self.ensure_lsp_for_current_document();
     }
 
     fn open_document(&mut self, path: PathBuf) -> Result<()> {
         self.save_current_buffer_view_state();
         self.workspace.open_document(path)?;
         self.restore_current_buffer_view_state();
+        self.ensure_lsp_for_current_document()?;
         Ok(())
+    }
+
+    fn ensure_lsp_for_current_document(&mut self) -> Result<()> {
+        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+            return Ok(());
+        };
+        if !is_rust_source_path(&path) {
+            return Ok(());
+        }
+
+        if matches!(self.lsp, LspClientState::NotAvailable) {
+            return Ok(());
+        }
+
+        let started_now = matches!(self.lsp, LspClientState::Inactive);
+        if matches!(self.lsp, LspClientState::Inactive) {
+            self.lsp = match RustLspClient::start(Path::new(".")) {
+                Ok(client) => LspClientState::Ready(client),
+                Err(error) => LspClientState::Failed(format!("{error:?}")),
+            };
+        }
+
+        if started_now {
+            let rust_docs = self
+                .workspace
+                .documents
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    if !is_rust_source_path(&entry.path) {
+                        return None;
+                    }
+                    Some((index, entry.path.clone(), entry.document.full_text()?, entry.version))
+                })
+                .collect::<Vec<_>>();
+            if let LspClientState::Ready(client) = &mut self.lsp {
+                for (index, path, text, version) in rust_docs {
+                    client.ensure_open(&path, version, &text)?;
+                    self.workspace.documents[index].lsp_open = true;
+                }
+            }
+        }
+
+        self.ensure_current_document_open_for_lsp()
+    }
+
+    fn ensure_current_document_open_for_lsp(&mut self) -> Result<()> {
+        let page_width = self.current_page_width();
+        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+            return Ok(());
+        };
+        if !is_rust_source_path(&path) {
+            return Ok(());
+        }
+
+        let Some(text) = self.workspace.current_document().full_text() else {
+            return Ok(());
+        };
+        let current_index = self.workspace.current_index;
+        let version = self.workspace.documents[current_index].version;
+
+        if let LspClientState::Ready(client) = &mut self.lsp {
+            client.ensure_open(&path, version, &text)?;
+            self.workspace.documents[current_index].lsp_open = true;
+        }
+
+        let _ = page_width;
+        Ok(())
+    }
+
+    fn poll_lsp(&mut self) {
+        let events = match &mut self.lsp {
+            LspClientState::Ready(client) => {
+                client.poll();
+                client.take_events()
+            }
+            _ => Vec::new(),
+        };
+
+        for event in events {
+            match event {
+                LspEvent::PublishDiagnostics { path, diagnostics } => {
+                    if let Some(index) = self.workspace.find_document_index(&path) {
+                        self.workspace.documents[index]
+                            .document
+                            .set_rust_diagnostics(diagnostics);
+                    }
+                }
+                LspEvent::GotoResult { kind, locations } => {
+                    let _ = self.open_location_results(kind.title(), locations);
+                }
+                LspEvent::ReferencesResult { locations } => {
+                    let _ = self.open_location_results("[references]", locations);
+                }
+                LspEvent::HoverResult { lines } => {
+                    if self.hover_popup.active {
+                        self.hover_popup.lines = if lines.is_empty() {
+                            vec!["No information.".to_owned()]
+                        } else {
+                            lines
+                        };
+                    }
+                }
+                LspEvent::RenameResult { edit } => {
+                    if let Some(edit) = edit {
+                        let _ = self.apply_workspace_edit(edit);
+                    }
+                }
+                LspEvent::Failed(message) => {
+                    self.last_save_feedback = Some(message.clone());
+                    self.lsp = LspClientState::Failed(message);
+                }
+            }
+        }
+    }
+
+    fn current_diagnostic_summary(&self) -> DiagnosticSummary {
+        let mut summary = DiagnosticSummary::default();
+        for entry in &self.workspace.documents {
+            let document_summary = entry.document.diagnostic_summary();
+            summary.errors += document_summary.errors;
+            summary.warnings += document_summary.warnings;
+        }
+        summary
+    }
+
+    fn sync_current_document_save(&mut self) {
+        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+            return;
+        };
+        if !is_rust_source_path(&path) {
+            return;
+        }
+        if self.ensure_lsp_for_current_document().is_err() {
+            return;
+        }
+        let Some(text) = self.workspace.current_document().full_text() else {
+            return;
+        };
+        if let LspClientState::Ready(client) = &mut self.lsp {
+            let _ = client.did_save(&path, &text);
+        }
+    }
+
+    fn sync_current_document_close(&mut self) {
+        let Some(entry) = self.workspace.documents.get(self.workspace.current_index) else {
+            return;
+        };
+        if !entry.lsp_open || !is_rust_source_path(&entry.path) {
+            return;
+        }
+        if let LspClientState::Ready(client) = &mut self.lsp {
+            let _ = client.did_close(&entry.path);
+        }
     }
 
     fn run_find_motion(&mut self, find_kind: FindKind, target: char) -> Result<()> {
@@ -388,7 +566,6 @@ impl App {
         } else {
             self.workspace.current_document_mut().end_undo_group();
         }
-
         Ok(())
     }
 
@@ -621,10 +798,10 @@ impl App {
             .delete_current_line(self.cursor.row, page_width)
         {
             self.yank_buffer = YankBuffer::Linewise(line_text);
-            self.cursor.row = row;
-            self.cursor.column = column;
-            self.clamp_vertical_state();
-        }
+        self.cursor.row = row;
+        self.cursor.column = column;
+        self.clamp_vertical_state();
+    }
         self.workspace.current_document_mut().end_undo_group();
 
         Ok(())
@@ -753,6 +930,8 @@ impl App {
                 path: PathBuf::from(title),
                 document: Document::Scratch(ScratchDocument::new(title, rows)),
                 view_state: BufferViewState::default(),
+                version: 1,
+                lsp_open: false,
             },
         );
         self.workspace.current_index = 0;
@@ -785,6 +964,203 @@ impl App {
             self.jump_with_context(row, self.current_page_width());
         }
 
+        Ok(())
+    }
+
+    fn open_hover_popup(&mut self) -> Result<()> {
+        self.ensure_lsp_for_current_document()?;
+        let Some((path, position)) = self.current_rust_lsp_position() else {
+            return Ok(());
+        };
+        if let LspClientState::Ready(client) = &mut self.lsp {
+            self.hover_popup.active = true;
+            self.hover_popup.lines = vec!["Loading...".to_owned()];
+            client.hover(&path, position)?;
+        }
+        Ok(())
+    }
+
+    fn close_hover_popup(&mut self) {
+        self.hover_popup.active = false;
+        self.hover_popup.lines.clear();
+    }
+
+    fn open_rename_input(&mut self) {
+        self.rename_input.active = true;
+        self.rename_input.value.clear();
+    }
+
+    fn close_rename_input(&mut self) {
+        self.rename_input.active = false;
+        self.rename_input.value.clear();
+    }
+
+    fn submit_rename_input(&mut self) -> Result<()> {
+        let new_name = self.rename_input.value.trim().to_owned();
+        if new_name.is_empty() {
+            self.close_rename_input();
+            return Ok(());
+        }
+
+        self.ensure_lsp_for_current_document()?;
+        let Some((path, position)) = self.current_rust_lsp_position() else {
+            self.close_rename_input();
+            return Ok(());
+        };
+
+        if let LspClientState::Ready(client) = &mut self.lsp {
+            client.rename(&path, position, new_name)?;
+        }
+        self.close_rename_input();
+        Ok(())
+    }
+
+    fn goto_symbol(&mut self, kind: GotoKind) -> Result<()> {
+        self.ensure_lsp_for_current_document()?;
+        let Some((path, position)) = self.current_rust_lsp_position() else {
+            return Ok(());
+        };
+        if let LspClientState::Ready(client) = &mut self.lsp {
+            client.goto(kind, &path, position)?;
+        }
+        Ok(())
+    }
+
+    fn show_references(&mut self) -> Result<()> {
+        self.ensure_lsp_for_current_document()?;
+        let Some((path, position)) = self.current_rust_lsp_position() else {
+            return Ok(());
+        };
+        if let LspClientState::Ready(client) = &mut self.lsp {
+            client.references(&path, position)?;
+        }
+        Ok(())
+    }
+
+    fn open_location_results(&mut self, title: &str, locations: Vec<Location>) -> Result<()> {
+        if locations.is_empty() {
+            return Ok(());
+        }
+
+        if locations.len() == 1 {
+            return self.jump_to_location(&locations[0]);
+        }
+
+        let rows = locations
+            .into_iter()
+            .filter_map(|location| {
+                let path = uri_to_path(&location.uri)?;
+                Some(ScratchRow {
+                    text: format!(
+                        "{}:{}:{}",
+                        path.display(),
+                        location.range.start.line + 1,
+                        location.range.start.character + 1
+                    ),
+                    target: Some(ScratchTarget {
+                        path,
+                        line_number: location.range.start.line as usize + 1,
+                        column: location.range.start.character as usize,
+                    }),
+                })
+            })
+            .collect();
+
+        self.save_current_buffer_view_state();
+        self.workspace.documents.insert(
+            0,
+            DocumentEntry {
+                path: PathBuf::from(title),
+                document: Document::Scratch(ScratchDocument::new(title, rows)),
+                view_state: BufferViewState::default(),
+                version: 1,
+                lsp_open: false,
+            },
+        );
+        self.workspace.current_index = 0;
+        self.restore_current_buffer_view_state();
+        Ok(())
+    }
+
+    fn jump_to_location(&mut self, location: &Location) -> Result<()> {
+        let Some(path) = uri_to_path(&location.uri) else {
+            return Ok(());
+        };
+
+        self.push_jump_history();
+        if let Some(index) = self.workspace.find_document_index(&path) {
+            self.make_document_current(index);
+        } else {
+                    self.open_document(path.clone())?;
+        }
+
+        if let Some((row, column)) = self
+            .workspace
+            .current_document()
+            .display_position_for_lsp_position(location.range.start, self.current_page_width())
+        {
+            self.cursor.column = column;
+            self.jump_with_context(row, self.current_page_width());
+        }
+
+        Ok(())
+    }
+
+    fn current_rust_lsp_position(&self) -> Option<(PathBuf, Position)> {
+        let path = self.workspace.current_document_path()?.to_path_buf();
+        if !is_rust_source_path(&path) {
+            return None;
+        }
+        let position = self.workspace.current_document().lsp_position_for_display_position(
+            self.cursor.row,
+            self.cursor.column,
+            self.current_page_width(),
+        )?;
+        Some((path, position))
+    }
+
+    fn apply_workspace_edit(&mut self, edit: lsp_types::WorkspaceEdit) -> Result<()> {
+        if let Some(changes) = edit.changes {
+            for (uri, edits) in changes {
+                if let Some(path) = uri_to_path(&uri) {
+                    self.apply_text_edits_to_path(path, &edits)?;
+                }
+            }
+        }
+
+        if let Some(document_changes) = edit.document_changes {
+            match document_changes {
+                lsp_types::DocumentChanges::Edits(edits) => {
+                    for change in edits {
+                        if let Some(path) = uri_to_path(&change.text_document.uri) {
+                            self.apply_text_edits_to_path(path, &change.edits.into_iter().map(|edit| match edit {
+                                lsp_types::OneOf::Left(text_edit) => text_edit,
+                                lsp_types::OneOf::Right(annotated) => annotated.text_edit,
+                            }).collect::<Vec<_>>())?;
+                        }
+                    }
+                }
+                lsp_types::DocumentChanges::Operations(_) => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_text_edits_to_path(&mut self, path: PathBuf, edits: &[TextEdit]) -> Result<()> {
+        if let Some(index) = self.workspace.find_document_index(&path) {
+            self.workspace.documents[index].document.apply_text_edits(edits);
+            self.workspace.documents[index].version += 1;
+            if index == self.workspace.current_index {
+                self.clamp_vertical_state();
+            }
+            return Ok(());
+        }
+
+        self.open_document(path.clone())?;
+        let index = self.workspace.current_index;
+        self.workspace.documents[index].document.apply_text_edits(edits);
+        self.workspace.documents[index].version += 1;
         Ok(())
     }
 
@@ -873,27 +1249,6 @@ impl App {
         Ok(())
     }
 
-    fn refresh_rust_diagnostics(&mut self) -> Result<DiagnosticSummary> {
-        let diagnostics_by_path = load_rust_diagnostics(Path::new("."))?;
-        let mut summary = DiagnosticSummary::default();
-
-        for entry in &mut self.workspace.documents {
-            if entry.document.is_scratch() {
-                continue;
-            }
-            let diagnostics = diagnostics_by_path
-                .get(&entry.path)
-                .cloned()
-                .unwrap_or_default();
-            entry.document.set_rust_diagnostics(diagnostics);
-            let document_summary = entry.document.diagnostic_summary();
-            summary.errors += document_summary.errors;
-            summary.warnings += document_summary.warnings;
-        }
-
-        Ok(summary)
-    }
-
     fn leave_insert_mode(&mut self, rewind_cursor: bool) {
         self.workspace.current_document_mut().end_undo_group();
         self.mode = Mode::Normal;
@@ -908,13 +1263,12 @@ impl App {
             return Ok(());
         };
         self.workspace.current_document_mut().save(&path)?;
-
-        if path.extension().and_then(|ext| ext.to_str()) == Some("rs")
-            && self.rust_support.rust_analyzer_available
-            && self.rust_support.cargo_manifest_in_cwd
-        {
-            let summary = self.refresh_rust_diagnostics()?;
-            self.last_save_feedback = Some(format!("rust-analyzer E{} W{}", summary.errors, summary.warnings));
+        if is_rust_source_path(&path) {
+            self.sync_current_document_save();
+            self.poll_lsp();
+            let summary = self.current_diagnostic_summary();
+            self.last_save_feedback =
+                Some(format!("rust-analyzer E{} W{}", summary.errors, summary.warnings));
         } else {
             self.last_save_feedback = Some("saved".to_owned());
         }
@@ -928,6 +1282,7 @@ impl App {
         }
 
         self.save_current_buffer_view_state();
+        self.sync_current_document_close();
         self.workspace.close_current();
         let _ = self.refresh_picker_candidates();
         if !self.workspace.has_documents() {
@@ -1127,81 +1482,15 @@ fn rust_analyzer_available() -> bool {
         .unwrap_or(false)
 }
 
-fn load_rust_diagnostics(
-    project_root: &Path,
-) -> Result<HashMap<PathBuf, HashMap<usize, Vec<DiagnosticEntry>>>> {
-    let output = Command::new("rust-analyzer")
-        .current_dir(project_root)
-        .args(["-q", "diagnostics", ".", "--severity", "warning"])
-        .output()?;
-
-    if !output.status.success() {
-        return Ok(HashMap::new());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut diagnostics_by_path: HashMap<PathBuf, HashMap<usize, Vec<DiagnosticEntry>>> =
-        HashMap::new();
-
-    for line in stdout.lines() {
-        let Some((path, line_number, diagnostic)) = parse_rust_analyzer_diagnostic_line(line) else {
-            continue;
-        };
-
-        diagnostics_by_path
-            .entry(path)
-            .or_default()
-            .entry(line_number)
-            .or_default()
-            .push(diagnostic);
-    }
-
-    Ok(diagnostics_by_path)
-}
-
-fn parse_rust_analyzer_diagnostic_line(line: &str) -> Option<(PathBuf, usize, DiagnosticEntry)> {
-    if !line.starts_with("at crate ") {
-        return None;
-    }
-
-    let file_marker = ", file ";
-    let file_start = line.find(file_marker)? + file_marker.len();
-    let severity_marker = ": ";
-    let severity_start = line[file_start..].find(severity_marker)? + file_start + severity_marker.len();
-
-    let path = PathBuf::from(line[file_start..severity_start - severity_marker.len()].trim());
-    let remainder = &line[severity_start..];
-    let severity = if remainder.starts_with("Error") {
-        DiagnosticSeverity::Error
-    } else if remainder.starts_with("Warning") || remainder.starts_with("WeakWarning") {
-        DiagnosticSeverity::Warning
-    } else {
-        return None;
-    };
-
-    let line_marker = "line: ";
-    let line_pos = remainder.find(line_marker)? + line_marker.len();
-    let line_digits: String = remainder[line_pos..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect();
-    let line_number: usize = line_digits.parse().ok()?;
-
-    Some((
-        path,
-        line_number.saturating_add(1),
-        DiagnosticEntry {
-            severity,
-            message: remainder.trim().to_owned(),
-        },
-    ))
-}
-
 fn diagnostic_label(severity: DiagnosticSeverity) -> &'static str {
     match severity {
         DiagnosticSeverity::Warning => "Warning",
         DiagnosticSeverity::Error => "Error",
     }
+}
+
+fn is_rust_source_path(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("rs")
 }
 
 #[allow(dead_code)]

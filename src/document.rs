@@ -1,5 +1,7 @@
 use std::{fs, path::Path};
 
+use lsp_types::{Position, TextEdit};
+
 use crate::{config, error::Result};
 
 pub mod editable;
@@ -614,6 +616,62 @@ impl Document {
         match self {
             Self::Editable(document) => document.collect_diagnostics(),
             Self::LargeFile(_) | Self::Scratch(_) => Vec::new(),
+        }
+    }
+
+    pub fn full_text(&self) -> Option<String> {
+        match self {
+            Self::Editable(document) => Some(document.full_text()),
+            Self::LargeFile(_) | Self::Scratch(_) => None,
+        }
+    }
+
+    pub fn lsp_position_for_display_position(
+        &self,
+        display_row: usize,
+        display_column: usize,
+        page_width: usize,
+    ) -> Option<Position> {
+        let content_width = page_width.saturating_sub(
+            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
+        );
+
+        match self {
+            Self::Editable(document) => Some(document.lsp_position_for_display_position(
+                display_row,
+                display_column,
+                content_width.max(1),
+            )),
+            Self::LargeFile(_) | Self::Scratch(_) => None,
+        }
+    }
+
+    pub fn display_position_for_lsp_position(
+        &self,
+        position: Position,
+        page_width: usize,
+    ) -> Option<(usize, usize)> {
+        let content_width = page_width.saturating_sub(
+            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
+        );
+
+        match self {
+            Self::Editable(document) => document.display_position_for_lsp_position(
+                position.line,
+                position.character,
+                content_width.max(1),
+            ),
+            Self::LargeFile(_) | Self::Scratch(_) => None,
+        }
+    }
+
+    pub fn apply_text_edits(&mut self, edits: &[TextEdit]) -> bool {
+        match self {
+            Self::Editable(document) => {
+                document.apply_text_edits(edits);
+                true
+            }
+            Self::LargeFile(_) | Self::Scratch(_) => false,
         }
     }
 }

@@ -86,6 +86,8 @@ impl Workspace {
                 path,
                 document,
                 view_state: BufferViewState::default(),
+                version: 1,
+                lsp_open: false,
             },
         );
         self.current_index = 0;

@@ -56,6 +56,24 @@ impl App {
                 frame.render_widget(input, popup);
             }
 
+            if self.rename_input.active {
+                let popup = centered_rect(36, 3, area);
+                let input = Paragraph::new(self.rename_input.value.clone())
+                    .block(
+                        Block::default()
+                            .title(" Rename ")
+                            .borders(Borders::ALL)
+                            .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
+                    )
+                    .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
+                frame.render_widget(Clear, popup);
+                frame.render_widget(input, popup);
+            }
+
+            if self.hover_popup.active {
+                self.render_hover_popup(frame, area);
+            }
+
             if self.search_input.active {
                 let popup = centered_rect(36, 3, area);
                 let input = Paragraph::new(self.search_input.value.clone())
@@ -80,6 +98,10 @@ impl App {
 
             let cursor_position = if self.go_input.active {
                 self.go_input_cursor_position(area)
+            } else if self.rename_input.active {
+                self.rename_input_cursor_position(area)
+            } else if self.hover_popup.active {
+                self.hover_popup_cursor_position(area)
             } else if self.diagnostic_popup.active {
                 self.diagnostic_popup_cursor_position(area)
             } else if self.search_input.active {
@@ -452,6 +474,31 @@ impl App {
         frame.render_widget(widget, popup);
     }
 
+    fn render_hover_popup(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let height = (self.hover_popup.lines.len() as u16 + 2).clamp(3, 12);
+        let popup = centered_rect(72, height, area);
+        let mut lines = self
+            .hover_popup
+            .lines
+            .iter()
+            .map(|line| Line::from(line.clone()))
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+
+        let widget = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Hover ")
+                    .borders(Borders::ALL)
+                    .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
+            )
+            .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
+        frame.render_widget(Clear, popup);
+        frame.render_widget(widget, popup);
+    }
+
     fn pending_input_text(&self) -> Option<String> {
         match self.pending_normal_action {
             Some(PendingNormalAction::GoPrefix) => Some("g".to_owned()),
@@ -612,6 +659,15 @@ impl App {
         )
     }
 
+    fn rename_input_cursor_position(&self, area: Rect) -> Position {
+        let popup = centered_rect(36, 3, area);
+        Position::new(
+            popup.x
+                .saturating_add(1 + self.rename_input.value.chars().count() as u16),
+            popup.y.saturating_add(1),
+        )
+    }
+
     fn picker_cursor_position(&self, area: Rect) -> Position {
         let popup = centered_rect(72, 12, area);
         Position::new(
@@ -622,6 +678,11 @@ impl App {
     }
 
     fn diagnostic_popup_cursor_position(&self, area: Rect) -> Position {
+        let popup = centered_rect(72, 3, area);
+        Position::new(popup.x.saturating_add(1), popup.y.saturating_add(1))
+    }
+
+    fn hover_popup_cursor_position(&self, area: Rect) -> Position {
         let popup = centered_rect(72, 3, area);
         Position::new(popup.x.saturating_add(1), popup.y.saturating_add(1))
     }
