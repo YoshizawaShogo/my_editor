@@ -7,17 +7,21 @@ use std::{
 
 use lsp_server::{Message, Notification, Request, RequestId};
 use lsp_types::{
-    ClientCapabilities, DiagnosticClientCapabilities, DiagnosticWorkspaceClientCapabilities,
-    DidChangeConfigurationParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    ClientCapabilities, CompletionClientCapabilities, CompletionContext, CompletionParams,
+    CompletionResponse, CompletionTextEdit, DiagnosticClientCapabilities,
+    DiagnosticWorkspaceClientCapabilities, DidChangeConfigurationParams,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, GotoDefinitionParams, Hover, HoverContents, HoverParams, Location,
     Position, ReferenceContext, ReferenceParams, RenameParams, SelectionRange,
     SelectionRangeParams, SemanticTokenModifier, SemanticTokenType,
     SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
     SemanticTokensFullOptions, SemanticTokensParams, SelectionRangeClientCapabilities,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams,
     TextDocumentClientCapabilities, Uri,
-    TokenFormat, WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceDiagnosticParams,
-    WorkspaceDiagnosticReportResult, WorkspaceDocumentDiagnosticReport, WorkspaceEdit,
+    TokenFormat, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
+    WorkspaceClientCapabilities, WorkspaceDiagnosticParams, WorkspaceDiagnosticReportResult,
+    WorkspaceDocumentDiagnosticReport, WorkspaceEdit,
     notification, request,
 };
 use lsp_types::notification::Notification as LspNotificationTrait;
@@ -36,6 +40,7 @@ use crate::{
     error::{AppError, Result},
 };
 use super::PendingOperator;
+use super::completion::CompletionItem;
 use super::semantic::decode_semantic_tokens_response;
 
 pub enum LspClientState {
@@ -103,6 +108,11 @@ pub enum LspEvent {
         operator: PendingOperator,
         ranges: Vec<lsp_types::Range>,
     },
+    CompletionResult {
+        path: PathBuf,
+        serial: u64,
+        items: Vec<CompletionItem>,
+    },
     Failed(String),
 }
 
@@ -123,6 +133,11 @@ enum LspCommand {
     },
     DidSave {
         path: PathBuf,
+        text: String,
+    },
+    DidChange {
+        path: PathBuf,
+        version: i32,
         text: String,
     },
     DidClose {
@@ -157,6 +172,11 @@ enum LspCommand {
     WorkspaceDiagnostics {
         error_only: bool,
     },
+    Completion {
+        path: PathBuf,
+        position: Position,
+        serial: u64,
+    },
 }
 
 enum PendingRequest {
@@ -172,6 +192,10 @@ enum PendingRequest {
     },
     WorkspaceDiagnostics {
         error_only: bool,
+    },
+    Completion {
+        path: PathBuf,
+        serial: u64,
     },
 }
 
@@ -258,6 +282,14 @@ impl RustLspClient {
         })
     }
 
+    pub fn did_change(&mut self, path: &Path, version: i32, text: &str) -> Result<()> {
+        self.send(LspCommand::DidChange {
+            path: path.to_path_buf(),
+            version,
+            text: text.to_owned(),
+        })
+    }
+
     pub fn did_close(&mut self, path: &Path) -> Result<()> {
         if !self.opened_documents.remove(path) {
             return Ok(());
@@ -324,6 +356,14 @@ impl RustLspClient {
             ));
         }
         self.send(LspCommand::WorkspaceDiagnostics { error_only })
+    }
+
+    pub fn completion(&mut self, path: &Path, position: Position, serial: u64) -> Result<()> {
+        self.send(LspCommand::Completion {
+            path: path.to_path_buf(),
+            position,
+            serial,
+        })
     }
 
     pub fn supports_workspace_diagnostics(&self) -> bool {
@@ -493,6 +533,11 @@ async fn initialize_server(
                 server_cancel_support: Some(false),
                 augments_syntax_tokens: Some(true),
             }),
+            completion: Some(CompletionClientCapabilities {
+                dynamic_registration: Some(false),
+                context_support: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         ..Default::default()
@@ -599,6 +644,26 @@ async fn handle_command(
             send_notification(
                 writer,
                 notification::DidSaveTextDocument::METHOD,
+                serde_json::to_value(params)
+                    .map_err(|error| AppError::CommandFailed(error.to_string()))?,
+            )
+            .await?;
+        }
+        LspCommand::DidChange { path, version, text } => {
+            let params = DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: path_to_uri(&path)?,
+                    version,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text,
+                }],
+            };
+            send_notification(
+                writer,
+                notification::DidChangeTextDocument::METHOD,
                 serde_json::to_value(params)
                     .map_err(|error| AppError::CommandFailed(error.to_string()))?,
             )
@@ -766,6 +831,36 @@ async fn handle_command(
             )
             .await?;
         }
+        LspCommand::Completion {
+            path,
+            position,
+            serial,
+        } => {
+            let params = CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: path_to_uri(&path)?,
+                    },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: Default::default(),
+                context: Some(CompletionContext {
+                    trigger_kind: lsp_types::CompletionTriggerKind::INVOKED,
+                    trigger_character: None,
+                }),
+            };
+            let id = next_request_id_value(next_request_id);
+            pending_requests.insert(id.clone(), PendingRequest::Completion { path, serial });
+            send_request(
+                writer,
+                id,
+                request::Completion::METHOD,
+                serde_json::to_value(params)
+                    .map_err(|error| AppError::CommandFailed(error.to_string()))?,
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -827,6 +922,17 @@ async fn process_message(
                         ));
                         return Ok(());
                     }
+                    PendingRequest::Completion { path, serial } => {
+                        send_event(
+                            tx_events,
+                            LspEvent::CompletionResult {
+                                path,
+                                serial,
+                                items: Vec::new(),
+                            },
+                        );
+                        return Ok(());
+                    }
                     _ => {
                         send_event(
                             tx_events,
@@ -885,6 +991,13 @@ async fn process_message(
                     send_event(
                         tx_events,
                         LspEvent::WorkspaceDiagnosticsResult { error_only, items },
+                    );
+                }
+                PendingRequest::Completion { path, serial } => {
+                    let items = parse_completion_response(response.result)?;
+                    send_event(
+                        tx_events,
+                        LspEvent::CompletionResult { path, serial, items },
                     );
                 }
             }
@@ -1146,6 +1259,51 @@ fn parse_workspace_diagnostics_response(
             .then(left.column.cmp(&right.column))
     });
     Ok(items)
+}
+
+fn parse_completion_response(result: Option<Value>) -> Result<Vec<CompletionItem>> {
+    let Some(value) = result else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let response: CompletionResponse =
+        serde_json::from_value(value).map_err(|error| AppError::CommandFailed(error.to_string()))?;
+    let items = match response {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+
+    let mut mapped = items
+        .into_iter()
+        .map(map_completion_item)
+        .collect::<Vec<_>>();
+    mapped.sort_by(|left, right| left.label.cmp(&right.label));
+    Ok(mapped)
+}
+
+fn map_completion_item(item: lsp_types::CompletionItem) -> CompletionItem {
+    let label = item.label;
+    let insert_text = item.insert_text.unwrap_or_else(|| label.clone());
+    let text_edit = item.text_edit.map(|edit| match edit {
+        CompletionTextEdit::Edit(edit) => edit,
+        CompletionTextEdit::InsertAndReplace(edit) => lsp_types::TextEdit {
+            range: edit.insert,
+            new_text: edit.new_text,
+        },
+    });
+
+    let filter_text = item.filter_text.unwrap_or_else(|| label.clone());
+
+    CompletionItem {
+        label,
+        insert_text,
+        filter_text,
+        sort_text: item.sort_text,
+        text_edit,
+    }
 }
 
 fn supports_workspace_diagnostics(capabilities: &lsp_types::ServerCapabilities) -> bool {

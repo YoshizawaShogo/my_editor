@@ -255,6 +255,10 @@ impl EditableDocument {
         self.semantic_tokens = semantic_tokens;
     }
 
+    pub fn clear_semantic_tokens(&mut self) {
+        self.semantic_tokens.clear();
+    }
+
     pub fn diagnostic_summary(&self) -> DiagnosticSummary {
         let mut summary = DiagnosticSummary::default();
         for entries in self.diagnostics.values() {
@@ -444,6 +448,7 @@ impl EditableDocument {
         }
 
         self.push_undo_snapshot();
+        self.clear_semantic_tokens();
         self.rope = Rope::from_str(&text.replace(find, replace));
         self.reload_git_gutter_markers();
         count
@@ -486,8 +491,12 @@ impl EditableDocument {
             return;
         }
 
-        self.begin_undo_group();
+        let started_group = !self.undo_group_active;
+        if started_group {
+            self.begin_undo_group();
+        }
         self.push_undo_snapshot();
+        self.clear_semantic_tokens();
 
         let mut edits = edits.to_vec();
         edits.sort_by(|left, right| {
@@ -505,7 +514,9 @@ impl EditableDocument {
             self.rope.insert(start, &edit.new_text);
         }
 
-        self.end_undo_group();
+        if started_group {
+            self.end_undo_group();
+        }
         self.reload_git_gutter_markers();
     }
 
@@ -517,6 +528,7 @@ impl EditableDocument {
         ch: char,
     ) -> (usize, usize) {
         self.push_undo_snapshot();
+        self.clear_semantic_tokens();
         let insert_char_idx = self.char_index_for_display_position(display_row, display_column, page_width);
         self.rope.insert_char(insert_char_idx, ch);
         self.reload_git_gutter_markers();
@@ -530,6 +542,7 @@ impl EditableDocument {
         page_width: usize,
     ) -> (usize, usize) {
         self.push_undo_snapshot();
+        self.clear_semantic_tokens();
         let insert_char_idx = self.char_index_for_display_position(display_row, display_column, page_width);
         self.rope.insert_char(insert_char_idx, '\n');
         self.reload_git_gutter_markers();
@@ -548,6 +561,7 @@ impl EditableDocument {
         }
 
         self.push_undo_snapshot();
+        self.clear_semantic_tokens();
         self.rope.remove((cursor_char_idx - 1)..cursor_char_idx);
         self.reload_git_gutter_markers();
         Some(self.display_position_for_char_index(cursor_char_idx - 1, page_width))
@@ -565,6 +579,7 @@ impl EditableDocument {
         }
 
         self.push_undo_snapshot();
+        self.clear_semantic_tokens();
         self.rope.remove(cursor_char_idx..cursor_char_idx.saturating_add(1));
         self.reload_git_gutter_markers();
         Some(self.display_position_for_char_index(cursor_char_idx, page_width))
@@ -588,6 +603,7 @@ impl EditableDocument {
         }
 
         self.push_undo_snapshot();
+        self.clear_semantic_tokens();
         self.rope.remove(start_char_idx..end_char_idx);
         self.reload_git_gutter_markers();
         Some(self.display_position_for_char_index(start_char_idx, page_width))
@@ -607,6 +623,7 @@ impl EditableDocument {
             self.char_index_for_display_position(display_row, display_column, page_width);
         let spaces = " ".repeat(self.indent_width.max(1));
         self.push_undo_snapshot();
+        self.clear_semantic_tokens();
         self.rope.insert(insert_char_idx, &spaces);
         self.reload_git_gutter_markers();
         self.display_position_for_char_index(
@@ -624,6 +641,7 @@ impl EditableDocument {
         let insert_char_idx = line_start.saturating_add(trimmed_line_char_len(&line_text));
 
         self.push_undo_snapshot();
+        self.clear_semantic_tokens();
         self.rope.insert_char(insert_char_idx, '\n');
         self.reload_git_gutter_markers();
         self.display_position_for_char_index(insert_char_idx.saturating_add(1), page_width)
@@ -636,6 +654,7 @@ impl EditableDocument {
         let insert_char_idx = self.rope.line_to_char(line_index);
 
         self.push_undo_snapshot();
+        self.clear_semantic_tokens();
         self.rope.insert_char(insert_char_idx, '\n');
         self.reload_git_gutter_markers();
         self.display_position_for_char_index(insert_char_idx, page_width)
@@ -692,6 +711,7 @@ impl EditableDocument {
 
         if trimmed_len > 0 {
             self.push_undo_snapshot();
+            self.clear_semantic_tokens();
             self.rope.remove(
                 line_start.saturating_add(indent_len)..line_start.saturating_add(trimmed_len),
             );
@@ -726,6 +746,7 @@ impl EditableDocument {
 
         if self.rope.len_lines() <= 1 {
             self.push_undo_snapshot();
+            self.clear_semantic_tokens();
             self.rope = Rope::from_str("");
             self.reload_git_gutter_markers();
             return Some((removed, (0, 0)));
@@ -737,6 +758,7 @@ impl EditableDocument {
             line_start.saturating_add(trimmed_line_char_len(&line_text))
         };
         self.push_undo_snapshot();
+        self.clear_semantic_tokens();
         self.rope.remove(line_start..removal_end);
         self.reload_git_gutter_markers();
 

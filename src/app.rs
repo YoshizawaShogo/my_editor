@@ -27,6 +27,7 @@ use crate::{
 };
 
 mod action;
+mod completion;
 mod keymap;
 mod lsp;
 mod navigation;
@@ -39,6 +40,10 @@ mod terminal_session;
 mod workspace;
 
 use self::action::{FindKind, PendingNormalAction, PendingOperator, ReplayableAction};
+use self::completion::{
+    CompletionItem, CompletionState, collect_fallback_items, completion_prefix,
+    has_empty_completion_trigger, rank_completion_items, text_end_position,
+};
 use self::lsp::{
     GotoKind, HoverPopupState, LspClientState, LspEvent, RenameInputState, RustLspClient,
     WorkspaceDiagnosticItem, uri_to_path,
@@ -58,6 +63,7 @@ pub struct App {
     pub go_input: GoInputState,
     pub search_input: SearchInputState,
     pub replace_input: ReplaceInputState,
+    pub completion: CompletionState,
     pub selection_input: SelectionInputState,
     pub diagnostic_popup: DiagnosticPopupState,
     pub last_search: Option<SearchState>,
@@ -311,6 +317,7 @@ impl App {
                 scope: SearchScope::CurrentFile,
                 field: ReplaceField::Find,
             },
+            completion: CompletionState::default(),
             selection_input: SelectionInputState {
                 active: false,
                 operator: None,
@@ -366,6 +373,7 @@ impl App {
             changed |= self.prune_toast();
             changed |= self.poll_lsp();
             changed |= self.poll_shell_output();
+            changed |= self.poll_completion();
             needs_redraw |= changed;
 
             if needs_redraw {
@@ -454,6 +462,7 @@ impl App {
     }
 
     fn make_document_current(&mut self, index: usize) {
+        self.close_completion();
         self.save_current_buffer_view_state();
         self.workspace.make_current(index);
         self.restore_current_buffer_view_state();
@@ -461,6 +470,7 @@ impl App {
     }
 
     fn select_current_document(&mut self, index: usize) {
+        self.close_completion();
         self.save_current_buffer_view_state();
         self.workspace.select_current(index);
         self.restore_current_buffer_view_state();
@@ -469,6 +479,7 @@ impl App {
 
     fn open_document(&mut self, path: PathBuf) -> Result<()> {
         let path = normalize_workspace_path(&path)?;
+        self.close_completion();
         self.save_current_buffer_view_state();
         self.workspace.open_document(path.clone())?;
         self.restore_cached_lsp_state(&path);
@@ -556,10 +567,15 @@ impl App {
         let version = self.workspace.documents[current_index].version;
 
         self.show_lsp_sync_toast(&path, "loading");
-        self.pending_semantic_tokens_path = Some(path.clone());
         if let LspClientState::Ready(client) = &mut self.lsp {
             client.ensure_open(&path, version, &text)?;
             let _ = client.did_save(&path, &text);
+            if should_wait_for_diagnostics_before_semantic(&path) {
+                self.pending_semantic_tokens_path = Some(path.clone());
+            } else {
+                self.pending_semantic_tokens_path = None;
+                let _ = client.request_semantic_tokens(&path);
+            }
             self.workspace.documents[current_index].lsp_open = true;
         }
 
@@ -679,6 +695,9 @@ impl App {
                     self.clear_persistent_toast();
                     let _ = self.open_selection_input(operator, ranges);
                 }
+                LspEvent::CompletionResult { path, serial, items } => {
+                    self.handle_completion_result(path, serial, items);
+                }
                 LspEvent::Failed(message) => {
                     self.clear_persistent_toast();
                     self.last_save_feedback = Some(message.clone());
@@ -713,8 +732,13 @@ impl App {
             return;
         };
         self.show_lsp_sync_toast(&path, "updating");
-        self.pending_semantic_tokens_path = Some(path.clone());
         if let LspClientState::Ready(client) = &mut self.lsp {
+            if should_wait_for_diagnostics_before_semantic(&path) {
+                self.pending_semantic_tokens_path = Some(path.clone());
+            } else {
+                self.pending_semantic_tokens_path = None;
+                let _ = client.request_semantic_tokens(&path);
+            }
             let _ = client.did_save(&path, &text);
         }
     }
@@ -1434,6 +1458,7 @@ impl App {
 
     fn open_hover_popup(&mut self) -> Result<()> {
         self.ensure_lsp_for_current_document()?;
+        self.sync_current_document_saved_state_for_lsp();
         let Some((path, position)) = self.current_rust_lsp_position() else {
             return Ok(());
         };
@@ -1469,6 +1494,7 @@ impl App {
         }
 
         self.ensure_lsp_for_current_document()?;
+        self.sync_current_document_saved_state_for_lsp();
         let Some((path, position)) = self.current_rust_lsp_position() else {
             self.close_rename_input();
             return Ok(());
@@ -1484,6 +1510,7 @@ impl App {
 
     fn goto_symbol(&mut self, kind: GotoKind) -> Result<()> {
         self.ensure_lsp_for_current_document()?;
+        self.sync_current_document_saved_state_for_lsp();
         let Some((path, position)) = self.current_rust_lsp_position() else {
             return Ok(());
         };
@@ -1496,6 +1523,7 @@ impl App {
 
     fn show_references(&mut self) -> Result<()> {
         self.ensure_lsp_for_current_document()?;
+        self.sync_current_document_saved_state_for_lsp();
         let Some((path, position)) = self.current_rust_lsp_position() else {
             return Ok(());
         };
@@ -1589,8 +1617,29 @@ impl App {
         Some((path, position))
     }
 
+    fn sync_current_document_saved_state_for_lsp(&mut self) {
+        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+            return;
+        };
+        if !is_rust_source_path(&path) {
+            return;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            return;
+        };
+        let current_index = self.workspace.current_index;
+        self.workspace.documents[current_index].version += 1;
+        let version = self.workspace.documents[current_index].version;
+        if let LspClientState::Ready(client) = &mut self.lsp {
+            let _ = client.ensure_open(&path, version, &text);
+            let _ = client.did_change(&path, version, &text);
+            self.workspace.documents[current_index].lsp_open = true;
+        }
+    }
+
     fn request_selection_range_operator(&mut self, operator: PendingOperator) -> Result<()> {
         self.ensure_lsp_for_current_document()?;
+        self.sync_current_document_saved_state_for_lsp();
         let Some((path, position)) = self.current_rust_lsp_position() else {
             self.show_toast("LSP syntax range unavailable");
             return Ok(());
@@ -1851,10 +1900,46 @@ impl App {
 
     fn leave_insert_mode(&mut self, rewind_cursor: bool) {
         self.workspace.current_document_mut().end_undo_group();
+        self.close_completion();
         self.mode = Mode::Normal;
         self.pending_insert_j = None;
         if rewind_cursor {
             self.cursor.column = self.cursor.column.saturating_sub(1);
+        }
+        self.refresh_current_document_semantic_tokens();
+    }
+
+    fn refresh_current_document_semantic_tokens(&mut self) {
+        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+            return;
+        };
+        if !is_rust_source_path(&path) {
+            return;
+        }
+        let Some(text) = self.workspace.current_document().full_text() else {
+            return;
+        };
+
+        if matches!(self.lsp, LspClientState::Inactive) {
+            self.lsp = match RustLspClient::start(Path::new(".")) {
+                Ok(client) => LspClientState::Ready(client),
+                Err(_) => return,
+            };
+        }
+
+        let current_index = self.workspace.current_index;
+        self.workspace.documents[current_index].version += 1;
+        let version = self.workspace.documents[current_index].version;
+
+        if let LspClientState::Ready(client) = &mut self.lsp {
+            if client.ensure_open(&path, version, &text).is_err() {
+                return;
+            }
+            self.workspace.documents[current_index].lsp_open = true;
+            if client.did_change(&path, version, &text).is_err() {
+                return;
+            }
+            let _ = client.request_semantic_tokens(&path);
         }
     }
 
@@ -1912,6 +1997,7 @@ impl App {
             return;
         }
 
+        self.close_completion();
         self.save_current_buffer_view_state();
         self.sync_current_document_close();
         self.workspace.close_current();
@@ -1980,6 +2066,7 @@ impl App {
             self.cursor.row = row;
             self.cursor.column = column;
             self.clamp_vertical_state();
+            self.schedule_completion_refresh();
         }
     }
 
@@ -1993,6 +2080,7 @@ impl App {
             self.cursor.row = row;
             self.cursor.column = column;
             self.clamp_vertical_state();
+            self.close_completion();
         }
     }
 
@@ -2006,6 +2094,7 @@ impl App {
             self.cursor.row = row;
             self.cursor.column = column;
             self.clamp_vertical_state();
+            self.close_completion();
         }
     }
 
@@ -2019,6 +2108,7 @@ impl App {
             self.cursor.row = row;
             self.cursor.column = column;
             self.clamp_vertical_state();
+            self.schedule_completion_refresh();
         }
     }
 
@@ -2032,7 +2122,232 @@ impl App {
             self.cursor.row = row;
             self.cursor.column = column;
             self.clamp_vertical_state();
+            self.schedule_completion_refresh();
         }
+    }
+
+    fn close_completion(&mut self) {
+        self.completion.invalidate();
+    }
+
+    fn schedule_completion_refresh(&mut self) {
+        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+            self.close_completion();
+            return;
+        };
+        if !is_rust_source_path(&path) {
+            self.close_completion();
+            return;
+        }
+
+        let page_width = self.current_page_width();
+        let line = self
+            .workspace
+            .current_document()
+            .display_line_text(self.cursor.row, page_width)
+            .unwrap_or_default();
+        let (query_start, query) = completion_prefix(&line, self.cursor.column);
+        if query.is_empty() && !has_empty_completion_trigger(&line, self.cursor.column) {
+            self.close_completion();
+            return;
+        }
+
+        self.completion.active = false;
+        self.completion.items.clear();
+        self.completion.query_start = query_start;
+        self.completion.query = query;
+        self.completion.path = Some(path);
+        self.completion.serial = self.completion.serial.saturating_add(1);
+        let serial = self.completion.serial;
+        self.completion.last_edit_at = None;
+        self.completion.last_requested_serial = serial;
+        self.completion.pending_request_serial = Some(serial);
+        self.request_completion(serial);
+    }
+
+    fn poll_completion(&mut self) -> bool {
+        if self.mode != Mode::Insert || self.picker.active || self.search_input.active || self.replace_input.active {
+            return false;
+        }
+
+        let Some(last_edit_at) = self.completion.last_edit_at else {
+            return false;
+        };
+        if Instant::now().duration_since(last_edit_at) < Duration::from_millis(120) {
+            return false;
+        }
+
+        if self.completion.serial == self.completion.last_requested_serial {
+            return false;
+        }
+
+        let serial = self.completion.serial;
+        self.completion.last_requested_serial = serial;
+        self.completion.pending_request_serial = Some(serial);
+        self.request_completion(serial);
+        true
+    }
+
+    fn request_completion(&mut self, serial: u64) {
+        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+            self.apply_completion_fallback(serial);
+            return;
+        };
+        if !is_rust_source_path(&path) {
+            self.close_completion();
+            return;
+        }
+
+        let page_width = self.current_page_width();
+        let Some(position) = self
+            .workspace
+            .current_document()
+            .lsp_position_for_display_position(self.cursor.row, self.cursor.column, page_width)
+        else {
+            self.apply_completion_fallback(serial);
+            return;
+        };
+
+        let Some(text) = self.workspace.current_document().full_text() else {
+            self.apply_completion_fallback(serial);
+            return;
+        };
+
+        match &mut self.lsp {
+            LspClientState::NotAvailable | LspClientState::Failed(_) => {
+                self.apply_completion_fallback(serial);
+            }
+            LspClientState::Inactive => {
+                self.lsp = match RustLspClient::start(Path::new(".")) {
+                    Ok(client) => LspClientState::Ready(client),
+                    Err(_) => {
+                        self.apply_completion_fallback(serial);
+                        return;
+                    }
+                };
+                if self
+                    .request_completion_after_start(path, text, position, serial)
+                    .is_err()
+                {
+                    self.apply_completion_fallback(serial);
+                }
+            }
+            LspClientState::Ready(_) => {
+                if self
+                    .request_completion_after_start(path, text, position, serial)
+                    .is_err()
+                {
+                    self.apply_completion_fallback(serial);
+                }
+            }
+        }
+    }
+
+    fn request_completion_after_start(
+        &mut self,
+        path: PathBuf,
+        text: String,
+        position: Position,
+        serial: u64,
+    ) -> Result<()> {
+        let current_index = self.workspace.current_index;
+        self.workspace.documents[current_index].version += 1;
+        let version = self.workspace.documents[current_index].version;
+        let LspClientState::Ready(client) = &mut self.lsp else {
+            self.apply_completion_fallback(serial);
+            return Ok(());
+        };
+        client.ensure_open(&path, version, &text)?;
+        self.workspace.documents[current_index].lsp_open = true;
+        client.did_change(&path, version, &text)?;
+        client.completion(&path, position, serial)?;
+        Ok(())
+    }
+
+    fn handle_completion_result(
+        &mut self,
+        path: PathBuf,
+        serial: u64,
+        items: Vec<CompletionItem>,
+    ) {
+        if self.mode != Mode::Insert {
+            return;
+        }
+        if self.completion.serial != serial {
+            return;
+        }
+        if self.completion.path.as_ref().is_some_and(|current| current != &path) {
+            return;
+        }
+
+        self.completion.pending_request_serial = None;
+        let ranked = rank_completion_items(items, &self.completion.query, 8);
+        if ranked.is_empty() {
+            self.apply_completion_fallback(serial);
+            return;
+        }
+
+        self.completion.items = ranked;
+        self.completion.active = true;
+    }
+
+    fn apply_completion_fallback(&mut self, serial: u64) {
+        if self.completion.serial != serial {
+            return;
+        }
+        let Some(text) = self.workspace.current_document().full_text() else {
+            self.close_completion();
+            return;
+        };
+        let items = collect_fallback_items(&text, &self.completion.query, 8);
+        self.completion.items = items;
+        self.completion.active = !self.completion.items.is_empty();
+    }
+
+    fn submit_completion(&mut self) -> bool {
+        let Some(item) = self.completion.items.first().cloned() else {
+            return false;
+        };
+
+        let page_width = self.current_page_width();
+        let prefix_start = self.completion.query_start;
+        let Some(start_position) = self
+            .workspace
+            .current_document()
+            .lsp_position_for_display_position(self.cursor.row, prefix_start, page_width)
+        else {
+            self.close_completion();
+            return false;
+        };
+
+        let edit = item.text_edit.clone().unwrap_or_else(|| {
+            let end = self
+                .workspace
+                .current_document()
+                .lsp_position_for_display_position(self.cursor.row, self.cursor.column, page_width)
+                .unwrap_or(start_position);
+            TextEdit {
+                range: lsp_types::Range::new(start_position, end),
+                new_text: item.insert_text.clone(),
+            }
+        });
+
+        let cursor_position = text_end_position(edit.range.start, &edit.new_text);
+        let applied = self.workspace.current_document_mut().apply_text_edits(&[edit]);
+        if applied {
+            self.workspace.documents[self.workspace.current_index].version += 1;
+            if let Some((row, column)) = self
+                .workspace
+                .current_document()
+                .display_position_for_lsp_position(cursor_position, page_width)
+            {
+                self.cursor.row = row;
+                self.cursor.column = column;
+                self.clamp_vertical_state();
+            }
+        }
+        self.close_completion();
+        true
     }
 }
 
@@ -2159,6 +2474,13 @@ fn diagnostic_label(severity: DiagnosticSeverity) -> &'static str {
 
 fn is_rust_source_path(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+}
+
+fn should_wait_for_diagnostics_before_semantic(path: &Path) -> bool {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| cwd.canonicalize().ok())
+        .is_some_and(|cwd| path.starts_with(cwd))
 }
 
 #[allow(dead_code)]

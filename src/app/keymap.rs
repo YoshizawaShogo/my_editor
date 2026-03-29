@@ -751,7 +751,8 @@ impl App {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
         {
-            self.leave_insert_mode(true);
+            self.close_completion();
+            self.leave_insert_mode(false);
             return Ok(false);
         }
 
@@ -759,7 +760,7 @@ impl App {
             && matches!(key_event.code, KeyCode::Char('s'))
         {
             self.save_current_document()?;
-            self.leave_insert_mode(true);
+            self.leave_insert_mode(false);
             return Ok(false);
         }
 
@@ -789,35 +790,42 @@ impl App {
 
         match key_event.code {
             KeyCode::Esc => {
-                self.leave_insert_mode(true);
+                self.close_completion();
+                self.leave_insert_mode(false);
                 Ok(false)
             }
             KeyCode::Up => {
+                self.close_completion();
                 self.move_cursor_up();
                 self.pending_insert_j = None;
                 Ok(false)
             }
             KeyCode::Left => {
+                self.close_completion();
                 self.move_cursor_left();
                 self.pending_insert_j = None;
                 Ok(false)
             }
             KeyCode::Down => {
+                self.close_completion();
                 self.move_cursor_down();
                 self.pending_insert_j = None;
                 Ok(false)
             }
             KeyCode::Right => {
+                self.close_completion();
                 self.move_cursor_right();
                 self.pending_insert_j = None;
                 Ok(false)
             }
             KeyCode::Home => {
+                self.close_completion();
                 self.move_cursor_to_line_start();
                 self.pending_insert_j = None;
                 Ok(false)
             }
             KeyCode::End => {
+                self.close_completion();
                 self.move_cursor_to_line_end();
                 self.pending_insert_j = None;
                 Ok(false)
@@ -829,6 +837,7 @@ impl App {
                     .is_some_and(|previous| now.duration_since(previous) <= super::insert_escape_timeout())
                 {
                     self.backspace_char();
+                    self.close_completion();
                     self.leave_insert_mode(false);
                 } else {
                     self.insert_char('j');
@@ -852,7 +861,10 @@ impl App {
                 Ok(false)
             }
             KeyCode::Tab => {
-                self.insert_tab();
+                if !self.submit_completion() {
+                    self.close_completion();
+                    self.insert_tab();
+                }
                 self.pending_insert_j = None;
                 Ok(false)
             }
@@ -867,6 +879,7 @@ impl App {
                 Ok(false)
             }
             _ => {
+                self.close_completion();
                 self.pending_insert_j = None;
                 Ok(false)
             }

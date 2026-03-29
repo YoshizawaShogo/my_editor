@@ -117,6 +117,10 @@ impl App {
                 self.render_picker(frame, area);
             }
 
+            if self.completion.active && !self.completion.items.is_empty() && self.mode == Mode::Insert {
+                self.render_completion_popup(frame, layout[0]);
+            }
+
             if !self.toast.transient_messages.is_empty() || self.toast.persistent_message.is_some() {
                 self.render_toasts(frame, layout[0]);
             }
@@ -588,6 +592,59 @@ impl App {
             .block(
                 Block::default()
                     .title(" Hover ")
+                    .borders(Borders::ALL)
+                    .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
+            )
+            .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
+        frame.render_widget(Clear, popup);
+        frame.render_widget(widget, popup);
+    }
+
+    fn render_completion_popup(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let cursor = self.cursor_position(area);
+        let max_label_width = self
+            .completion
+            .items
+            .iter()
+            .take(8)
+            .map(|item| item.label.chars().count())
+            .max()
+            .unwrap_or(8)
+            .min(48) as u16;
+        let width = max_label_width.saturating_add(2).clamp(12, area.width.min(50));
+        let item_count = self.completion.items.len().min(8) as u16;
+        let height = item_count.saturating_add(2).min(area.height.max(3));
+        let x = cursor
+            .x
+            .min(area.x + area.width.saturating_sub(width));
+        let mut y = cursor.y.saturating_add(1);
+        if y + height > area.y + area.height {
+            y = cursor.y.saturating_sub(height.saturating_sub(1));
+        }
+        let popup = Rect::new(x, y, width, height);
+
+        let lines = self
+            .completion
+            .items
+            .iter()
+            .take(8)
+            .enumerate()
+            .map(|(index, item)| {
+                let label = truncate_chars(&item.label, width.saturating_sub(2) as usize);
+                let style = if index == 0 {
+                    Style::default()
+                        .fg(AppColors::ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(AppColors::FOREGROUND)
+                };
+                Line::from(Span::styled(label, style))
+            })
+            .collect::<Vec<_>>();
+
+        let widget = Paragraph::new(lines)
+            .block(
+                Block::default()
                     .borders(Borders::ALL)
                     .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
             )
@@ -1281,6 +1338,10 @@ fn wrapped_text_cursor_position(area: Rect, text: &str, content_width: u16) -> P
         area.x.saturating_add(1 + wrapped_col as u16),
         area.y.saturating_add(1 + wrapped_row as u16).min(area.y.saturating_add(area.height.saturating_sub(2))),
     )
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }
 
 fn highlight_fuzzy_match(text: &str, indices: &[usize]) -> Vec<Span<'static>> {
