@@ -255,27 +255,12 @@ impl SearchScope {
 }
 
 impl App {
-    pub fn open(path: Option<&Path>) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let rust_analyzer_available = rust_analyzer_available();
         let cargo_manifest_in_cwd = Path::new("Cargo.toml").exists();
-        let workspace = match path {
-            Some(path) => {
-                let path = normalize_workspace_path(path)?;
-                Workspace {
-                    documents: vec![DocumentEntry {
-                        path: path.clone(),
-                        document: Document::open(&path)?,
-                        view_state: BufferViewState::default(),
-                        version: 1,
-                        lsp_open: false,
-                    }],
-                    current_index: 0,
-                }
-            }
-            None => Workspace {
-                documents: Vec::new(),
-                current_index: 0,
-            },
+        let workspace = Workspace {
+            documents: Vec::new(),
+            current_index: 0,
         };
 
         let mut app = Self {
@@ -359,6 +344,15 @@ impl App {
             pending_semantic_tokens_path: None,
             lsp_document_cache: std::collections::HashMap::new(),
         };
+        let _ = app.ensure_lsp_for_current_document();
+        app.refresh_picker_candidates()?;
+        Ok(app)
+    }
+
+    pub fn open_path(path: &Path) -> Result<Self> {
+        let mut app = Self::new()?;
+        let path = normalize_workspace_path(path)?;
+        app.workspace.open_document(path)?;
         let _ = app.ensure_lsp_for_current_document();
         app.refresh_picker_candidates()?;
         Ok(app)

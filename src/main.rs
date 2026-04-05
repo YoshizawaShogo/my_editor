@@ -19,7 +19,12 @@ struct Args {
 fn main() -> ExitCode {
     let args = Args::parse();
 
-    match app::App::open(args.path.as_deref()) {
+    let app = match args.path.as_deref() {
+        Some(path) => app::App::open_path(path),
+        None => app::App::new(),
+    };
+
+    match app {
         Ok(mut app) => match app.run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
