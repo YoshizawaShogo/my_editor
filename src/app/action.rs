@@ -1,8 +1,7 @@
-/*
 #[derive(Clone, Copy)]
 pub enum ReplayableAction {
     GitHunk { forward: bool },
-    Find(FindKind, char),
+    Find { kind: FindKind, ch: char },
     Diagnostic { error_only: bool, forward: bool },
     Search { forward: bool },
 }
@@ -11,9 +10,9 @@ pub enum ReplayableAction {
 pub enum PendingNormalAction {
     GoPrefix,
     DiagnosticPrefix,
-    Find(FindKind),
-    Operator(PendingOperator),
-    OperatorFind(PendingOperator, FindKind),
+    Find { kind: FindKind },
+    Operator { operator: PendingOperator },
+    OperatorFind { operator: PendingOperator, find_kind: FindKind },
 }
 
 #[derive(Clone, Copy)]
@@ -30,4 +29,3 @@ pub enum FindKind {
     TillForward,
     TillBackward,
 }
-*/

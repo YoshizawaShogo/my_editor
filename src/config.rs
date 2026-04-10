@@ -1,36 +1,45 @@
-/*
-use std::{env, sync::OnceLock};
+use std::env;
 
-const LARGE_FILE_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
-const LARGE_FILE_READ_WINDOW_BYTES: usize = 64 * 1024;
+const DEFAULT_LARGE_FILE_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
+const DEFAULT_LARGE_FILE_READ_WINDOW_BYTES: usize = 64 * 1024;
 const DEFAULT_SHELL_PROGRAM: &str = "/bin/sh";
-static LARGE_FILE_THRESHOLD_BYTES_CACHE: OnceLock<u64> = OnceLock::new();
-static LARGE_FILE_READ_WINDOW_BYTES_CACHE: OnceLock<usize> = OnceLock::new();
-static SHELL_PROGRAM_CACHE: OnceLock<String> = OnceLock::new();
 
-pub fn large_file_threshold_bytes() -> u64 {
-    *LARGE_FILE_THRESHOLD_BYTES_CACHE.get_or_init(|| {
-        env::var("LARGE_FILE_THRESHOLD_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(LARGE_FILE_THRESHOLD_BYTES)
-    })
+pub struct Config {
+    pub(crate) large_file_threshold_bytes: u64,
+    pub(crate) large_file_read_window_bytes: usize,
+    pub(crate) shell_program: String,
 }
 
-pub fn large_file_read_window_bytes() -> usize {
-    *LARGE_FILE_READ_WINDOW_BYTES_CACHE.get_or_init(|| {
-        env::var("LARGE_FILE_READ_WINDOW_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(LARGE_FILE_READ_WINDOW_BYTES)
-    })
+impl Config {
+    pub fn new(
+        large_file_threshold_bytes: u64,
+        large_file_read_window_bytes: usize,
+        shell_program: String,
+    ) -> Self {
+        Self {
+            large_file_threshold_bytes,
+            large_file_read_window_bytes,
+            shell_program,
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self {
+            large_file_threshold_bytes: env_u64("LARGE_FILE_THRESHOLD_BYTES")
+                .unwrap_or(DEFAULT_LARGE_FILE_THRESHOLD_BYTES),
+            large_file_read_window_bytes: env_usize("LARGE_FILE_READ_WINDOW_BYTES")
+                .unwrap_or(DEFAULT_LARGE_FILE_READ_WINDOW_BYTES),
+            shell_program: env::var("SHELL")
+                .unwrap_or_else(|_| DEFAULT_SHELL_PROGRAM.to_owned()),
+        }
+    }
+
 }
 
-pub fn shell_program() -> &'static str {
-    SHELL_PROGRAM_CACHE
-        .get_or_init(|| env::var("SHELL").unwrap_or_else(|_| DEFAULT_SHELL_PROGRAM.to_owned()))
-        .as_str()
+fn env_u64(key: &str) -> Option<u64> {
+    env::var(key).ok()?.parse::<u64>().ok().filter(|&v| v > 0)
 }
-*/
+
+fn env_usize(key: &str) -> Option<usize> {
+    env::var(key).ok()?.parse::<usize>().ok().filter(|&v| v > 0)
+}
