@@ -1,3 +1,4 @@
+/*
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -158,9 +159,7 @@ impl App {
     }
 
     fn effective_mode(&self) -> Mode {
-        if self.focused_pane == FocusedPane::Right
-            && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single)
-        {
+        if self.is_terminal_pane_focused() {
             Mode::Shell
         } else {
             self.mode
@@ -185,9 +184,7 @@ impl App {
     }
 
     fn active_pane_label(&self) -> String {
-        if self.focused_pane == FocusedPane::Right
-            && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single)
-        {
+        if self.is_terminal_pane_focused() {
             return format!("terminal {}", self.shell.program);
         }
 
@@ -196,9 +193,7 @@ impl App {
     }
 
     fn active_pane_status(&self) -> String {
-        if self.focused_pane == FocusedPane::Right
-            && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single)
-        {
+        if self.is_terminal_pane_focused() {
             return "TERMINAL".to_owned();
         }
 
@@ -814,10 +809,7 @@ impl App {
     }
 
     fn cursor_position(&self, area: Rect) -> Position {
-        if !self.workspace.has_documents()
-            && !(self.focused_pane == FocusedPane::Right
-                && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single))
-        {
+        if !self.workspace.has_documents() && !self.is_terminal_pane_focused() {
             return Position::new(area.x.saturating_add(1), area.y.saturating_add(1));
         }
 
@@ -837,9 +829,7 @@ impl App {
             }
         };
 
-        if self.focused_pane == FocusedPane::Right
-            && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single)
-        {
+        if self.is_terminal_pane_focused() {
             let Some(parser) = &self.shell.parser else {
                 return Position::new(pane_area.x, pane_area.y);
             };
@@ -1586,3 +1576,4 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let y = area.y.saturating_add(area.height.saturating_sub(height) / 2);
     Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
+*/

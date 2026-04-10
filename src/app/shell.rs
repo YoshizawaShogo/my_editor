@@ -1,3 +1,4 @@
+/*
 use std::{
     fs::File,
     io::{self, Read, Write},
@@ -22,6 +23,7 @@ use crate::{error::Result, mode::Mode};
 use super::{App, FocusedPane, LayoutMode};
 
 impl App {
+    /// シェルが未起動なら擬似端末を作成してシェルプロセスを起動する
     pub(super) fn ensure_shell_started(&mut self) -> Result<()> {
         self.reap_exited_shell();
         if self.shell.child.is_some() {
@@ -86,6 +88,7 @@ impl App {
         Ok(())
     }
 
+    /// シェル出力チャンネルからデータを受け取ってvt100パーサに送り、変更があればtrueを返す
     pub(super) fn poll_shell_output(&mut self) -> bool {
         let mut changed = self.reap_exited_shell();
         let Some(rx) = &self.shell.output_rx else {
@@ -107,6 +110,7 @@ impl App {
         changed
     }
 
+    /// シェルプロセスを強制終了してリソースを解放する
     pub(super) fn shutdown_shell(&mut self) {
         self.shell.pty.take();
         if let Some(mut child) = self.shell.child.take() {
@@ -117,6 +121,7 @@ impl App {
         self.shell.parser = None;
     }
 
+    /// シェルモードのキー入力を処理してシェルに転送する
     pub(super) fn handle_shell_mode_key(&mut self, key_event: KeyEvent) -> Result<bool> {
         if key_event.modifiers.contains(KeyModifiers::CONTROL) {
             match key_event.code {
@@ -187,6 +192,7 @@ impl App {
         Ok(false)
     }
 
+    /// ターミナル分割の表示をトグルしてシェルを起動またはレイアウトを切り替える
     pub(super) fn toggle_terminal_split(&mut self) -> Result<()> {
         self.reap_exited_shell();
         if self.shell.child.is_none()
@@ -214,6 +220,7 @@ impl App {
         Ok(())
     }
 
+    /// レイアウトに応じて擬似端末のウィンドウサイズを更新する
     pub(super) fn sync_shell_size(&mut self) -> Result<()> {
         let Some(pty) = &self.shell.pty else {
             return Ok(());
@@ -248,6 +255,7 @@ impl App {
         Ok(())
     }
 
+    /// 擬似端末のマスター側にバイト列を書き込む
     fn write_shell_input(&mut self, bytes: &[u8]) -> Result<()> {
         if let Some(pty) = &mut self.shell.pty {
             pty.write_all(bytes)?;
@@ -256,6 +264,7 @@ impl App {
         Ok(())
     }
 
+    /// 終了したシェルプロセスを検出してリソースをクリアし、変更があればtrueを返す
     fn reap_exited_shell(&mut self) -> bool {
         let exited = match self.shell.child.as_mut() {
             Some(child) => match child.try_wait() {
@@ -284,6 +293,7 @@ impl App {
     }
 }
 
+/// レイアウトモードに応じたシェルの行数と列数を返す
 fn shell_size_for_layout(layout_mode: LayoutMode) -> (u16, u16) {
     let (columns, rows) = terminal::size().unwrap_or((120, 40));
     let content_rows = rows.saturating_sub(1).max(1);
@@ -295,3 +305,4 @@ fn shell_size_for_layout(layout_mode: LayoutMode) -> (u16, u16) {
     };
     (content_rows, content_cols)
 }
+*/

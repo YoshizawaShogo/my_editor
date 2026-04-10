@@ -1,3 +1,4 @@
+/*
 #[derive(Clone, Copy)]
 pub enum ReplayableAction {
     GitHunk { forward: bool },
@@ -29,3 +30,4 @@ pub enum FindKind {
     TillForward,
     TillBackward,
 }
+*/

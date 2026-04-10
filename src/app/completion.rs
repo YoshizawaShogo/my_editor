@@ -1,3 +1,4 @@
+/*
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -14,6 +15,7 @@ pub struct CompletionItem {
     pub text_edit: Option<TextEdit>,
 }
 
+#[derive(Default)]
 pub struct CompletionState {
     pub active: bool,
     pub query_start: usize,
@@ -26,35 +28,15 @@ pub struct CompletionState {
     pub path: Option<PathBuf>,
 }
 
-impl Default for CompletionState {
-    fn default() -> Self {
-        Self {
-            active: false,
-            query_start: 0,
-            query: String::new(),
-            items: Vec::new(),
-            serial: 0,
-            last_requested_serial: 0,
-            pending_request_serial: None,
-            last_edit_at: None,
-            path: None,
-        }
-    }
-}
-
 impl CompletionState {
+    /// シリアル番号を進めて補完状態をデフォルトにリセットする
     pub fn invalidate(&mut self) {
-        self.active = false;
-        self.items.clear();
-        self.pending_request_serial = None;
-        self.last_edit_at = None;
-        self.query.clear();
-        self.query_start = 0;
-        self.path = None;
-        self.serial = self.serial.saturating_add(1);
+        let next_serial = self.serial.saturating_add(1);
+        *self = Self { serial: next_serial, ..Default::default() };
     }
 }
 
+/// カーソル直前の識別子部分を開始位置と文字列で返す
 pub fn completion_prefix(line: &str, cursor_column: usize) -> (usize, String) {
     let chars: Vec<char> = line.chars().collect();
     let cursor = cursor_column.min(chars.len());
@@ -66,6 +48,7 @@ pub fn completion_prefix(line: &str, cursor_column: usize) -> (usize, String) {
     (start, prefix)
 }
 
+/// カーソル直前が`.`または`::`で空クエリ補完をトリガするかを返す
 pub fn has_empty_completion_trigger(line: &str, cursor_column: usize) -> bool {
     let chars: Vec<char> = line.chars().collect();
     let cursor = cursor_column.min(chars.len());
@@ -80,6 +63,7 @@ pub fn has_empty_completion_trigger(line: &str, cursor_column: usize) -> bool {
     cursor >= 2 && chars[cursor - 2] == ':' && chars[cursor - 1] == ':'
 }
 
+/// ドキュメント全文からprefixに前方一致する識別子をフォールバック補完として収集する
 pub fn collect_fallback_items(text: &str, prefix: &str, max_items: usize) -> Vec<CompletionItem> {
     if prefix.is_empty() {
         return Vec::new();
@@ -106,6 +90,7 @@ pub fn collect_fallback_items(text: &str, prefix: &str, max_items: usize) -> Vec
     items
 }
 
+/// クエリに対してfuzzyスコアリングし上位max_items件の補完候補を返す
 pub fn rank_completion_items(
     items: Vec<CompletionItem>,
     query: &str,
@@ -151,6 +136,7 @@ pub fn rank_completion_items(
         .collect()
 }
 
+/// 挿入テキストを適用した後のLSP終端位置を計算する
 pub fn text_end_position(start: Position, inserted_text: &str) -> Position {
     let mut line = start.line;
     let mut column = start.character;
@@ -175,6 +161,7 @@ pub fn text_end_position(start: Position, inserted_text: &str) -> Position {
     }
 }
 
+/// prefixで始まる未登録の単語を補完リストに追加する
 fn push_fallback_word(
     items: &mut Vec<CompletionItem>,
     seen: &mut HashSet<String>,
@@ -200,6 +187,7 @@ fn push_fallback_word(
     });
 }
 
+/// 補完対象の識別子を構成する文字かどうかを返す
 fn is_completion_word_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
@@ -284,3 +272,4 @@ mod tests {
         assert_eq!(labels, vec!["alloc", "collections"]);
     }
 }
+*/

@@ -1,3 +1,4 @@
+/*
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 
 use crate::open_candidate::OpenCandidate;
@@ -65,3 +66,4 @@ fn base_candidate_score(candidate: &OpenCandidate) -> i64 {
         OpenCandidate::ProjectFile(_) => 0,
     }
 }
+*/

@@ -1,3 +1,4 @@
+/*
 use std::{fs, path::Path};
 
 use lsp_types::{Position, TextEdit};
@@ -35,6 +36,7 @@ pub struct DocumentRenderLine {
 }
 
 impl Document {
+    /// ファイルサイズに応じて EditableDocument または LargeFileDocument を開く
     pub fn open(path: &Path) -> Result<Self> {
         let metadata = fs::metadata(path)?;
         let file_size_bytes = metadata.len();
@@ -49,61 +51,31 @@ impl Document {
         Ok(Self::Editable(editable::EditableDocument::open(path)?))
     }
 
+    /// ビューポートの最初のページをレンダリングデータに変換して返す
     pub fn render_first_page(
         &self,
         viewport_row: usize,
         page_height: usize,
         page_width: usize,
     ) -> Result<DocumentRender> {
-        let content_height = page_height;
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => {
-                let page = document.read_page(viewport_row, content_height, content_width)?;
-                let lines = page
-                    .rows
-                    .into_iter()
-                    .map(|row| {
-                        build_render_line(
-                            document.diagnostic_marker(row.line_number),
-                            row.line_number,
-                            document.git_gutter_marker(row.line_number),
-                            row.text,
-                            row.syntax_spans,
-                        )
-                    })
-                    .collect();
-                let status = build_status(page_width, "EDITOR");
-                Ok(DocumentRender { lines, status })
+                let page = document.read_page(viewport_row, page_height, content_width)?;
+                Ok(render_editable_page(document, page, page_width))
             }
             Self::LargeFile(document) => {
-                let page = document.read_page(viewport_row, content_height, content_width)?;
-                let lines = page
-                    .rows
-                    .into_iter()
-                    .map(|row| {
-                        build_render_line(None, row.line_number, None, row.text, Vec::new())
-                    })
-                    .collect();
-                let status = if page.next_byte_offset >= document.file_size_bytes {
-                    "VIEWER END"
-                } else {
-                    "VIEWER"
-                };
-                let status = build_status(page_width, status);
-                Ok(DocumentRender { lines, status })
+                let page = document.read_page(viewport_row, page_height, content_width)?;
+                Ok(render_large_file_page(document, page, page_width))
             }
             Self::Scratch(document) => Ok(document.render_first_page(viewport_row, page_height)),
         }
     }
 
+    /// 総表示行数を返す（LargeFile は行数不明のため None）
     pub fn total_rows(&self, page_width: usize) -> Option<usize> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => Some(document.total_rows(content_width)),
@@ -126,10 +98,9 @@ impl Document {
         }
     }
 
+    /// ドキュメント末尾にジャンプし、表示開始行を返す（Editable は行ベース管理のため None）
     pub fn jump_to_bottom(&mut self, page_height: usize, page_width: usize) -> Result<Option<usize>> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(_) => Ok(None),
@@ -181,9 +152,7 @@ impl Document {
         page_width: usize,
         ch: char,
     ) -> Option<(usize, usize)> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => Some(document.insert_char(
@@ -203,9 +172,7 @@ impl Document {
         display_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => Some(document.insert_newline(
@@ -224,9 +191,7 @@ impl Document {
         display_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => document.backspace(
@@ -245,9 +210,7 @@ impl Document {
         display_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => Some(document.insert_tab(
@@ -266,9 +229,7 @@ impl Document {
         display_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => document.delete_forward(
@@ -282,9 +243,7 @@ impl Document {
     }
 
     pub fn next_git_marker_row(&self, current_row: usize, page_width: usize) -> Option<usize> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => document.next_git_marker_row(current_row, content_width.max(1)),
@@ -294,9 +253,7 @@ impl Document {
     }
 
     pub fn previous_git_marker_row(&self, current_row: usize, page_width: usize) -> Option<usize> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => {
@@ -313,9 +270,7 @@ impl Document {
         page_width: usize,
         error_only: bool,
     ) -> Option<usize> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => {
@@ -332,9 +287,7 @@ impl Document {
         page_width: usize,
         error_only: bool,
     ) -> Option<usize> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => {
@@ -372,9 +325,7 @@ impl Document {
     }
 
     pub fn display_line_width(&self, cursor_row: usize, page_width: usize) -> Result<usize> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => Ok(document.display_line_width(cursor_row, content_width.max(1))),
@@ -391,9 +342,7 @@ impl Document {
     }
 
     pub fn display_line_text(&self, cursor_row: usize, page_width: usize) -> Result<String> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => {
@@ -412,9 +361,7 @@ impl Document {
     }
 
     pub fn jump_row_for_line_number(&self, line_number: usize, page_width: usize) -> Option<usize> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => {
@@ -430,9 +377,7 @@ impl Document {
     }
 
     pub fn first_match_position(&self, query: &str, page_width: usize) -> Option<(usize, usize)> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => document.first_match_position(query, content_width.max(1)),
@@ -448,9 +393,7 @@ impl Document {
         start_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => document.next_match_position(
@@ -471,9 +414,7 @@ impl Document {
         start_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => document.previous_match_position(
@@ -495,9 +436,7 @@ impl Document {
         end_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => document.remove_display_range(
@@ -513,9 +452,7 @@ impl Document {
     }
 
     pub fn open_below(&mut self, display_row: usize, page_width: usize) -> Option<(usize, usize)> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => Some(document.open_below(display_row, content_width.max(1))),
@@ -525,9 +462,7 @@ impl Document {
     }
 
     pub fn open_above(&mut self, display_row: usize, page_width: usize) -> Option<(usize, usize)> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => Some(document.open_above(display_row, content_width.max(1))),
@@ -537,9 +472,7 @@ impl Document {
     }
 
     pub fn current_line_text(&self, display_row: usize, page_width: usize) -> Option<String> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => {
@@ -556,9 +489,7 @@ impl Document {
         display_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => document.matching_bracket_position(
@@ -576,9 +507,7 @@ impl Document {
         display_row: usize,
         page_width: usize,
     ) -> Option<(String, (usize, usize))> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => {
@@ -594,9 +523,7 @@ impl Document {
         display_row: usize,
         page_width: usize,
     ) -> Option<(String, (usize, usize))> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => {
@@ -623,9 +550,7 @@ impl Document {
         display_row: usize,
         page_width: usize,
     ) -> Vec<DiagnosticEntry> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => {
@@ -655,9 +580,7 @@ impl Document {
         display_column: usize,
         page_width: usize,
     ) -> Option<Position> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => Some(document.lsp_position_for_display_position(
@@ -674,9 +597,7 @@ impl Document {
         position: Position,
         page_width: usize,
     ) -> Option<(usize, usize)> {
-        let content_width = page_width.saturating_sub(
-            DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1,
-        );
+        let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(document) => document.display_position_for_lsp_position(
@@ -706,11 +627,61 @@ impl Document {
     }
 }
 
+/// EditablePage のページデータを DocumentRender に変換する
+fn render_editable_page(
+    document: &editable::EditableDocument,
+    page: editable::EditablePage,
+    page_width: usize,
+) -> DocumentRender {
+    let lines = page
+        .rows
+        .into_iter()
+        .map(|row| {
+            build_render_line(
+                document.diagnostic_marker(row.line_number),
+                row.line_number,
+                document.git_gutter_marker(row.line_number),
+                row.text,
+                row.syntax_spans,
+            )
+        })
+        .collect();
+    let status = build_status(page_width, "EDITOR");
+    DocumentRender { lines, status }
+}
+
+/// LargeFilePage のページデータを DocumentRender に変換する
+fn render_large_file_page(
+    document: &large_file::LargeFileDocument,
+    page: large_file::LargeFilePage,
+    page_width: usize,
+) -> DocumentRender {
+    let lines = page
+        .rows
+        .into_iter()
+        .map(|row| build_render_line(None, row.line_number, None, row.text, Vec::new()))
+        .collect();
+    let label = if page.next_byte_offset >= document.file_size_bytes {
+        "VIEWER END"
+    } else {
+        "VIEWER"
+    };
+    let status = build_status(page_width, label);
+    DocumentRender { lines, status }
+}
+
+/// ページ幅からガター等を除いたコンテンツ幅を計算する
+fn content_width_for_page(page_width: usize) -> usize {
+    page_width.saturating_sub(DIAGNOSTIC_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + GUTTER_WIDTH + 1)
+}
+
+/// ラベルをダッシュで埋めてステータスバー文字列を構築する
 fn build_status(page_width: usize, label: &str) -> String {
     let width = page_width.max(label.len());
     format!("{label}{}", "-".repeat(width.saturating_sub(label.len())))
 }
 
+/// 行データをレンダリング用の DocumentRenderLine に変換する
 fn build_render_line(
     diagnostic_marker: Option<DiagnosticSeverity>,
     line_number: usize,
@@ -730,3 +701,4 @@ fn build_render_line(
         syntax_spans,
     }
 }
+*/

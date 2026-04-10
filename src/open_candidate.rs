@@ -1,3 +1,4 @@
+/*
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -119,3 +120,4 @@ fn git_command_lines(git_root: &Path, args: &[&str]) -> Result<Vec<String>> {
         .map(ToOwned::to_owned)
         .collect())
 }
+*/

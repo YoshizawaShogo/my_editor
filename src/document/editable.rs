@@ -1,3 +1,4 @@
+/*
 use std::{
     collections::HashMap,
     fs::File,
@@ -1155,3 +1156,4 @@ fn parse_diff_range(range: &str) -> Option<(usize, usize)> {
 
     Some((start.parse().ok()?, count.parse().ok()?))
 }
+*/

@@ -1,3 +1,4 @@
+/*
 use std::sync::{Arc, atomic::AtomicBool};
 
 use crossterm::{
@@ -18,6 +19,7 @@ pub(super) struct TerminalSession {
 }
 
 impl TerminalSession {
+    /// rawモードとオルタナティブスクリーンを有効化してターミナルセッションを開始する
     pub(super) fn enter() -> Result<Self> {
         let mut stdout = std::io::stdout();
         terminal::enable_raw_mode()?;
@@ -37,10 +39,12 @@ impl TerminalSession {
         })
     }
 
+    /// 内部のratatuiターミナルへの可変参照を返す
     pub(super) fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<std::io::Stdout>> {
         &mut self.terminal
     }
 
+    /// rawモードとオルタナティブスクリーンを無効化してターミナルセッションを終了する
     pub(super) fn leave(&mut self) -> Result<()> {
         if !self.active {
             return Ok(());
@@ -66,6 +70,7 @@ struct SuspendSignalGuard {
 }
 
 impl SuspendSignalGuard {
+    /// SIGTSTPシグナルを無視するハンドラを登録して返す
     fn enter() -> Self {
         #[cfg(unix)]
         {
@@ -106,3 +111,4 @@ impl Drop for TerminalSession {
         }
     }
 }
+*/

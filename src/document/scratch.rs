@@ -1,3 +1,4 @@
+/*
 use std::path::PathBuf;
 
 use crate::document::{DocumentRender, DocumentRenderLine};
@@ -99,3 +100,4 @@ impl ScratchDocument {
             .and_then(|row| row.target.clone())
     }
 }
+*/

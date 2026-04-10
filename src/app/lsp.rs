@@ -1,3 +1,4 @@
+/*
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -50,11 +51,13 @@ pub enum LspClientState {
     Failed(String),
 }
 
+#[derive(Default)]
 pub struct HoverPopupState {
     pub active: bool,
     pub lines: Vec<String>,
 }
 
+#[derive(Default)]
 pub struct RenameInputState {
     pub active: bool,
     pub value: String,
@@ -68,6 +71,7 @@ pub enum GotoKind {
 }
 
 impl GotoKind {
+    /// GotoKindに対応するLSP操作のタイトル文字列を返す
     pub fn title(self) -> &'static str {
         match self {
             Self::Definition => "[definition]",
@@ -211,6 +215,7 @@ fn append_tmp_log(_message: impl AsRef<str>) {
 }
 
 impl RustLspClient {
+    /// rust-analyzerを別スレッドで起動してLSPクライアントを初期化する
     pub fn start(root_path: &Path) -> Result<Self> {
         let (tx, rx_commands) = unbounded_channel();
         let (tx_events, rx) = mpsc::channel();
@@ -251,16 +256,19 @@ impl RustLspClient {
         })
     }
 
+    /// 受信チャンネルから届いたイベントをpending_eventsバッファに移す
     pub fn poll(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             self.pending_events.push(event);
         }
     }
 
+    /// pending_eventsを全て取り出してクリアする
     pub fn take_events(&mut self) -> Vec<LspEvent> {
         std::mem::take(&mut self.pending_events)
     }
 
+    /// 未登録のドキュメントをLSPにオープン通知して登録する
     pub fn ensure_open(&mut self, path: &Path, version: i32, text: &str) -> Result<()> {
         if self.opened_documents.contains(path) {
             return Ok(());
@@ -275,6 +283,7 @@ impl RustLspClient {
         Ok(())
     }
 
+    /// ドキュメントの保存をLSPに通知する
     pub fn did_save(&mut self, path: &Path, text: &str) -> Result<()> {
         self.send(LspCommand::DidSave {
             path: path.to_path_buf(),
@@ -282,6 +291,7 @@ impl RustLspClient {
         })
     }
 
+    /// ドキュメントの変更内容をLSPに通知する
     pub fn did_change(&mut self, path: &Path, version: i32, text: &str) -> Result<()> {
         self.send(LspCommand::DidChange {
             path: path.to_path_buf(),
@@ -290,6 +300,7 @@ impl RustLspClient {
         })
     }
 
+    /// ドキュメントのクローズをLSPに通知して登録を解除する
     pub fn did_close(&mut self, path: &Path) -> Result<()> {
         if !self.opened_documents.remove(path) {
             return Ok(());
@@ -300,12 +311,14 @@ impl RustLspClient {
         })
     }
 
+    /// セマンティックトークンをLSPに要求する
     pub fn request_semantic_tokens(&mut self, path: &Path) -> Result<()> {
         self.send(LspCommand::SemanticTokens {
             path: path.to_path_buf(),
         })
     }
 
+    /// ジャンプ種別とカーソル位置をLSPに送信する
     pub fn goto(&mut self, kind: GotoKind, path: &Path, position: Position) -> Result<()> {
         self.send(LspCommand::Goto {
             kind,
@@ -314,6 +327,7 @@ impl RustLspClient {
         })
     }
 
+    /// カーソル位置のシンボル参照一覧をLSPに要求する
     pub fn references(&mut self, path: &Path, position: Position) -> Result<()> {
         self.send(LspCommand::References {
             path: path.to_path_buf(),
@@ -321,6 +335,7 @@ impl RustLspClient {
         })
     }
 
+    /// カーソル位置のホバー情報をLSPに要求する
     pub fn hover(&mut self, path: &Path, position: Position) -> Result<()> {
         self.send(LspCommand::Hover {
             path: path.to_path_buf(),
@@ -328,6 +343,7 @@ impl RustLspClient {
         })
     }
 
+    /// カーソル位置のシンボルを新しい名前にリネームするようLSPに要求する
     pub fn rename(&mut self, path: &Path, position: Position, new_name: String) -> Result<()> {
         self.send(LspCommand::Rename {
             path: path.to_path_buf(),
@@ -336,6 +352,7 @@ impl RustLspClient {
         })
     }
 
+    /// カーソル位置のシンタックス選択範囲をLSPに要求する
     pub fn selection_range(
         &mut self,
         path: &Path,
@@ -349,6 +366,7 @@ impl RustLspClient {
         })
     }
 
+    /// ワークスペース全体の診断をLSPに要求する
     pub fn workspace_diagnostics(&mut self, error_only: bool) -> Result<()> {
         if !self.workspace_diagnostics_supported {
             return Err(AppError::CommandFailed(
@@ -358,6 +376,7 @@ impl RustLspClient {
         self.send(LspCommand::WorkspaceDiagnostics { error_only })
     }
 
+    /// カーソル位置の補完候補をLSPに要求する
     pub fn completion(&mut self, path: &Path, position: Position, serial: u64) -> Result<()> {
         self.send(LspCommand::Completion {
             path: path.to_path_buf(),
@@ -366,10 +385,12 @@ impl RustLspClient {
         })
     }
 
+    /// ワークスペース診断のサポート有無を返す
     pub fn supports_workspace_diagnostics(&self) -> bool {
         self.workspace_diagnostics_supported
     }
 
+    /// コマンドをLSPワーカースレッドに送信する
     fn send(&self, command: LspCommand) -> Result<()> {
         self.tx
             .send(command)
@@ -377,6 +398,7 @@ impl RustLspClient {
     }
 }
 
+/// HoverContentsを行ごとの文字列リストに変換する
 pub fn hover_lines(hover: &Hover) -> Vec<String> {
     match &hover.contents {
         HoverContents::Scalar(marked) => marked_string_lines(marked),
@@ -385,6 +407,7 @@ pub fn hover_lines(hover: &Hover) -> Vec<String> {
     }
 }
 
+/// LSPの非同期コマンド/メッセージループをrust-analyzerの終了まで実行する
 async fn run_lsp_worker(
     root_path: PathBuf,
     mut rx_commands: UnboundedReceiver<LspCommand>,
@@ -446,6 +469,7 @@ async fn run_lsp_worker(
     Ok(())
 }
 
+/// rust-analyzerにInitializeリクエストを送信してサーバーケイパビリティを取得する
 async fn initialize_server(
     writer: &mut ChildStdin,
     reader: &mut BufReader<ChildStdout>,
@@ -606,6 +630,7 @@ async fn initialize_server(
     Ok((workspace_diagnostics_supported, semantic_token_legend))
 }
 
+/// LspCommandをLSPプロトコルメッセージに変換して送信する
 async fn handle_command(
     command: LspCommand,
     writer: &mut ChildStdin,
@@ -866,6 +891,7 @@ async fn handle_command(
     Ok(())
 }
 
+/// LSPから受け取ったメッセージを解析してイベントに変換する
 async fn process_message(
     message: Message,
     writer: &mut ChildStdin,
@@ -1027,10 +1053,12 @@ async fn process_message(
     Ok(())
 }
 
+/// イベントをメインスレッドに送信する
 fn send_event(tx_events: &Sender<LspEvent>, event: LspEvent) {
     let _ = tx_events.send(event);
 }
 
+/// セマンティックトークンリクエストを構築してpendingに登録し送信する
 async fn send_semantic_tokens_request(
     writer: &mut ChildStdin,
     next_request_id: &mut i32,
@@ -1065,6 +1093,7 @@ async fn send_semantic_tokens_request(
     .await
 }
 
+/// LSPリクエストメッセージを構築して送信する
 async fn send_request(
     writer: &mut ChildStdin,
     id: RequestId,
@@ -1082,6 +1111,7 @@ async fn send_request(
     .await
 }
 
+/// LSP通知メッセージを構築して送信する
 async fn send_notification(writer: &mut ChildStdin, method: &str, params: Value) -> Result<()> {
     send_message(
         writer,
@@ -1093,6 +1123,7 @@ async fn send_notification(writer: &mut ChildStdin, method: &str, params: Value)
     .await
 }
 
+/// LSP-RPC形式（Content-Lengthヘッダ付き）でメッセージをstdinに書き込む
 async fn send_message(writer: &mut ChildStdin, message: Message) -> Result<()> {
     let body =
         serde_json::to_vec(&message).map_err(|error| AppError::CommandFailed(error.to_string()))?;
@@ -1104,6 +1135,7 @@ async fn send_message(writer: &mut ChildStdin, message: Message) -> Result<()> {
     Ok(())
 }
 
+/// stdoutからLSP-RPCヘッダを読んでメッセージボディをデシリアライズする
 async fn read_message<R>(reader: &mut BufReader<R>) -> Result<Message>
 where
     R: AsyncRead + Unpin,
@@ -1131,12 +1163,14 @@ where
     serde_json::from_slice(&body).map_err(|error| AppError::CommandFailed(error.to_string()))
 }
 
+/// 次のリクエストIDを生成してカウンタをインクリメントする
 fn next_request_id_value(next_request_id: &mut i32) -> RequestId {
     let id = *next_request_id;
     *next_request_id += 1;
     id.into()
 }
 
+/// MarkedStringを行ごとの文字列リストに変換する
 fn marked_string_lines(marked: &lsp_types::MarkedString) -> Vec<String> {
     match marked {
         lsp_types::MarkedString::String(value) => value.lines().map(ToOwned::to_owned).collect(),
@@ -1146,6 +1180,7 @@ fn marked_string_lines(marked: &lsp_types::MarkedString) -> Vec<String> {
     }
 }
 
+/// LSPのgoto応答をLocation・LocationLink・単一どれでも受け付けて配列に変換する
 fn parse_locations_response(result: Option<Value>) -> Result<Vec<Location>> {
     let Some(value) = result else {
         return Ok(Vec::new());
@@ -1178,6 +1213,7 @@ fn parse_locations_response(result: Option<Value>) -> Result<Vec<Location>> {
     ))
 }
 
+/// LSPのselection_range応答をSelectionRange配列にデシリアライズする
 fn parse_selection_ranges_response(result: Option<Value>) -> Result<Vec<SelectionRange>> {
     let Some(value) = result else {
         return Ok(Vec::new());
@@ -1190,6 +1226,7 @@ fn parse_selection_ranges_response(result: Option<Value>) -> Result<Vec<Selectio
     serde_json::from_value(value).map_err(|error| AppError::CommandFailed(error.to_string()))
 }
 
+/// 入れ子のSelectionRangeを親方向にたどってフラットなRange配列に変換する
 fn flatten_selection_ranges(selections: Vec<SelectionRange>) -> Vec<lsp_types::Range> {
     let Some(first) = selections.into_iter().next() else {
         return Vec::new();
@@ -1204,6 +1241,7 @@ fn flatten_selection_ranges(selections: Vec<SelectionRange>) -> Vec<lsp_types::R
     ranges
 }
 
+/// LSPのワークスペース診断応答をWorkspaceDiagnosticItemのソート済みリストに変換する
 fn parse_workspace_diagnostics_response(
     result: Option<Value>,
     error_only: bool,
@@ -1261,6 +1299,7 @@ fn parse_workspace_diagnostics_response(
     Ok(items)
 }
 
+/// LSPの補完応答をラベルでソートしたCompletionItem配列に変換する
 fn parse_completion_response(result: Option<Value>) -> Result<Vec<CompletionItem>> {
     let Some(value) = result else {
         return Ok(Vec::new());
@@ -1284,6 +1323,7 @@ fn parse_completion_response(result: Option<Value>) -> Result<Vec<CompletionItem
     Ok(mapped)
 }
 
+/// lsp_types::CompletionItemをアプリ内部のCompletionItemに変換する
 fn map_completion_item(item: lsp_types::CompletionItem) -> CompletionItem {
     let label = item.label;
     let insert_text = item.insert_text.unwrap_or_else(|| label.clone());
@@ -1306,6 +1346,7 @@ fn map_completion_item(item: lsp_types::CompletionItem) -> CompletionItem {
     }
 }
 
+/// サーバーケイパビリティからワークスペース診断サポートの有無を返す
 fn supports_workspace_diagnostics(capabilities: &lsp_types::ServerCapabilities) -> bool {
     match &capabilities.diagnostic_provider {
         Some(lsp_types::DiagnosticServerCapabilities::Options(options)) => {
@@ -1318,6 +1359,7 @@ fn supports_workspace_diagnostics(capabilities: &lsp_types::ServerCapabilities) 
     }
 }
 
+/// サーバーケイパビリティからセマンティックトークンの型凡例を抽出する
 fn semantic_token_legend(capabilities: &lsp_types::ServerCapabilities) -> Vec<String> {
     match &capabilities.semantic_tokens_provider {
         Some(lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(options)) => {
@@ -1330,6 +1372,7 @@ fn semantic_token_legend(capabilities: &lsp_types::ServerCapabilities) -> Vec<St
     }
 }
 
+/// ファイルパスをLSP用のfile://URIに変換する
 pub fn path_to_uri(path: &Path) -> Result<Uri> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -1346,8 +1389,10 @@ pub fn path_to_uri(path: &Path) -> Result<Uri> {
         .map_err(|error| AppError::CommandFailed(format!("failed to convert path to uri: {error}")))
 }
 
+/// file://URIをファイルパスに変換する
 pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     let value = uri.as_str();
     let stripped = value.strip_prefix("file://")?;
     Some(PathBuf::from(stripped))
 }
+*/

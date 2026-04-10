@@ -1,3 +1,4 @@
+/*
 use std::time::Instant;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -87,6 +88,7 @@ enum NormalAction {
     YankCurrentLine,
 }
 
+/// KeyEventをノーマルモード用のNormalInput型に正規化する
 fn normalize_normal_input(key_event: KeyEvent) -> NormalInput {
     if key_event.modifiers.contains(KeyModifiers::CONTROL) {
         return match key_event.code {
@@ -111,6 +113,7 @@ fn normalize_normal_input(key_event: KeyEvent) -> NormalInput {
     }
 }
 
+/// 保留アクション状態と入力キーを状態機械でNormalDecisionに変換する
 fn transition_normal_input(
     state: Option<PendingNormalAction>,
     input: NormalInput,
@@ -254,6 +257,7 @@ fn transition_normal_input(
 }
 
 impl App {
+    /// crossterm Eventを受け取りキーイベントのみを処理する
     pub(super) fn handle_event(&mut self, event: Event) -> Result<bool> {
         match event {
             Event::Key(key_event) => self.handle_key_event(key_event),
@@ -262,6 +266,7 @@ impl App {
         }
     }
 
+    /// アクティブなUIとモードに応じてキーイベントを適切なハンドラに振り分ける
     fn handle_key_event(&mut self, key_event: KeyEvent) -> Result<bool> {
         if self.go_input.active {
             return self.handle_go_input_key(key_event);
@@ -295,12 +300,7 @@ impl App {
             return self.handle_picker_key(key_event);
         }
 
-        if self.focused_pane == super::FocusedPane::Right
-            && matches!(
-                self.layout_mode,
-                super::LayoutMode::TerminalSplit | super::LayoutMode::Single
-            )
-        {
+        if self.is_terminal_pane_focused() {
             return self.handle_shell_mode_key(key_event);
         }
 
@@ -311,6 +311,7 @@ impl App {
         }
     }
 
+    /// ノーマルモードのキー入力を状態機械で処理してアクションを実行する
     fn handle_normal_mode_key(&mut self, key_event: KeyEvent) -> Result<bool> {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
@@ -367,6 +368,7 @@ impl App {
         }
     }
 
+    /// NormalActionを対応するApp操作にディスパッチして実行する
     fn apply_normal_action(&mut self, action: NormalAction) -> Result<bool> {
         match action {
             NormalAction::OpenGoInput => self.open_go_input(),
@@ -553,6 +555,7 @@ impl App {
         Ok(false)
     }
 
+    /// 診断ポップアップ表示中のキー入力を処理する
     fn handle_diagnostic_popup_key(&mut self, key_event: KeyEvent) -> Result<bool> {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
@@ -589,6 +592,7 @@ impl App {
         }
     }
 
+    /// 行番号入力中のキー入力を処理する
     fn handle_go_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
@@ -639,6 +643,7 @@ impl App {
         }
     }
 
+    /// 検索入力中のキー入力を処理する
     fn handle_search_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
@@ -700,6 +705,7 @@ impl App {
         }
     }
 
+    /// 置換入力中のキー入力を処理する
     fn handle_replace_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
@@ -747,6 +753,7 @@ impl App {
         }
     }
 
+    /// インサートモードのキー入力を処理する
     fn handle_insert_mode_key(&mut self, key_event: KeyEvent) -> Result<bool> {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
@@ -886,6 +893,7 @@ impl App {
         }
     }
 
+    /// ピッカー表示中のキー入力を処理する
     fn handle_picker_key(&mut self, key_event: KeyEvent) -> Result<bool> {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
@@ -933,6 +941,7 @@ impl App {
         }
     }
 
+    /// ホバーポップアップ表示中のキー入力を処理する
     fn handle_hover_popup_key(&mut self, key_event: KeyEvent) -> Result<bool> {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
@@ -950,6 +959,7 @@ impl App {
         }
     }
 
+    /// 選択範囲入力中のキー入力を処理する
     fn handle_selection_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
@@ -982,6 +992,7 @@ impl App {
         }
     }
 
+    /// リネーム入力中のキー入力を処理する
     fn handle_rename_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
@@ -1025,3 +1036,4 @@ impl App {
         }
     }
 }
+*/

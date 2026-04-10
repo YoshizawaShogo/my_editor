@@ -1,3 +1,4 @@
+/*
 use std::{env, sync::OnceLock};
 
 const LARGE_FILE_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
@@ -32,3 +33,4 @@ pub fn shell_program() -> &'static str {
         .get_or_init(|| env::var("SHELL").unwrap_or_else(|_| DEFAULT_SHELL_PROGRAM.to_owned()))
         .as_str()
 }
+*/

@@ -1,3 +1,4 @@
+/*
 use ratatui::style::Color;
 
 pub struct AppColors;
@@ -39,3 +40,4 @@ impl AppColors {
     pub const SYNTAX_NAMESPACE: Color = Color::Rgb(138, 164, 196);
     pub const SYNTAX_PROPERTY: Color = Color::Rgb(118, 190, 172);
 }
+*/

@@ -1,3 +1,4 @@
+/*
 use std::collections::HashMap;
 
 use lsp_types::{SemanticToken, SemanticTokens};
@@ -8,6 +9,7 @@ use crate::{
     error::{AppError, Result},
 };
 
+/// LSPのセマンティックトークン応答を行番号キーのSyntaxTokenSpanマップにデコードする
 pub fn decode_semantic_tokens_response(
     result: Option<Value>,
     legend: &[String],
@@ -37,6 +39,7 @@ pub fn decode_semantic_tokens_response(
     Ok(decode_semantic_tokens_data(&semantic_tokens.data, legend))
 }
 
+/// デルタ形式のSemanticToken配列を行番号キーのSyntaxTokenSpanマップに変換する
 pub fn decode_semantic_tokens_data(
     data: &[SemanticToken],
     legend: &[String],
@@ -73,6 +76,7 @@ pub fn decode_semantic_tokens_data(
     by_line
 }
 
+/// 行トークンスパンをラップ済みピース区間にクリップして相対座標で返す
 pub fn slice_wrapped_syntax_spans(
     line_tokens: &[SyntaxTokenSpan],
     piece_start: usize,
@@ -96,6 +100,7 @@ pub fn slice_wrapped_syntax_spans(
         .collect()
 }
 
+/// LSPのトークン型名をSyntaxHighlightKindにマッピングする
 pub fn map_semantic_kind(kind: &str) -> Option<SyntaxHighlightKind> {
     Some(match kind {
         "keyword" | "selfKeyword" | "boolean" => SyntaxHighlightKind::Keyword,
@@ -222,3 +227,4 @@ mod tests {
         assert!(matches!(line1[1].kind, SyntaxHighlightKind::Variable));
     }
 }
+*/
