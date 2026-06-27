@@ -141,6 +141,7 @@ impl EditableDocument {
 
                 rows.push(EditableRow {
                     line_number: line_index + 1,
+                    show_line_number: row_in_line == 0,
                     text: piece,
                     syntax_spans: slice_wrapped_syntax_spans(
                         &line_tokens,
@@ -157,6 +158,7 @@ impl EditableDocument {
         if rows.is_empty() {
             rows.push(EditableRow {
                 line_number: 1,
+                show_line_number: true,
                 text: String::new(),
                 syntax_spans: Vec::new(),
             });
@@ -1040,6 +1042,7 @@ pub struct EditablePage {
 
 pub struct EditableRow {
     pub line_number: usize,
+    pub show_line_number: bool,
     pub text: String,
     pub syntax_spans: Vec<SyntaxTokenSpan>,
 }

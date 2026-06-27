@@ -23,7 +23,9 @@ impl AppColors {
     pub const EDITOR_PANE_FOCUSED: Color = EDITOR_PANE_FOCUSED;
     pub const SPLIT_DIVIDER: Color = SPLIT_DIVIDER;
     pub const NORMAL_MODE: Color = NORMAL_MODE;
+    #[allow(dead_code)]
     pub const INSERT_MODE: Color = INSERT_MODE;
+    #[allow(dead_code)]
     pub const SHELL_MODE: Color = SHELL_MODE;
     pub const SYNTAX_KEYWORD: Color = SYNTAX_KEYWORD;
     pub const SYNTAX_STRING: Color = SYNTAX_STRING;
@@ -59,7 +61,9 @@ pub const EDITOR_PANE: Color = Color::Rgb(9, 12, 18);
 pub const EDITOR_PANE_FOCUSED: Color = Color::Rgb(14, 20, 34);
 pub const SPLIT_DIVIDER: Color = Color::Rgb(34, 40, 54);
 pub const NORMAL_MODE: Color = Color::Rgb(128, 146, 169);
+#[allow(dead_code)]
 pub const INSERT_MODE: Color = Color::Rgb(152, 180, 150);
+#[allow(dead_code)]
 pub const SHELL_MODE: Color = Color::Rgb(170, 150, 188);
 pub const SYNTAX_KEYWORD: Color = Color::Rgb(196, 162, 120);
 pub const SYNTAX_STRING: Color = Color::Rgb(146, 186, 150);

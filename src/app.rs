@@ -80,12 +80,22 @@ pub struct App {
     pub lsp_document_cache: std::collections::HashMap<PathBuf, CachedLspDocumentState>,
     pub editor_rc: language::EditorRc,
     pub silent: bool,
+    pub wrap: bool,
     pub last_file_check: Instant,
     pub selection_anchor: Option<CursorState>,
     pub extra_cursors: Vec<CursorState>,
 }
 
-fn append_tmp_log(_message: impl AsRef<str>) {}
+fn append_tmp_log(message: impl AsRef<str>) {
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/my_editor_debug.log")
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{}", message.as_ref())
+        });
+}
 
 pub struct Workspace {
     pub documents: Vec<DocumentEntry>,
@@ -349,6 +359,7 @@ impl App {
             lsp_document_cache: std::collections::HashMap::new(),
             editor_rc: language::EditorRc::load(),
             silent: false,
+            wrap: true,
             last_file_check: Instant::now(),
             selection_anchor: None,
             extra_cursors: Vec::new(),
@@ -462,6 +473,9 @@ impl App {
 
     /// 現在のレイアウトとフォーカスに基づいてページ幅を返す
     fn current_page_width(&self) -> usize {
+        if !self.wrap {
+            return u16::MAX as usize;
+        }
         let Ok((terminal_width, _)) = terminal::size() else {
             return 80;
         };
@@ -616,7 +630,7 @@ impl App {
         let current_index = self.workspace.current_index;
         let version = self.workspace.documents[current_index].version;
 
-        self.show_lsp_sync_toast(&path, "loading");
+        self.show_lsp_sync_toast(&path, "sync");
         if let LspClientState::Ready(client) = &mut self.lsp {
             client.ensure_open(&path, version, &text)?;
             let _ = client.did_save(&path, &text);
@@ -693,6 +707,11 @@ impl App {
                             .document
                             .set_rust_diagnostics(diagnostics);
                     }
+                    append_tmp_log(format!(
+                        "[diag] path={} pending={:?}",
+                        path.display(),
+                        self.pending_semantic_tokens_path
+                    ));
                     if self
                         .pending_semantic_tokens_path
                         .as_ref()
@@ -701,6 +720,7 @@ impl App {
                         if let LspClientState::Ready(client) = &mut self.lsp {
                             let _ = client.request_semantic_tokens(&path);
                         }
+                        self.show_lsp_sync_toast(&path, "syntax");
                         self.pending_semantic_tokens_path = None;
                     }
                 }
@@ -776,6 +796,19 @@ impl App {
                     items,
                 } => {
                     self.handle_completion_result(path, serial, items);
+                }
+                LspEvent::SemanticTokensFailed { path } => {
+                    append_tmp_log(format!(
+                        "[app] semantic tokens failed path={}",
+                        path.display()
+                    ));
+                    if self
+                        .workspace
+                        .current_document_path()
+                        .is_some_and(|current| current == path)
+                    {
+                        self.clear_persistent_toast();
+                    }
                 }
                 LspEvent::Failed(message) => {
                     self.clear_persistent_toast();
@@ -894,8 +927,16 @@ impl App {
     /// セマンティックトークンリクエストを診断待機またはLSPへの即時送信としてスケジュールする
     fn schedule_semantic_tokens_request(&mut self, path: &std::path::Path) {
         if should_wait_for_diagnostics_before_semantic(path) {
+            append_tmp_log(format!(
+                "[schedule] waiting diag for path={}",
+                path.display()
+            ));
             self.pending_semantic_tokens_path = Some(path.to_path_buf());
         } else {
+            append_tmp_log(format!(
+                "[schedule] immediate semantic for path={}",
+                path.display()
+            ));
             self.pending_semantic_tokens_path = None;
             if let LspClientState::Ready(client) = &mut self.lsp {
                 let _ = client.request_semantic_tokens(path);
@@ -1197,7 +1238,7 @@ impl App {
                 self.insert_text_at(self.cursor.row, insertion_column, &yank_text);
             }
             YankBuffer::Linewise(line_text) => {
-                self.open_line_below_with_text(&line_text);
+                self.open_line_above_with_text(&line_text);
             }
         }
 
@@ -1268,6 +1309,7 @@ impl App {
     }
 
     /// 現在行の下に空行を開いてテキストを挿入する
+    #[allow(dead_code)]
     fn open_line_below_with_text(&mut self, text: &str) {
         let page_width = self.current_page_width();
         if let Some((row, column)) = self
@@ -1281,7 +1323,6 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
     /// 現在行の上に空行を開いてテキストを挿入する
     fn open_line_above_with_text(&mut self, text: &str) {
         let page_width = self.current_page_width();

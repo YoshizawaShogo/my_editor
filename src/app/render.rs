@@ -177,36 +177,17 @@ impl App {
         Ok(())
     }
 
-    fn footer_color(&self) -> ratatui::style::Color {
-        match self.effective_mode() {
-            Mode::Normal => AppColors::NORMAL_MODE,
-            Mode::Insert => AppColors::INSERT_MODE,
-            Mode::Shell => AppColors::SHELL_MODE,
-        }
-    }
-
-    fn effective_mode(&self) -> Mode {
-        if self.is_terminal_pane_focused() {
-            Mode::Shell
-        } else {
-            self.mode
-        }
-    }
-
     fn footer_line(&self) -> Line<'static> {
-        let mode = self.effective_mode().label();
         let file_name = self.active_pane_label();
         let status = self.active_pane_status();
-        let mode_bg = self.footer_color();
         let footer_bg = AppColors::PANEL;
+        let accent_bg = AppColors::NORMAL_MODE;
 
         Line::from(vec![
-            powerline_segment(mode.to_owned(), AppColors::BACKGROUND, mode_bg),
-            powerline_separator_left(mode_bg, footer_bg),
-            powerline_segment(file_name, AppColors::ACCENT, footer_bg),
-            powerline_separator_right(mode_bg),
+            powerline_segment(file_name, AppColors::BACKGROUND, accent_bg),
+            powerline_separator_left(accent_bg, footer_bg),
             powerline_segment(status.to_owned(), AppColors::MUTED, footer_bg),
-            powerline_separator_right(mode_bg),
+            powerline_separator_right(accent_bg),
         ])
     }
 
@@ -1186,7 +1167,11 @@ fn format_render_line(
         ),
         Span::raw(" "),
         Span::styled(
-            format!("{:>6}", line.line_number),
+            if line.line_number == 0 {
+                "      ".to_owned()
+            } else {
+                format!("{:>6}", line.line_number)
+            },
             Style::default().fg(if current_row {
                 AppColors::CURRENT_LINE_NUMBER
             } else {

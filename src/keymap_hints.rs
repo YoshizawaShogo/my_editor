@@ -73,6 +73,14 @@ pub static TOP_LEVEL_HINTS: &[KeyHint] = &[
         description: "リネーム",
     },
     KeyHint {
+        key: "F4",
+        description: "終了",
+    },
+    KeyHint {
+        key: "F8",
+        description: "折り返しトグル",
+    },
+    KeyHint {
         key: "Alt+h",
         description: "このヒントを隠す",
     },

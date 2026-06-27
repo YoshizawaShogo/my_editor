@@ -91,6 +91,9 @@ pub enum LspEvent {
         path: PathBuf,
         tokens: HashMap<usize, Vec<SyntaxTokenSpan>>,
     },
+    SemanticTokensFailed {
+        path: PathBuf,
+    },
     WorkspaceDiagnosticsResult {
         error_only: bool,
         items: Vec<WorkspaceDiagnosticItem>,
@@ -926,6 +929,7 @@ async fn process_message(
                             error.code,
                             error.message
                         ));
+                        send_event(tx_events, LspEvent::SemanticTokensFailed { path });
                         return Ok(());
                     }
                     PendingRequest::Completion { path, serial } => {

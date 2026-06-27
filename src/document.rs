@@ -160,6 +160,10 @@ impl Document {
         }
     }
 
+    pub fn is_in_undo_group(&self) -> bool {
+        matches!(self, Self::Editable(doc) if doc.undo_group_active)
+    }
+
     pub fn insert_char(
         &mut self,
         display_row: usize,
@@ -682,13 +686,17 @@ fn render_editable_page(
         .rows
         .into_iter()
         .map(|row| {
-            build_render_line(
-                document.diagnostic_marker(row.line_number),
-                row.line_number,
-                document.git_gutter_marker(row.line_number),
-                row.text,
-                row.syntax_spans,
-            )
+            if row.show_line_number {
+                build_render_line(
+                    document.diagnostic_marker(row.line_number),
+                    row.line_number,
+                    document.git_gutter_marker(row.line_number),
+                    row.text,
+                    row.syntax_spans,
+                )
+            } else {
+                build_render_line(None, 0, None, row.text, row.syntax_spans)
+            }
         })
         .collect();
     let status = build_status(page_width, "EDITOR");

@@ -60,6 +60,18 @@ impl App {
         let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key_event.modifiers.contains(KeyModifiers::ALT);
 
+        // Undo group management: group consecutive plain character inputs into one undo step
+        if self.workspace.has_documents() {
+            let is_plain_char = !ctrl && !alt && matches!(key_event.code, KeyCode::Char(_));
+            if is_plain_char {
+                if !self.workspace.current_document().is_in_undo_group() {
+                    self.workspace.current_document_mut().begin_undo_group();
+                }
+            } else {
+                self.workspace.current_document_mut().end_undo_group();
+            }
+        }
+
         // Handle c-j prefix state
         if let Some(PendingNormalAction::JumpPrefix) = self.pending_normal_action {
             self.pending_normal_action = None;
@@ -339,6 +351,13 @@ impl App {
                 if self.workspace.has_documents() {
                     self.open_rename_input();
                 }
+                Ok(false)
+            }
+
+            KeyCode::F(4) => Ok(true), // Quit
+
+            KeyCode::F(8) => {
+                self.wrap = !self.wrap;
                 Ok(false)
             }
 
