@@ -78,8 +78,11 @@ pub struct App {
     pub workspace_diagnostics_cache: WorkspaceDiagnosticsCache,
     pub pending_semantic_tokens_path: Option<PathBuf>,
     pub lsp_document_cache: std::collections::HashMap<PathBuf, CachedLspDocumentState>,
-    pub language_config: Vec<language::LanguageEntry>,
+    pub editor_rc: language::EditorRc,
     pub silent: bool,
+    pub last_file_check: Instant,
+    pub selection_anchor: Option<CursorState>,
+    pub extra_cursors: Vec<CursorState>,
 }
 
 fn append_tmp_log(_message: impl AsRef<str>) {}
@@ -115,7 +118,7 @@ pub struct ShellState {
     output_rx: Option<Receiver<Vec<u8>>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct CursorState {
     pub row: usize,
     pub column: usize,
@@ -307,7 +310,7 @@ impl App {
         };
 
         let mut app = Self {
-            mode: Mode::Normal,
+            mode: Mode::Insert,
             workspace,
             picker: PickerState::default(),
             shell: ShellState {
@@ -344,8 +347,11 @@ impl App {
             workspace_diagnostics_cache: WorkspaceDiagnosticsCache::default(),
             pending_semantic_tokens_path: None,
             lsp_document_cache: std::collections::HashMap::new(),
-            language_config: language::load_language_config(),
+            editor_rc: language::EditorRc::load(),
             silent: false,
+            last_file_check: Instant::now(),
+            selection_anchor: None,
+            extra_cursors: Vec::new(),
         };
         let _ = app.ensure_lsp_for_current_document();
         app.refresh_picker_candidates()?;
@@ -373,6 +379,7 @@ impl App {
             changed |= self.poll_lsp();
             changed |= self.poll_shell_output();
             changed |= self.poll_completion();
+            changed |= self.poll_external_file_changes();
             needs_redraw |= changed;
 
             if needs_redraw {
@@ -530,13 +537,8 @@ impl App {
     }
 
     /// 言語設定からパスに対応する LSP コマンド情報を返す
-    fn lsp_command_for_path(
-        &self,
-        path: &Path,
-    ) -> Option<(String, Vec<String>, Option<serde_json::Value>)> {
-        let entry = language::detect_language(path, &self.language_config)?;
-        let cmd = entry.lsp_command.clone()?;
-        Some((cmd, entry.lsp_args.clone(), entry.lsp_init_options.clone()))
+    fn lsp_command_for_path(&self, path: &Path) -> Option<(String, Vec<String>)> {
+        self.editor_rc.lsp_for_path(path)
     }
 
     /// 現在のドキュメントに対してLSPが動作中か確認し、必要なら起動してドキュメントを登録する
@@ -557,24 +559,26 @@ impl App {
             return Ok(());
         }
 
-        if matches!(self.lsp, LspClientState::NotAvailable) {
+        if matches!(
+            self.lsp,
+            LspClientState::NotAvailable | LspClientState::Starting(_)
+        ) {
             return Ok(());
         }
 
         if matches!(self.lsp, LspClientState::Inactive) {
             let lsp_info = self.lsp_command_for_path(&path);
             self.lsp = match lsp_info {
-                Some((cmd, args, opts)) => {
-                    match LspClient::start(Path::new("."), cmd, args, opts) {
-                        Ok(client) => LspClientState::Ready(client),
-                        Err(error) => {
-                            self.show_toast(format!("LSP failed: {error:?}"));
-                            LspClientState::Failed(())
-                        }
+                Some((cmd, args)) => match LspClient::start(Path::new("."), cmd, args) {
+                    Ok(client) => LspClientState::Starting(client),
+                    Err(error) => {
+                        self.show_toast(format!("LSP failed: {error:?}"));
+                        LspClientState::Failed(())
                     }
-                }
+                },
                 None => LspClientState::NotAvailable,
             };
+            return Ok(());
         }
 
         self.ensure_current_document_open_for_lsp()
@@ -626,6 +630,33 @@ impl App {
 
     /// LSPイベントを処理してドキュメントに反映し、変更があればtrueを返す
     fn poll_lsp(&mut self) -> bool {
+        // Starting 状態のクライアントもポーリングし、Initialized が届いたら Ready へ遷移する
+        if let LspClientState::Starting(client) = &mut self.lsp {
+            client.poll();
+            let initialized = client
+                .pending_events
+                .iter()
+                .position(|e| matches!(e, LspEvent::Initialized { .. }));
+            if let Some(idx) = initialized {
+                let event = client.pending_events.remove(idx);
+                if let (
+                    LspEvent::Initialized {
+                        workspace_diagnostics_supported,
+                    },
+                    LspClientState::Starting(mut client),
+                ) = (
+                    event,
+                    std::mem::replace(&mut self.lsp, LspClientState::Inactive),
+                ) {
+                    client.workspace_diagnostics_supported = workspace_diagnostics_supported;
+                    self.lsp = LspClientState::Ready(client);
+                    let _ = self.ensure_lsp_for_current_document();
+                }
+                return true;
+            }
+            return false;
+        }
+
         let events = match &mut self.lsp {
             LspClientState::Ready(client) => {
                 client.poll();
@@ -751,6 +782,8 @@ impl App {
                     self.last_save_feedback = Some(message);
                     self.lsp = LspClientState::Failed(());
                 }
+                // Starting 状態で処理されなかった場合のフォールバック
+                LspEvent::Initialized { .. } => {}
             }
         }
         true
@@ -765,6 +798,72 @@ impl App {
             summary.warnings += document_summary.warnings;
         }
         summary
+    }
+
+    /// 外部変更を検出し、未変更なら自動リロード、変更済みなら通知する
+    fn poll_external_file_changes(&mut self) -> bool {
+        if self.last_file_check.elapsed() < Duration::from_secs(1) {
+            return false;
+        }
+        self.last_file_check = Instant::now();
+
+        let paths: Vec<PathBuf> = self
+            .workspace
+            .documents
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
+
+        let mut changed = false;
+        for path in paths {
+            let Some(current_mtime) = path_modified_time(&path) else {
+                continue;
+            };
+            let Some(doc) = self
+                .workspace
+                .documents
+                .iter_mut()
+                .find(|e| e.path == path)
+                .and_then(|e| e.document.as_editable_mut())
+            else {
+                continue;
+            };
+            let Some(disk_mtime) = doc.disk_mtime else {
+                continue;
+            };
+            if current_mtime == disk_mtime {
+                continue;
+            }
+
+            if !doc.is_dirty {
+                if doc.reload().is_ok() {
+                    let name = display_name(&path);
+                    self.show_toast(format!("{name}: 外部変更を検出、再読み込みしました"));
+                    changed = true;
+                    // LSP へ変更を通知
+                    if let Some(entry) =
+                        self.workspace.documents.iter_mut().find(|e| e.path == path)
+                    {
+                        entry.version += 1;
+                        let version = entry.version;
+                        if let (Some(text), LspClientState::Ready(client)) =
+                            (entry.document.full_text(), &mut self.lsp)
+                        {
+                            let _ = client.did_change(&path, version, &text);
+                        }
+                    }
+                }
+            } else {
+                // 未保存の変更がある場合はディスク mtime だけ更新して繰り返し通知を抑制
+                doc.disk_mtime = Some(current_mtime);
+                let name = display_name(&path);
+                self.show_toast(format!(
+                    "{name}: 外部変更を検出（未保存の変更があるため再読み込みしていません）"
+                ));
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// 現在のドキュメントの保存をLSPに通知してセマンティックトークンをスケジュールする
@@ -886,6 +985,7 @@ impl App {
         Ok(())
     }
 
+    #[allow(dead_code)]
     /// 検索モーションとオペレータを組み合わせて範囲を削除またはチェンジする
     fn run_operator_find(
         &mut self,
@@ -1105,6 +1205,7 @@ impl App {
         Ok(())
     }
 
+    #[allow(dead_code)]
     /// ヤンクバッファの内容をカーソルの前にペーストする
     fn paste_before_cursor(&mut self) -> Result<()> {
         self.workspace.current_document_mut().begin_undo_group();
@@ -1180,6 +1281,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     /// 現在行の上に空行を開いてテキストを挿入する
     fn open_line_above_with_text(&mut self, text: &str) {
         let page_width = self.current_page_width();
@@ -1194,6 +1296,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     /// 現在行をlinewiseヤンクバッファにコピーする
     fn yank_current_line(&mut self) -> Result<()> {
         let page_width = self.current_page_width();
@@ -1227,6 +1330,7 @@ impl App {
         Ok(())
     }
 
+    #[allow(dead_code)]
     /// 現在行をクリアしてヤンクバッファに保存しインサートモードに入る
     fn change_current_line(&mut self) -> Result<()> {
         let page_width = self.current_page_width();
@@ -1497,6 +1601,7 @@ impl App {
         self.open_scratch_document(title, rows);
     }
 
+    #[allow(dead_code)]
     /// カーソル行のスクラッチターゲットを開いてその位置にジャンプする
     fn open_scratch_target_under_cursor(&mut self) -> Result<()> {
         let Some(target) = self
@@ -1711,6 +1816,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     /// LSPにシンタックス選択範囲を要求してオペレータを紐付ける
     fn request_selection_range_operator(&mut self, operator: PendingOperator) -> Result<()> {
         self.ensure_lsp_for_current_document()?;
@@ -1995,6 +2101,7 @@ impl App {
         Ok(())
     }
 
+    #[allow(dead_code)]
     /// インサートモードを終了してノーマルモードに戻り、セマンティックトークンを更新する
     fn leave_insert_mode(&mut self, rewind_cursor: bool) {
         self.workspace.current_document_mut().end_undo_group();
@@ -2007,6 +2114,7 @@ impl App {
         self.refresh_current_document_semantic_tokens();
     }
 
+    #[allow(dead_code)]
     /// 現在のドキュメントの変更内容をLSPに送信してセマンティックトークンを再取得する
     fn refresh_current_document_semantic_tokens(&mut self) {
         let Some(path) = self
@@ -2026,12 +2134,10 @@ impl App {
         if matches!(self.lsp, LspClientState::Inactive) {
             let lsp_info = self.lsp_command_for_path(&path);
             self.lsp = match lsp_info {
-                Some((cmd, args, opts)) => {
-                    match LspClient::start(Path::new("."), cmd, args, opts) {
-                        Ok(client) => LspClientState::Ready(client),
-                        Err(_) => return,
-                    }
-                }
+                Some((cmd, args)) => match LspClient::start(Path::new("."), cmd, args) {
+                    Ok(client) => LspClientState::Ready(client),
+                    Err(_) => return,
+                },
                 None => return,
             };
         }
@@ -2358,32 +2464,27 @@ impl App {
         };
 
         match &mut self.lsp {
-            LspClientState::NotAvailable | LspClientState::Failed(_) => {
+            LspClientState::NotAvailable
+            | LspClientState::Failed(_)
+            | LspClientState::Starting(_) => {
                 self.apply_completion_fallback(serial);
             }
             LspClientState::Inactive => {
                 let lsp_info = self.lsp_command_for_path(&path);
                 self.lsp = match lsp_info {
-                    Some((cmd, args, opts)) => {
-                        match LspClient::start(Path::new("."), cmd, args, opts) {
-                            Ok(client) => LspClientState::Ready(client),
-                            Err(_) => {
-                                self.apply_completion_fallback(serial);
-                                return;
-                            }
+                    Some((cmd, args)) => match LspClient::start(Path::new("."), cmd, args) {
+                        Ok(client) => LspClientState::Starting(client),
+                        Err(_) => {
+                            self.apply_completion_fallback(serial);
+                            return;
                         }
-                    }
+                    },
                     None => {
                         self.apply_completion_fallback(serial);
                         return;
                     }
                 };
-                if self
-                    .request_completion_after_start(path, text, position, serial)
-                    .is_err()
-                {
-                    self.apply_completion_fallback(serial);
-                }
+                self.apply_completion_fallback(serial);
             }
             LspClientState::Ready(_) => {
                 if self
@@ -2509,6 +2610,318 @@ impl App {
         self.close_completion();
         true
     }
+
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    fn copy_selection_or_line(&mut self) -> Result<()> {
+        let page_width = self.current_page_width();
+        if let Some(anchor) = self.selection_anchor {
+            let cursor_row = self.cursor.row;
+            let cursor_col = self.cursor.column;
+            let (sr, sc, er, ec) =
+                normalize_selection(anchor.row, anchor.column, cursor_row, cursor_col);
+            let text = self
+                .workspace
+                .current_document()
+                .text_for_display_range(sr, sc, er, ec, page_width);
+            self.yank_buffer = YankBuffer::Charwise(text);
+            self.selection_anchor = None;
+        } else if let Some(line_text) = self
+            .workspace
+            .current_document()
+            .current_line_text(self.cursor.row, page_width)
+        {
+            self.yank_buffer = YankBuffer::Linewise(line_text);
+        }
+        Ok(())
+    }
+
+    fn cut_selection_or_line(&mut self) -> Result<()> {
+        let page_width = self.current_page_width();
+        if let Some(anchor) = self.selection_anchor {
+            let cursor_row = self.cursor.row;
+            let cursor_col = self.cursor.column;
+            let (sr, sc, er, ec) =
+                normalize_selection(anchor.row, anchor.column, cursor_row, cursor_col);
+            let text = self
+                .workspace
+                .current_document()
+                .text_for_display_range(sr, sc, er, ec, page_width);
+            self.yank_buffer = YankBuffer::Charwise(text);
+            self.selection_anchor = None;
+            if let Some((row, col)) = self
+                .workspace
+                .current_document_mut()
+                .remove_display_range(sr, sc, er, ec, page_width)
+            {
+                self.cursor.row = row;
+                self.cursor.column = col;
+            }
+            self.clamp_vertical_state();
+        } else {
+            self.delete_current_line()?;
+        }
+        Ok(())
+    }
+
+    fn delete_selection(&mut self) -> Result<()> {
+        let Some(anchor) = self.selection_anchor.take() else {
+            return Ok(());
+        };
+        let page_width = self.current_page_width();
+        let (sr, sc, er, ec) = normalize_selection(
+            anchor.row,
+            anchor.column,
+            self.cursor.row,
+            self.cursor.column,
+        );
+        if let Some((row, col)) = self
+            .workspace
+            .current_document_mut()
+            .remove_display_range(sr, sc, er, ec, page_width)
+        {
+            self.cursor.row = row;
+            self.cursor.column = col;
+        }
+        self.clamp_vertical_state();
+        Ok(())
+    }
+
+    fn delete_selection_if_any(&mut self) -> Result<()> {
+        if self.selection_anchor.is_some() {
+            self.delete_selection()?;
+        }
+        Ok(())
+    }
+
+    fn select_all(&mut self) {
+        let page_width = self.current_page_width();
+        let total_rows = self
+            .workspace
+            .current_document()
+            .total_rows(page_width)
+            .unwrap_or(0);
+        if total_rows == 0 {
+            return;
+        }
+        self.selection_anchor = Some(CursorState { row: 0, column: 0 });
+        let last_row = total_rows.saturating_sub(1);
+        let last_line_width = self
+            .workspace
+            .current_document()
+            .display_line_width(last_row, page_width)
+            .unwrap_or(0);
+        self.cursor.row = last_row;
+        self.cursor.column = last_line_width;
+        self.clamp_vertical_state();
+    }
+
+    fn select_word_or_next_occurrence(&mut self) -> Result<()> {
+        let page_width = self.current_page_width();
+        if let Some(anchor) = self.selection_anchor {
+            let cursor_row = self.cursor.row;
+            let cursor_col = self.cursor.column;
+            let (sr, sc, er, ec) =
+                normalize_selection(anchor.row, anchor.column, cursor_row, cursor_col);
+            let selected_text = self
+                .workspace
+                .current_document()
+                .text_for_display_range(sr, sc, er, ec, page_width);
+            if selected_text.is_empty() {
+                return Ok(());
+            }
+            let total_rows = self
+                .workspace
+                .current_document()
+                .total_rows(page_width)
+                .unwrap_or(0);
+            for row in er..total_rows {
+                let row_line = self
+                    .workspace
+                    .current_document()
+                    .display_line_text(row, page_width)
+                    .unwrap_or_default();
+                let start_col = if row == er { ec } else { 0 };
+                if let Some(byte_offset) = row_line.find(&selected_text) {
+                    let char_col = row_line[..byte_offset].chars().count();
+                    if char_col >= start_col || row > er {
+                        self.selection_anchor = Some(CursorState {
+                            row,
+                            column: char_col,
+                        });
+                        self.cursor.row = row;
+                        self.cursor.column = char_col + selected_text.chars().count();
+                        self.clamp_vertical_state();
+                        return Ok(());
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let line = self
+            .workspace
+            .current_document()
+            .display_line_text(self.cursor.row, page_width)
+            .unwrap_or_default();
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            return Ok(());
+        }
+        let col = self.cursor.column.min(chars.len().saturating_sub(1));
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        if !is_word(chars.get(col).copied().unwrap_or(' ')) {
+            return Ok(());
+        }
+        let mut start = col;
+        while start > 0 && is_word(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = col + 1;
+        while end < chars.len() && is_word(chars[end]) {
+            end += 1;
+        }
+        self.selection_anchor = Some(CursorState {
+            row: self.cursor.row,
+            column: start,
+        });
+        self.cursor.column = end;
+        Ok(())
+    }
+
+    fn toggle_comment(&mut self) -> Result<()> {
+        let page_width = self.current_page_width();
+        let comment_prefix = self
+            .workspace
+            .current_document_path()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .map(|ext| match ext {
+                "toml" | "py" | "sh" | "yaml" | "yml" | "rb" => "# ",
+                _ => "// ",
+            })
+            .unwrap_or("// ");
+
+        let (start_row, end_row) = if let Some(anchor) = self.selection_anchor {
+            let cursor_row = self.cursor.row;
+            let (ar, _, er, _) =
+                normalize_selection(anchor.row, anchor.column, cursor_row, self.cursor.column);
+            (ar, er)
+        } else {
+            (self.cursor.row, self.cursor.row)
+        };
+
+        let all_commented = (start_row..=end_row).all(|row| {
+            let text = self
+                .workspace
+                .current_document()
+                .display_line_text(row, page_width)
+                .unwrap_or_default();
+            text.starts_with(comment_prefix)
+        });
+
+        for row in start_row..=end_row {
+            let text = self
+                .workspace
+                .current_document()
+                .display_line_text(row, page_width)
+                .unwrap_or_default();
+            if all_commented {
+                let new_text = text
+                    .strip_prefix(comment_prefix)
+                    .unwrap_or(&text)
+                    .to_owned();
+                self.workspace
+                    .current_document_mut()
+                    .replace_line_display(row, &new_text, page_width);
+            } else {
+                let new_text = format!("{comment_prefix}{text}");
+                self.workspace
+                    .current_document_mut()
+                    .replace_line_display(row, &new_text, page_width);
+            }
+        }
+        self.selection_anchor = None;
+        Ok(())
+    }
+
+    fn add_extra_cursor_above(&mut self) {
+        let row = if let Some(last) = self.extra_cursors.last() {
+            last.row.saturating_sub(1)
+        } else {
+            self.cursor.row.saturating_sub(1)
+        };
+        if !self.extra_cursors.iter().any(|c| c.row == row) && row < self.cursor.row {
+            self.extra_cursors.push(CursorState {
+                row,
+                column: self.cursor.column,
+            });
+        }
+    }
+
+    fn add_extra_cursor_below(&mut self) {
+        let page_width = self.current_page_width();
+        let total = self
+            .workspace
+            .current_document()
+            .total_rows(page_width)
+            .unwrap_or(0);
+        let row = if let Some(last) = self.extra_cursors.last() {
+            last.row.saturating_add(1)
+        } else {
+            self.cursor.row.saturating_add(1)
+        };
+        if row < total && !self.extra_cursors.iter().any(|c| c.row == row) {
+            self.extra_cursors.push(CursorState {
+                row,
+                column: self.cursor.column,
+            });
+        }
+    }
+
+    fn open_line_above(&mut self) {
+        let page_width = self.current_page_width();
+        self.workspace.current_document_mut().begin_undo_group();
+        if let Some((row, column)) = self
+            .workspace
+            .current_document_mut()
+            .open_above(self.cursor.row, page_width)
+        {
+            self.cursor.row = row;
+            self.cursor.column = column;
+            self.clamp_vertical_state();
+        }
+    }
+
+    fn insert_char_for_all_cursors(&mut self, ch: char) {
+        self.insert_char(ch);
+        self.extra_cursors.clear();
+    }
+
+    fn backspace_char_for_all_cursors(&mut self) {
+        self.backspace_char();
+        self.extra_cursors.clear();
+    }
+
+    fn insert_newline_for_all_cursors(&mut self) {
+        self.insert_newline();
+        self.extra_cursors.clear();
+    }
+}
+
+pub(super) fn normalize_selection(
+    ar: usize,
+    ac: usize,
+    cr: usize,
+    cc: usize,
+) -> (usize, usize, usize, usize) {
+    if ar < cr || (ar == cr && ac <= cc) {
+        (ar, ac, cr, cc)
+    } else {
+        (cr, cc, ar, ac)
+    }
 }
 
 /// パスからファイル名部分を返す
@@ -2563,6 +2976,7 @@ fn collect_rust_files_under(dir: &Path, rust_files: &mut Vec<PathBuf>) -> Result
     Ok(())
 }
 
+#[allow(dead_code)]
 /// インサートモードのjjエスケープ待機タイムアウトを返す
 fn insert_escape_timeout() -> Duration {
     Duration::from_millis(300)
@@ -2592,6 +3006,7 @@ fn invert_find_kind(find_kind: FindKind, reverse: bool) -> FindKind {
     }
 }
 
+#[allow(dead_code)]
 /// カーソルと発見位置からFindKindに応じたオペレータ操作範囲を計算する
 fn operator_range(
     cursor_row: usize,

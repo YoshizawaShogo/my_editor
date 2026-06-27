@@ -91,6 +91,14 @@ impl Document {
         }
     }
 
+    pub fn as_editable_mut(&mut self) -> Option<&mut editable::EditableDocument> {
+        if let Self::Editable(doc) = self {
+            Some(doc)
+        } else {
+            None
+        }
+    }
+
     pub fn jump_to_top(&mut self) {
         if let Self::LargeFile(document) = self {
             document.jump_to_top();
@@ -474,6 +482,34 @@ impl Document {
         }
     }
 
+    pub fn text_for_display_range(
+        &self,
+        start_row: usize,
+        start_column: usize,
+        end_row: usize,
+        end_column: usize,
+        page_width: usize,
+    ) -> String {
+        let content_width = content_width_for_page(page_width);
+        match self {
+            Self::Editable(document) => document.text_for_display_range(
+                start_row,
+                start_column,
+                end_row,
+                end_column,
+                content_width.max(1),
+            ),
+            Self::LargeFile(_) | Self::Scratch(_) => String::new(),
+        }
+    }
+
+    pub fn replace_line_display(&mut self, display_row: usize, new_text: &str, page_width: usize) {
+        let content_width = content_width_for_page(page_width);
+        if let Self::Editable(document) = self {
+            document.replace_line_display(display_row, new_text, content_width.max(1));
+        }
+    }
+
     pub fn current_line_text(&self, display_row: usize, page_width: usize) -> Option<String> {
         let content_width = content_width_for_page(page_width);
 
@@ -505,6 +541,7 @@ impl Document {
         }
     }
 
+    #[allow(dead_code)]
     pub fn clear_current_line(
         &mut self,
         display_row: usize,
@@ -541,6 +578,7 @@ impl Document {
         matches!(self, Self::Scratch(_))
     }
 
+    #[allow(dead_code)]
     pub fn scratch_target_at_row(&self, row: usize) -> Option<ScratchTarget> {
         match self {
             Self::Scratch(document) => document.target_at_row(row),

@@ -10,6 +10,7 @@ pub struct DiagnosticEntry {
     pub message: String,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct ScratchTarget {
     pub path: PathBuf,
@@ -20,6 +21,7 @@ pub struct ScratchTarget {
 #[derive(Clone)]
 pub struct ScratchRow {
     pub text: String,
+    #[allow(dead_code)]
     pub target: Option<ScratchTarget>,
 }
 
@@ -95,6 +97,7 @@ impl ScratchDocument {
         Some(line_number - 1)
     }
 
+    #[allow(dead_code)]
     pub fn target_at_row(&self, display_row: usize) -> Option<ScratchTarget> {
         self.rows
             .get(display_row)

@@ -7,6 +7,39 @@ pub struct SearchOptions {
     pub use_regex: bool,
 }
 
+impl SearchOptions {
+    /// タイトルバーに表示するオプションインジケーター文字列を返す
+    pub fn indicator(&self) -> String {
+        format!(
+            "[{}][{}][{}]",
+            if self.case_sensitive { "Aa" } else { "aa" },
+            if self.whole_word { "\\b" } else { ".." },
+            if self.use_regex { ".*" } else { "--" },
+        )
+    }
+
+    #[allow(dead_code)]
+    /// `Alt+c/w/r` のキーコードに対応するオプションをトグルし、処理したら true を返す
+    pub fn toggle_from_key(&mut self, code: crossterm::event::KeyCode) -> bool {
+        use crossterm::event::KeyCode;
+        match code {
+            KeyCode::Char('c') => {
+                self.case_sensitive = !self.case_sensitive;
+                true
+            }
+            KeyCode::Char('w') => {
+                self.whole_word = !self.whole_word;
+                true
+            }
+            KeyCode::Char('e') => {
+                self.use_regex = !self.use_regex;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// クエリと検索オプションをもとに構築されたマッチャー
 pub struct Matcher {
     inner: MatcherInner,

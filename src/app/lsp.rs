@@ -11,18 +11,17 @@ use lsp_types::request::Request as LspRequestTrait;
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionContext, CompletionParams,
     CompletionResponse, CompletionTextEdit, DiagnosticClientCapabilities,
-    DiagnosticWorkspaceClientCapabilities, DidChangeConfigurationParams,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, GotoDefinitionParams, Hover, HoverContents, HoverParams, Location,
-    Position, ReferenceContext, ReferenceParams, RenameParams, SelectionRange,
-    SelectionRangeClientCapabilities, SelectionRangeParams, SemanticTokenModifier,
-    SemanticTokenType, SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
-    SemanticTokensFullOptions, SemanticTokensParams, TextDocumentClientCapabilities,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, TokenFormat, Uri, VersionedTextDocumentIdentifier,
-    WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceDiagnosticParams,
-    WorkspaceDiagnosticReportResult, WorkspaceDocumentDiagnosticReport, WorkspaceEdit,
-    notification, request,
+    DiagnosticWorkspaceClientCapabilities, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams, Hover,
+    HoverContents, HoverParams, Location, Position, ReferenceContext, ReferenceParams,
+    RenameParams, SelectionRange, SelectionRangeClientCapabilities, SelectionRangeParams,
+    SemanticTokenModifier, SemanticTokenType, SemanticTokensClientCapabilities,
+    SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions, SemanticTokensParams,
+    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, TokenFormat, Uri,
+    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceClientCapabilities,
+    WorkspaceDiagnosticParams, WorkspaceDiagnosticReportResult, WorkspaceDocumentDiagnosticReport,
+    WorkspaceEdit, notification, request,
 };
 use serde_json::Value;
 use tokio::{
@@ -44,6 +43,7 @@ use crate::{
 pub enum LspClientState {
     NotAvailable,
     Inactive,
+    Starting(LspClient),
     Ready(LspClient),
     Failed(()),
 }
@@ -80,6 +80,9 @@ impl GotoKind {
 
 #[derive(Clone)]
 pub enum LspEvent {
+    Initialized {
+        workspace_diagnostics_supported: bool,
+    },
     PublishDiagnostics {
         path: PathBuf,
         diagnostics: HashMap<usize, Vec<DiagnosticEntry>>,
@@ -126,6 +129,7 @@ pub struct WorkspaceDiagnosticItem {
     pub message: String,
 }
 
+#[allow(dead_code)]
 enum LspCommand {
     EnsureOpen {
         path: PathBuf,
@@ -194,24 +198,19 @@ enum PendingRequest {
 pub struct LspClient {
     tx: UnboundedSender<LspCommand>,
     rx: Receiver<LspEvent>,
-    pending_events: Vec<LspEvent>,
+    pub pending_events: Vec<LspEvent>,
     opened_documents: HashSet<PathBuf>,
-    workspace_diagnostics_supported: bool,
+    pub workspace_diagnostics_supported: bool,
 }
 
 fn append_tmp_log(_message: impl AsRef<str>) {}
 
 impl LspClient {
-    /// LSPサーバーを別スレッドで起動してクライアントを初期化する
-    pub fn start(
-        root_path: &Path,
-        command: String,
-        args: Vec<String>,
-        init_options: Option<serde_json::Value>,
-    ) -> Result<Self> {
+    /// LSPサーバーを別スレッドで起動する。初期化はバックグラウンドで進み、
+    /// 完了時に LspEvent::Initialized が届く。
+    pub fn start(root_path: &Path, command: String, args: Vec<String>) -> Result<Self> {
         let (tx, rx_commands) = unbounded_channel();
         let (tx_events, rx) = mpsc::channel();
-        let (tx_init, rx_init) = mpsc::channel();
         let root_path = root_path.to_path_buf();
 
         thread::spawn(move || {
@@ -219,9 +218,6 @@ impl LspClient {
             let runtime = match runtime {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    let _ = tx_init.send(Err(AppError::CommandFailed(format!(
-                        "failed to build tokio runtime: {error}"
-                    ))));
                     let _ = tx_events.send(LspEvent::Failed(format!(
                         "failed to build tokio runtime: {error}"
                     )));
@@ -233,26 +229,19 @@ impl LspClient {
                 root_path,
                 command,
                 args,
-                init_options,
                 rx_commands,
                 tx_events.clone(),
-                tx_init.clone(),
             )) {
-                let _ = tx_init.send(Err(AppError::CommandFailed(format!("{error:?}"))));
                 let _ = tx_events.send(LspEvent::Failed(format!("{error:?}")));
             }
         });
-
-        let workspace_diagnostics_supported = rx_init.recv().map_err(|_| {
-            AppError::CommandFailed("failed to receive LSP init result".to_owned())
-        })??;
 
         Ok(Self {
             tx,
             rx,
             pending_events: Vec::new(),
             opened_documents: HashSet::new(),
-            workspace_diagnostics_supported,
+            workspace_diagnostics_supported: false,
         })
     }
 
@@ -352,7 +341,7 @@ impl LspClient {
         })
     }
 
-    /// カーソル位置のシンタックス選択範囲をLSPに要求する
+    #[allow(dead_code)]
     pub fn selection_range(
         &mut self,
         path: &Path,
@@ -412,10 +401,8 @@ async fn run_lsp_worker(
     root_path: PathBuf,
     command: String,
     args: Vec<String>,
-    init_options: Option<serde_json::Value>,
     mut rx_commands: UnboundedReceiver<LspCommand>,
     tx_events: Sender<LspEvent>,
-    tx_init: Sender<Result<bool>>,
 ) -> Result<()> {
     let mut child = Command::new(&command)
         .args(&args)
@@ -438,15 +425,11 @@ async fn run_lsp_worker(
     let mut next_request_id = 1;
     let mut pending_requests = HashMap::<RequestId, PendingRequest>::new();
 
-    let (workspace_diagnostics_supported, semantic_token_legend) = initialize_server(
-        &mut writer,
-        &mut reader,
-        &root_path,
-        &mut next_request_id,
-        init_options,
-    )
-    .await?;
-    let _ = tx_init.send(Ok(workspace_diagnostics_supported));
+    let (workspace_diagnostics_supported, semantic_token_legend) =
+        initialize_server(&mut writer, &mut reader, &root_path, &mut next_request_id).await?;
+    let _ = tx_events.send(LspEvent::Initialized {
+        workspace_diagnostics_supported,
+    });
 
     loop {
         select! {
@@ -485,7 +468,6 @@ async fn initialize_server(
     reader: &mut BufReader<ChildStdout>,
     root_path: &Path,
     next_request_id: &mut i32,
-    init_options: Option<serde_json::Value>,
 ) -> Result<(bool, Vec<String>)> {
     let root_uri = path_to_uri(root_path)?;
     let workspace_folders = Some(vec![lsp_types::WorkspaceFolder {
@@ -576,7 +558,6 @@ async fn initialize_server(
         process_id: Some(std::process::id()),
         workspace_folders,
         capabilities,
-        initialization_options: init_options.clone(),
         ..Default::default()
     };
 
@@ -617,17 +598,6 @@ async fn initialize_server(
         serde_json::json!({}),
     )
     .await?;
-
-    if let Some(settings) = init_options {
-        let configuration = DidChangeConfigurationParams { settings };
-        send_notification(
-            writer,
-            notification::DidChangeConfiguration::METHOD,
-            serde_json::to_value(configuration)
-                .map_err(|error| AppError::CommandFailed(error.to_string()))?,
-        )
-        .await?;
-    }
 
     Ok((workspace_diagnostics_supported, semantic_token_legend))
 }

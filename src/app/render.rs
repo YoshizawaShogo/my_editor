@@ -15,8 +15,8 @@ use crate::{
 };
 
 use super::{
-    App, FindKind, FocusedPane, LayoutMode, PendingNormalAction, PendingOperator, PickerScope,
-    ReplaceField, ReplayableAction,
+    App, FindKind, FocusedPane, LayoutMode, PendingNormalAction, PickerScope, ReplaceField,
+    ReplayableAction,
 };
 
 impl App {
@@ -97,23 +97,18 @@ impl App {
             }
 
             if self.search_input.active {
-                let opts = &self.search_input.options;
-                let opts_str = format!(
-                    " [{}][{}][{}]",
-                    if opts.case_sensitive { "Aa" } else { "aa" },
-                    if opts.whole_word { "\\b" } else { ".." },
-                    if opts.use_regex { ".*" } else { "--" },
-                );
                 let title = format!(
-                    " Search [{}]{}: ",
+                    " Search [{}] {}: ",
                     self.search_input.scope.label(),
-                    opts_str,
+                    self.search_input.options.indicator(),
                 );
-                let popup = top_right_rect(50, 3, area);
+                let hint = " c-f:スコープ  Alt+c/w/e:オプション  Esc:閉じる ";
+                let popup = top_right_rect(52, 3, area);
                 let input = Paragraph::new(self.search_input.value.clone())
                     .block(
                         Block::default()
                             .title(title)
+                            .title_bottom(hint)
                             .borders(Borders::ALL)
                             .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
                     )
@@ -475,7 +470,7 @@ impl App {
                 Style::default().fg(AppColors::ACCENT),
             )),
             Line::from(Span::styled(
-                "Press Ctrl-Q to quit.",
+                "Press Ctrl+Shift+W to quit.",
                 Style::default().fg(AppColors::MUTED),
             )),
         ];
@@ -560,19 +555,13 @@ impl App {
         } else {
             Style::default().fg(AppColors::FOREGROUND)
         };
-        let opts = &self.replace_input.options;
-        let opts_str = format!(
-            "[{}][{}][{}]",
-            if opts.case_sensitive { "Aa" } else { "aa" },
-            if opts.whole_word { "\\b" } else { ".." },
-            if opts.use_regex { ".*" } else { "--" },
-        );
         let frame_widget = Block::default()
             .title(format!(
                 " Replace [{}] {} ",
                 self.replace_input.scope.label(),
-                opts_str
+                self.replace_input.options.indicator(),
             ))
+            .title_bottom(" c-h:スコープ  Alt+c/w/e:オプション  Tab:移動  Esc:閉じる ")
             .borders(Borders::ALL)
             .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT));
         frame.render_widget(Clear, popup);
@@ -779,17 +768,7 @@ impl App {
         use crate::keymap_hints;
 
         let hints: &[keymap_hints::KeyHint] = match self.pending_normal_action {
-            Some(PendingNormalAction::GoPrefix) => keymap_hints::GO_PREFIX_HINTS,
-            Some(PendingNormalAction::DiagnosticPrefix) => keymap_hints::DIAGNOSTIC_PREFIX_HINTS,
-            Some(PendingNormalAction::Operator(PendingOperator::Change)) => {
-                keymap_hints::CHANGE_OPERATOR_HINTS
-            }
-            Some(PendingNormalAction::Operator(PendingOperator::Delete)) => {
-                keymap_hints::DELETE_OPERATOR_HINTS
-            }
-            Some(PendingNormalAction::Operator(PendingOperator::Yank)) => {
-                keymap_hints::YANK_OPERATOR_HINTS
-            }
+            Some(PendingNormalAction::JumpPrefix) => keymap_hints::JUMP_PREFIX_HINTS,
             _ => keymap_hints::TOP_LEVEL_HINTS,
         };
 
@@ -835,62 +814,7 @@ impl App {
     }
 
     fn pending_input_text(&self) -> Option<String> {
-        match self.pending_normal_action {
-            Some(PendingNormalAction::GoPrefix) => Some("g".to_owned()),
-            Some(PendingNormalAction::DiagnosticPrefix) => Some("e".to_owned()),
-            Some(PendingNormalAction::Find(FindKind::Forward)) => Some("f".to_owned()),
-            Some(PendingNormalAction::Find(FindKind::Backward)) => Some("F".to_owned()),
-            Some(PendingNormalAction::Find(FindKind::TillForward)) => Some("t".to_owned()),
-            Some(PendingNormalAction::Find(FindKind::TillBackward)) => Some("T".to_owned()),
-            Some(PendingNormalAction::Operator(PendingOperator::Change)) => Some("c".to_owned()),
-            Some(PendingNormalAction::Operator(PendingOperator::Delete)) => Some("d".to_owned()),
-            Some(PendingNormalAction::Operator(PendingOperator::Yank)) => Some("y".to_owned()),
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Change, FindKind::Forward)) => {
-                Some("cf".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(
-                PendingOperator::Change,
-                FindKind::Backward,
-            )) => Some("cF".to_owned()),
-            Some(PendingNormalAction::OperatorFind(
-                PendingOperator::Change,
-                FindKind::TillForward,
-            )) => Some("ct".to_owned()),
-            Some(PendingNormalAction::OperatorFind(
-                PendingOperator::Change,
-                FindKind::TillBackward,
-            )) => Some("cT".to_owned()),
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Delete, FindKind::Forward)) => {
-                Some("df".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(
-                PendingOperator::Delete,
-                FindKind::Backward,
-            )) => Some("dF".to_owned()),
-            Some(PendingNormalAction::OperatorFind(
-                PendingOperator::Delete,
-                FindKind::TillForward,
-            )) => Some("dt".to_owned()),
-            Some(PendingNormalAction::OperatorFind(
-                PendingOperator::Delete,
-                FindKind::TillBackward,
-            )) => Some("dT".to_owned()),
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Yank, FindKind::Forward)) => {
-                Some("yf".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Yank, FindKind::Backward)) => {
-                Some("yF".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(
-                PendingOperator::Yank,
-                FindKind::TillForward,
-            )) => Some("yt".to_owned()),
-            Some(PendingNormalAction::OperatorFind(
-                PendingOperator::Yank,
-                FindKind::TillBackward,
-            )) => Some("yT".to_owned()),
-            None => None,
-        }
+        self.pending_normal_action.map(|_| "c-j".to_owned())
     }
 
     fn replay_command_text(&self) -> Option<String> {
@@ -1039,10 +963,27 @@ impl App {
         &self,
         viewport_row: usize,
     ) -> Option<(usize, usize, usize, usize)> {
-        let range = self.selection_input.current_range()?;
-        let start_row = range.start_row.checked_sub(viewport_row)?;
-        let end_row = range.end_row.checked_sub(viewport_row)?;
-        Some((start_row, range.start_column, end_row, range.end_column))
+        // Text selection (new)
+        if let Some(anchor) = self.selection_anchor {
+            let cursor_row = self.cursor.row;
+            let cursor_col = self.cursor.column;
+            let (sr, sc, er, ec) =
+                super::normalize_selection(anchor.row, anchor.column, cursor_row, cursor_col);
+            if er < viewport_row {
+                return None;
+            }
+            let start_row_in_view = sr.saturating_sub(viewport_row);
+            let end_row_in_view = er.saturating_sub(viewport_row);
+            return Some((start_row_in_view, sc, end_row_in_view, ec));
+        }
+        // LSP selection range (existing)
+        if self.selection_input.active {
+            let range = self.selection_input.current_range()?;
+            let start_row = range.start_row.checked_sub(viewport_row)?;
+            let end_row = range.end_row.checked_sub(viewport_row)?;
+            return Some((start_row, range.start_column, end_row, range.end_column));
+        }
+        None
     }
 
     fn rename_input_cursor_position(&self, area: Rect) -> Position {

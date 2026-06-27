@@ -57,7 +57,7 @@ impl App {
         self.clamp_vertical_state();
     }
 
-    /// 対応するブラケットの位置にカーソルをジャンプする
+    #[allow(dead_code)]
     pub(super) fn jump_to_matching_bracket(&mut self) {
         if let Some((row, column)) = self.workspace.current_document().matching_bracket_position(
             self.cursor.row,
@@ -322,5 +322,155 @@ impl App {
 
         self.clamp_to_document_bounds();
         self.clamp_cursor_column_to_current_line();
+    }
+
+    pub(super) fn extend_selection_up(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(super::CursorState {
+                row: self.cursor.row,
+                column: self.cursor.column,
+            });
+        }
+        self.move_cursor_up();
+    }
+
+    pub(super) fn extend_selection_down(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(super::CursorState {
+                row: self.cursor.row,
+                column: self.cursor.column,
+            });
+        }
+        self.move_cursor_down();
+    }
+
+    pub(super) fn extend_selection_left(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(super::CursorState {
+                row: self.cursor.row,
+                column: self.cursor.column,
+            });
+        }
+        self.move_cursor_left();
+    }
+
+    pub(super) fn extend_selection_right(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(super::CursorState {
+                row: self.cursor.row,
+                column: self.cursor.column,
+            });
+        }
+        self.move_cursor_right();
+    }
+
+    pub(super) fn move_cursor_word_left(&mut self) {
+        // If not at start of line, move to start of previous word on current line
+        let page_width = self.current_page_width();
+        if self.cursor.column > 0 {
+            let text = self
+                .workspace
+                .current_document()
+                .display_line_text(self.cursor.row, page_width)
+                .unwrap_or_default();
+            let chars: Vec<char> = text.chars().collect();
+            let mut col = self.cursor.column.min(chars.len());
+            // Skip whitespace to the left
+            while col > 0 && chars[col - 1].is_whitespace() {
+                col -= 1;
+            }
+            // Skip word chars to the left
+            if col > 0 {
+                let is_word = chars[col - 1].is_alphanumeric() || chars[col - 1] == '_';
+                while col > 0 {
+                    let c = chars[col - 1];
+                    let this_word = c.is_alphanumeric() || c == '_';
+                    if this_word != is_word {
+                        break;
+                    }
+                    col -= 1;
+                }
+            }
+            self.cursor.column = col;
+        } else if self.cursor.row > 0 {
+            // Move to end of previous line
+            self.cursor.row -= 1;
+            self.clamp_vertical_state();
+            self.move_cursor_to_line_end();
+        }
+    }
+
+    pub(super) fn move_cursor_word_right(&mut self) {
+        let page_width = self.current_page_width();
+        let text = self
+            .workspace
+            .current_document()
+            .display_line_text(self.cursor.row, page_width)
+            .unwrap_or_default();
+        let chars: Vec<char> = text.chars().collect();
+        let len = chars.len();
+        let mut col = self.cursor.column.min(len);
+        if col < len {
+            let is_word = chars[col].is_alphanumeric() || chars[col] == '_';
+            // Skip current word-class chars
+            while col < len {
+                let c = chars[col];
+                let this_word = c.is_alphanumeric() || c == '_';
+                if this_word != is_word {
+                    break;
+                }
+                col += 1;
+            }
+            // Skip whitespace
+            while col < len && chars[col].is_whitespace() {
+                col += 1;
+            }
+            self.cursor.column = col;
+        } else {
+            // Move to start of next line
+            self.cursor.row = self.cursor.row.saturating_add(1);
+            self.clamp_vertical_state();
+            self.cursor.column = 0;
+        }
+    }
+
+    pub(super) fn extend_selection_word_left(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(super::CursorState {
+                row: self.cursor.row,
+                column: self.cursor.column,
+            });
+        }
+        self.move_cursor_word_left();
+    }
+
+    pub(super) fn extend_selection_word_right(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(super::CursorState {
+                row: self.cursor.row,
+                column: self.cursor.column,
+            });
+        }
+        self.move_cursor_word_right();
+    }
+
+    pub(super) fn extend_selection_to_line_start(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(super::CursorState {
+                row: self.cursor.row,
+                column: self.cursor.column,
+            });
+        }
+        self.move_cursor_to_line_start();
+    }
+
+    pub(super) fn extend_selection_to_line_end(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(super::CursorState {
+                row: self.cursor.row,
+                column: self.cursor.column,
+            });
+        }
+        self.move_cursor_to_line_end();
     }
 }

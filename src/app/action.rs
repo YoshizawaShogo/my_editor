@@ -8,13 +8,10 @@ pub enum ReplayableAction {
 
 #[derive(Clone, Copy)]
 pub enum PendingNormalAction {
-    GoPrefix,
-    DiagnosticPrefix,
-    Find(FindKind),
-    Operator(PendingOperator),
-    OperatorFind(PendingOperator, FindKind),
+    JumpPrefix,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum PendingOperator {
     Change,
@@ -22,6 +19,7 @@ pub enum PendingOperator {
     Yank,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum FindKind {
     Forward,

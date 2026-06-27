@@ -1,276 +1,12 @@
-use std::time::Instant;
-
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{error::Result, mode::Mode};
 
-use super::{App, FindKind, PendingNormalAction, PendingOperator, ReplayableAction};
-
-#[derive(Clone, Copy)]
-enum NormalInput {
-    Enter,
-    F2,
-    Up,
-    Left,
-    Down,
-    Right,
-    Home,
-    End,
-    Char(char),
-    Ctrl(char),
-    CtrlSpace,
-    Unsupported,
-}
-
-enum NormalDecision {
-    Ignore,
-    Quit,
-    SetPending(PendingNormalAction),
-    Action(NormalAction),
-}
-
-enum NormalAction {
-    OpenGoInput,
-    OpenPicker,
-    OpenSearch,
-    OpenReplace,
-    OpenDiagnosticPopup,
-    OpenDiagnosticList {
-        error_only: bool,
-    },
-    OpenWorkspaceDiagnosticList {
-        error_only: bool,
-    },
-    OpenScratchTarget,
-    OpenHoverPopup,
-    OpenRenameInput,
-    CloseCurrentBuffer,
-    AdvanceLayoutOrFocus,
-    CollapseToSinglePane,
-    ToggleTerminalSplit,
-    Save,
-    EnterInsertAppend,
-    EnterInsertAtCursor,
-    JumpBack,
-    JumpForward,
-    PageDownHalf,
-    PageUpHalf,
-    MoveUp,
-    MoveLeft,
-    MoveDown,
-    MoveRight,
-    MoveToLineStart,
-    MoveToLineEnd,
-    JumpMatchingBracket,
-    OpenLineBelow,
-    Paste,
-    PasteBefore,
-    Replay {
-        reverse: bool,
-    },
-    Undo,
-    Redo,
-    JumpTop,
-    JumpBottom,
-    JumpNextGitHunk,
-    JumpPreviousGitHunk,
-    JumpNextDiagnostic {
-        error_only: bool,
-    },
-    JumpPreviousDiagnostic {
-        error_only: bool,
-    },
-    RepeatSearch {
-        forward: bool,
-    },
-    Goto {
-        kind: super::GotoKind,
-    },
-    ShowReferences,
-    FindMotion {
-        kind: FindKind,
-        target: char,
-    },
-    OperatorFind {
-        operator: PendingOperator,
-        find_kind: FindKind,
-        target: char,
-    },
-    OperatorSelectionRange {
-        operator: PendingOperator,
-    },
-    ChangeCurrentLine,
-    DeleteCurrentLine,
-    YankCurrentLine,
-}
-
-/// KeyEventをノーマルモード用のNormalInput型に正規化する
-fn normalize_normal_input(key_event: KeyEvent) -> NormalInput {
-    if key_event.modifiers.contains(KeyModifiers::CONTROL) {
-        return match key_event.code {
-            KeyCode::Null => NormalInput::CtrlSpace,
-            KeyCode::Char(' ') => NormalInput::CtrlSpace,
-            KeyCode::Char(ch) => NormalInput::Ctrl(ch),
-            _ => NormalInput::Unsupported,
-        };
-    }
-
-    match key_event.code {
-        KeyCode::Up => NormalInput::Up,
-        KeyCode::F(2) => NormalInput::F2,
-        KeyCode::Enter => NormalInput::Enter,
-        KeyCode::Left => NormalInput::Left,
-        KeyCode::Down => NormalInput::Down,
-        KeyCode::Right => NormalInput::Right,
-        KeyCode::Home => NormalInput::Home,
-        KeyCode::End => NormalInput::End,
-        KeyCode::Char(ch) => NormalInput::Char(ch),
-        _ => NormalInput::Unsupported,
-    }
-}
-
-/// 保留アクション状態と入力キーを状態機械でNormalDecisionに変換する
-fn transition_normal_input(
-    state: Option<PendingNormalAction>,
-    input: NormalInput,
-) -> NormalDecision {
-    use NormalAction as Act;
-    use NormalDecision as Dec;
-    use NormalInput as In;
-    use PendingNormalAction as State;
-    use PendingOperator as Op;
-
-    match (state, input) {
-        (_, In::Ctrl('c')) => Dec::Ignore,
-        (_, In::Ctrl('q')) => Dec::Quit,
-        (None, In::Ctrl('j')) => Dec::Action(Act::OpenScratchTarget),
-        (None, In::Ctrl('g')) => Dec::Action(Act::OpenGoInput),
-        (None, In::Ctrl('t')) => Dec::Action(Act::OpenPicker),
-        (None, In::Ctrl('f')) => Dec::Action(Act::OpenSearch),
-        (None, In::Ctrl('h')) => Dec::Action(Act::OpenReplace),
-        (None, In::Ctrl('w')) => Dec::Action(Act::CloseCurrentBuffer),
-        (None, In::Ctrl('l')) => Dec::Action(Act::AdvanceLayoutOrFocus),
-        (None, In::Ctrl('o')) => Dec::Action(Act::CollapseToSinglePane),
-        (None, In::CtrlSpace) => Dec::Action(Act::ToggleTerminalSplit),
-        (None, In::Ctrl('s')) => Dec::Action(Act::Save),
-        (None, In::Ctrl('d')) => Dec::Action(Act::PageDownHalf),
-        (None, In::Ctrl('u')) => Dec::Action(Act::PageUpHalf),
-        (None, In::Ctrl('z')) | (None, In::Ctrl('y')) => Dec::Ignore,
-
-        (None, In::F2) => Dec::Action(Act::OpenRenameInput),
-        (None, In::Enter) => Dec::Action(Act::OpenScratchTarget),
-        (None, In::Up) => Dec::Action(Act::MoveUp),
-        (None, In::Left) => Dec::Action(Act::MoveLeft),
-        (None, In::Down) => Dec::Action(Act::MoveDown),
-        (None, In::Right) => Dec::Action(Act::MoveRight),
-        (None, In::Home) => Dec::Action(Act::MoveToLineStart),
-        (None, In::End) => Dec::Action(Act::MoveToLineEnd),
-
-        (None, In::Char('a')) => Dec::Action(Act::EnterInsertAppend),
-        (None, In::Char('h')) => Dec::Action(Act::EnterInsertAtCursor),
-        (None, In::Char('b')) => Dec::Action(Act::JumpBack),
-        (None, In::Char('B')) => Dec::Action(Act::JumpForward),
-        (None, In::Char('e')) => Dec::SetPending(State::DiagnosticPrefix),
-        (None, In::Char('K')) => Dec::Action(Act::OpenHoverPopup),
-        (None, In::Char('i')) => Dec::Action(Act::MoveUp),
-        (None, In::Char('j')) => Dec::Action(Act::MoveLeft),
-        (None, In::Char('k')) => Dec::Action(Act::MoveDown),
-        (None, In::Char('l')) => Dec::Action(Act::MoveRight),
-        (None, In::Char('%')) => Dec::Action(Act::JumpMatchingBracket),
-        (None, In::Char('o')) => Dec::Action(Act::OpenLineBelow),
-        (None, In::Char('p')) => Dec::Action(Act::Paste),
-        (None, In::Char('P')) => Dec::Action(Act::PasteBefore),
-        (None, In::Char('r')) => Dec::Action(Act::Replay { reverse: false }),
-        (None, In::Char('R')) => Dec::Action(Act::Replay { reverse: true }),
-        (None, In::Char('u')) => Dec::Action(Act::Undo),
-        (None, In::Char('U')) => Dec::Action(Act::Redo),
-
-        (None, In::Char('g')) => Dec::SetPending(State::GoPrefix),
-        (None, In::Char('f')) => Dec::SetPending(State::Find(FindKind::Forward)),
-        (None, In::Char('F')) => Dec::SetPending(State::Find(FindKind::Backward)),
-        (None, In::Char('t')) => Dec::SetPending(State::Find(FindKind::TillForward)),
-        (None, In::Char('T')) => Dec::SetPending(State::Find(FindKind::TillBackward)),
-        (None, In::Char('c')) => Dec::SetPending(State::Operator(Op::Change)),
-        (None, In::Char('d')) => Dec::SetPending(State::Operator(Op::Delete)),
-        (None, In::Char('y')) => Dec::SetPending(State::Operator(Op::Yank)),
-
-        (Some(State::GoPrefix), In::Char('t')) => Dec::Action(Act::JumpTop),
-        (Some(State::GoPrefix), In::Char('T')) => Dec::Action(Act::JumpBottom),
-        (Some(State::GoPrefix), In::Char('g')) => Dec::Action(Act::JumpNextGitHunk),
-        (Some(State::GoPrefix), In::Char('G')) => Dec::Action(Act::JumpPreviousGitHunk),
-        (Some(State::GoPrefix), In::Char('w')) => {
-            Dec::Action(Act::JumpNextDiagnostic { error_only: false })
-        }
-        (Some(State::GoPrefix), In::Char('W')) => {
-            Dec::Action(Act::JumpPreviousDiagnostic { error_only: false })
-        }
-        (Some(State::GoPrefix), In::Char('e')) => {
-            Dec::Action(Act::JumpNextDiagnostic { error_only: true })
-        }
-        (Some(State::GoPrefix), In::Char('E')) => {
-            Dec::Action(Act::JumpPreviousDiagnostic { error_only: true })
-        }
-        (Some(State::GoPrefix), In::Char('f')) => Dec::Action(Act::RepeatSearch { forward: true }),
-        (Some(State::GoPrefix), In::Char('F')) => Dec::Action(Act::RepeatSearch { forward: false }),
-        (Some(State::GoPrefix), In::Char('d')) => Dec::Action(Act::Goto {
-            kind: super::GotoKind::Definition,
-        }),
-        (Some(State::GoPrefix), In::Char('D')) => Dec::Action(Act::Goto {
-            kind: super::GotoKind::Declaration,
-        }),
-        (Some(State::GoPrefix), In::Char('i')) => Dec::Action(Act::Goto {
-            kind: super::GotoKind::Implementation,
-        }),
-        (Some(State::GoPrefix), In::Char('r')) => Dec::Action(Act::ShowReferences),
-
-        (Some(State::DiagnosticPrefix), In::Char('d')) => Dec::Action(Act::OpenDiagnosticPopup),
-        (Some(State::DiagnosticPrefix), In::Char('w')) => {
-            Dec::Action(Act::OpenDiagnosticList { error_only: false })
-        }
-        (Some(State::DiagnosticPrefix), In::Char('e')) => {
-            Dec::Action(Act::OpenDiagnosticList { error_only: true })
-        }
-        (Some(State::DiagnosticPrefix), In::Char('W')) => {
-            Dec::Action(Act::OpenWorkspaceDiagnosticList { error_only: false })
-        }
-        (Some(State::DiagnosticPrefix), In::Char('E')) => {
-            Dec::Action(Act::OpenWorkspaceDiagnosticList { error_only: true })
-        }
-
-        (Some(State::Find(kind)), In::Char(target)) => {
-            Dec::Action(Act::FindMotion { kind, target })
-        }
-
-        (Some(State::Operator(Op::Change)), In::Char('c')) => Dec::Action(Act::ChangeCurrentLine),
-        (Some(State::Operator(Op::Delete)), In::Char('d')) => Dec::Action(Act::DeleteCurrentLine),
-        (Some(State::Operator(Op::Yank)), In::Char('y')) => Dec::Action(Act::YankCurrentLine),
-        (Some(State::Operator(operator)), In::Char('f')) => {
-            Dec::SetPending(State::OperatorFind(operator, FindKind::Forward))
-        }
-        (Some(State::Operator(operator)), In::Char('F')) => {
-            Dec::SetPending(State::OperatorFind(operator, FindKind::Backward))
-        }
-        (Some(State::Operator(operator)), In::Char('t')) => {
-            Dec::SetPending(State::OperatorFind(operator, FindKind::TillForward))
-        }
-        (Some(State::Operator(operator)), In::Char('T')) => {
-            Dec::SetPending(State::OperatorFind(operator, FindKind::TillBackward))
-        }
-        (Some(State::Operator(operator)), In::Char('i')) => {
-            Dec::Action(Act::OperatorSelectionRange { operator })
-        }
-
-        (Some(State::OperatorFind(operator, find_kind)), In::Char(target)) => {
-            Dec::Action(Act::OperatorFind {
-                operator,
-                find_kind,
-                target,
-            })
-        }
-
-        _ => Dec::Ignore,
-    }
-}
+use super::{
+    App,
+    action::{PendingNormalAction, ReplayableAction},
+    lsp::GotoKind,
+};
 
 impl App {
     /// crossterm Eventを受け取りキーイベントのみを処理する
@@ -284,291 +20,512 @@ impl App {
 
     /// アクティブなUIとモードに応じてキーイベントを適切なハンドラに振り分ける
     fn handle_key_event(&mut self, key_event: KeyEvent) -> Result<bool> {
+        // Popups and special modes take priority
         if self.go_input.active {
             return self.handle_go_input_key(key_event);
         }
-
         if self.rename_input.active {
             return self.handle_rename_input_key(key_event);
         }
-
         if self.hover_popup.active {
             return self.handle_hover_popup_key(key_event);
         }
-
         if self.selection_input.active {
             return self.handle_selection_input_key(key_event);
         }
-
         if self.diagnostic_popup.active {
             return self.handle_diagnostic_popup_key(key_event);
         }
-
         if self.search_input.active {
             return self.handle_search_input_key(key_event);
         }
-
         if self.replace_input.active {
             return self.handle_replace_input_key(key_event);
         }
-
         if self.picker.active {
             return self.handle_picker_key(key_event);
         }
-
         if self.is_terminal_pane_focused() {
             return self.handle_shell_mode_key(key_event);
         }
 
         match self.mode {
-            Mode::Normal => self.handle_normal_mode_key(key_event),
-            Mode::Insert => self.handle_insert_mode_key(key_event),
+            Mode::Normal | Mode::Insert => self.handle_edit_mode_key(key_event),
             Mode::Shell => self.handle_shell_mode_key(key_event),
         }
     }
 
-    /// ノーマルモードのキー入力を状態機械で処理してアクションを実行する
-    fn handle_normal_mode_key(&mut self, key_event: KeyEvent) -> Result<bool> {
-        if key_event.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key_event.code, KeyCode::Char('c'))
-        {
-            if self.workspace.has_documents() && self.workspace.current_document().is_scratch() {
-                self.close_current_buffer();
-            } else {
-                self.pending_normal_action = None;
-            }
+    fn handle_edit_mode_key(&mut self, key_event: KeyEvent) -> Result<bool> {
+        let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key_event.modifiers.contains(KeyModifiers::ALT);
+
+        // Handle c-j prefix state
+        if let Some(PendingNormalAction::JumpPrefix) = self.pending_normal_action {
+            self.pending_normal_action = None;
+            return self.handle_jump_prefix_key(key_event);
+        }
+
+        // Alt+H = toggle hints (global)
+        if alt && !ctrl && matches!(key_event.code, KeyCode::Char('h')) {
+            self.silent = !self.silent;
             return Ok(false);
         }
 
-        if key_event.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key_event.code, KeyCode::Char('j'))
-            && self.workspace.has_documents()
-            && self.workspace.current_document().is_scratch()
-        {
-            self.open_scratch_target_under_cursor()?;
-            return Ok(false);
-        }
-
-        if matches!(key_event.code, KeyCode::Esc)
-            && self.workspace.has_documents()
-            && self.workspace.current_document().is_scratch()
-        {
-            self.close_current_buffer();
-            return Ok(false);
-        }
-
-        if !self.workspace.has_documents() {
-            return match transition_normal_input(None, normalize_normal_input(key_event)) {
-                NormalDecision::Quit => Ok(true),
-                NormalDecision::Action(action) => self.apply_normal_action(action),
-                NormalDecision::SetPending(_) | NormalDecision::Ignore => {
-                    self.pending_normal_action = None;
-                    Ok(false)
+        // Ctrl+Shift combos
+        if ctrl && shift {
+            match key_event.code {
+                KeyCode::Char('w') | KeyCode::Char('W') => return Ok(true), // Quit
+                KeyCode::Enter => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.open_line_above();
+                    }
+                    return Ok(false);
                 }
-            };
+                KeyCode::Left => {
+                    if self.workspace.has_documents() {
+                        self.extend_selection_word_left();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Right => {
+                    if self.workspace.has_documents() {
+                        self.extend_selection_word_right();
+                    }
+                    return Ok(false);
+                }
+                _ => return Ok(false),
+            }
         }
 
-        let decision = transition_normal_input(
-            self.pending_normal_action.take(),
-            normalize_normal_input(key_event),
-        );
-
-        match decision {
-            NormalDecision::Quit => Ok(true),
-            NormalDecision::Ignore => Ok(false),
-            NormalDecision::SetPending(next_state) => {
-                self.pending_normal_action = Some(next_state);
-                Ok(false)
+        // Ctrl+Alt combos
+        if ctrl && alt {
+            match key_event.code {
+                KeyCode::Up => {
+                    if self.workspace.has_documents() {
+                        self.add_extra_cursor_above();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Down => {
+                    if self.workspace.has_documents() {
+                        self.add_extra_cursor_below();
+                    }
+                    return Ok(false);
+                }
+                _ => return Ok(false),
             }
-            NormalDecision::Action(action) => self.apply_normal_action(action),
         }
-    }
 
-    /// NormalActionを対応するApp操作にディスパッチして実行する
-    fn apply_normal_action(&mut self, action: NormalAction) -> Result<bool> {
-        match action {
-            NormalAction::OpenGoInput => self.open_go_input(),
-            NormalAction::OpenPicker => self.open_or_cycle_picker()?,
-            NormalAction::OpenSearch => self.open_or_cycle_search_input(),
-            NormalAction::OpenReplace => self.open_or_cycle_replace_input(),
-            NormalAction::OpenDiagnosticPopup => self.open_current_diagnostic_popup(),
-            NormalAction::OpenDiagnosticList { error_only } => {
-                self.open_diagnostic_list(error_only);
+        // Alt combos (no ctrl)
+        if alt && !ctrl {
+            match key_event.code {
+                KeyCode::Left => {
+                    self.clear_selection();
+                    self.jump_back();
+                    return Ok(false);
+                }
+                KeyCode::Right => {
+                    self.clear_selection();
+                    self.jump_forward();
+                    return Ok(false);
+                }
+                KeyCode::Char('k') | KeyCode::Char('K') => {
+                    if self.workspace.has_documents() {
+                        self.open_hover_popup()?;
+                    }
+                    return Ok(false);
+                }
+                _ => return Ok(false),
             }
-            NormalAction::OpenWorkspaceDiagnosticList { error_only } => {
-                self.request_workspace_diagnostic_list(error_only)?;
+        }
+
+        // Ctrl combos (no shift, no alt)
+        if ctrl && !shift && !alt {
+            match key_event.code {
+                KeyCode::Char('z') => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.extra_cursors.clear();
+                        self.undo_current_document();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('y') => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.extra_cursors.clear();
+                        self.redo_current_document();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('c') => {
+                    if self.workspace.has_documents() {
+                        self.copy_selection_or_line()?;
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('x') => {
+                    if self.workspace.has_documents() {
+                        self.cut_selection_or_line()?;
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('v') => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.extra_cursors.clear();
+                        self.paste_after_cursor()?;
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('a') => {
+                    if self.workspace.has_documents() {
+                        self.select_all();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('d') => {
+                    if self.workspace.has_documents() {
+                        self.select_word_or_next_occurrence()?;
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('q') => {
+                    if self.workspace.has_documents() {
+                        self.toggle_comment()?;
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('s') => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.save_current_document()?;
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('w') => {
+                    self.close_current_buffer();
+                    return Ok(false);
+                }
+                KeyCode::Char('f') => {
+                    self.open_or_cycle_search_input();
+                    return Ok(false);
+                }
+                KeyCode::Char('h') => {
+                    self.open_or_cycle_replace_input();
+                    return Ok(false);
+                }
+                KeyCode::Char('j') => {
+                    if self.workspace.has_documents() {
+                        self.pending_normal_action = Some(PendingNormalAction::JumpPrefix);
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('n') => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.replay_last_action(false)?;
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('p') => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.replay_last_action(true)?;
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('t') => {
+                    self.open_or_cycle_picker()?;
+                    return Ok(false);
+                }
+                KeyCode::Char('g') => {
+                    self.open_go_input();
+                    return Ok(false);
+                }
+                KeyCode::Char('l') => {
+                    self.advance_layout_or_focus();
+                    return Ok(false);
+                }
+                KeyCode::Char('o') => {
+                    self.collapse_to_single_pane();
+                    return Ok(false);
+                }
+                KeyCode::Null | KeyCode::Char(' ') => {
+                    self.toggle_terminal_split()?;
+                    return Ok(false);
+                }
+                KeyCode::Enter => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.extra_cursors.clear();
+                        self.open_line_below();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('m') => {
+                    // c-m = enter (legacy support)
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.insert_newline();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Left => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.close_completion();
+                        self.move_cursor_word_left();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Right => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.close_completion();
+                        self.move_cursor_word_right();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Up => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.page_up_half();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Down => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.page_down_half();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Home => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.jump_to_top();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::End => {
+                    if self.workspace.has_documents() {
+                        self.clear_selection();
+                        self.jump_to_bottom();
+                    }
+                    return Ok(false);
+                }
+                _ => return Ok(false),
             }
-            NormalAction::OpenScratchTarget => {
+        }
+
+        // Non-modifier keys (possibly with Shift)
+        match key_event.code {
+            KeyCode::Esc => {
+                self.close_completion();
+                self.clear_selection();
+                self.extra_cursors.clear();
+                self.pending_normal_action = None;
                 if self.workspace.has_documents() && self.workspace.current_document().is_scratch()
                 {
-                    self.open_scratch_target_under_cursor()?;
+                    self.close_current_buffer();
                 }
+                Ok(false)
             }
-            NormalAction::OpenHoverPopup => {
-                if self.workspace.has_documents() {
-                    self.open_hover_popup()?;
-                }
-            }
-            NormalAction::OpenRenameInput => {
+
+            KeyCode::F(2) => {
                 if self.workspace.has_documents() {
                     self.open_rename_input();
                 }
+                Ok(false)
             }
-            NormalAction::CloseCurrentBuffer => self.close_current_buffer(),
-            NormalAction::AdvanceLayoutOrFocus => self.advance_layout_or_focus(),
-            NormalAction::CollapseToSinglePane => self.collapse_to_single_pane(),
-            NormalAction::ToggleTerminalSplit => self.toggle_terminal_split()?,
-            NormalAction::Save => {
+
+            KeyCode::Up => {
+                self.close_completion();
                 if self.workspace.has_documents() {
-                    self.save_current_document()?;
+                    if shift {
+                        self.extend_selection_up();
+                    } else {
+                        self.clear_selection();
+                        self.move_cursor_up();
+                    }
                 }
+                Ok(false)
             }
-            NormalAction::EnterInsertAppend => {
+            KeyCode::Down => {
+                self.close_completion();
                 if self.workspace.has_documents() {
-                    self.workspace.current_document_mut().begin_undo_group();
-                    self.mode = Mode::Insert;
-                    self.pending_insert_j = None;
-                    self.move_cursor_right();
-                    self.clamp_vertical_state();
+                    if shift {
+                        self.extend_selection_down();
+                    } else {
+                        self.clear_selection();
+                        self.move_cursor_down();
+                    }
                 }
+                Ok(false)
             }
-            NormalAction::EnterInsertAtCursor => {
+            KeyCode::Left => {
+                self.close_completion();
                 if self.workspace.has_documents() {
-                    self.workspace.current_document_mut().begin_undo_group();
-                    self.mode = Mode::Insert;
-                    self.pending_insert_j = None;
+                    if shift {
+                        self.extend_selection_left();
+                    } else {
+                        self.clear_selection();
+                        self.move_cursor_left();
+                    }
                 }
+                Ok(false)
             }
-            NormalAction::JumpBack => self.jump_back(),
-            NormalAction::JumpForward => self.jump_forward(),
-            NormalAction::PageDownHalf => {
+            KeyCode::Right => {
+                self.close_completion();
                 if self.workspace.has_documents() {
-                    self.page_down_half();
+                    if shift {
+                        self.extend_selection_right();
+                    } else {
+                        self.clear_selection();
+                        self.move_cursor_right();
+                    }
                 }
+                Ok(false)
             }
-            NormalAction::PageUpHalf => {
+            KeyCode::Home => {
+                self.close_completion();
                 if self.workspace.has_documents() {
-                    self.page_up_half();
+                    if shift {
+                        self.extend_selection_to_line_start();
+                    } else {
+                        self.clear_selection();
+                        self.move_cursor_to_line_start();
+                    }
                 }
+                Ok(false)
             }
-            NormalAction::MoveUp => {
+            KeyCode::End => {
+                self.close_completion();
                 if self.workspace.has_documents() {
-                    self.move_cursor_up();
+                    if shift {
+                        self.extend_selection_to_line_end();
+                    } else {
+                        self.clear_selection();
+                        self.move_cursor_to_line_end();
+                    }
                 }
+                Ok(false)
             }
-            NormalAction::MoveLeft => {
+
+            KeyCode::Enter => {
                 if self.workspace.has_documents() {
-                    self.move_cursor_left();
+                    self.delete_selection_if_any()?;
+                    self.insert_newline_for_all_cursors();
                 }
+                Ok(false)
             }
-            NormalAction::MoveDown => {
+
+            KeyCode::Tab => {
+                if !self.submit_completion() {
+                    self.close_completion();
+                    if self.workspace.has_documents() {
+                        self.delete_selection_if_any()?;
+                        self.insert_tab();
+                    }
+                }
+                Ok(false)
+            }
+
+            KeyCode::BackTab => {
+                // Shift+Tab = close completion for now
+                self.close_completion();
+                Ok(false)
+            }
+
+            KeyCode::Backspace => {
                 if self.workspace.has_documents() {
-                    self.move_cursor_down();
+                    if self.selection_anchor.is_some() {
+                        self.delete_selection()?;
+                    } else {
+                        self.backspace_char_for_all_cursors();
+                    }
                 }
+                Ok(false)
             }
-            NormalAction::MoveRight => {
+
+            KeyCode::Delete => {
                 if self.workspace.has_documents() {
-                    self.move_cursor_right();
+                    if self.selection_anchor.is_some() {
+                        self.delete_selection()?;
+                    } else {
+                        self.delete_forward_char();
+                    }
                 }
+                Ok(false)
             }
-            NormalAction::MoveToLineStart => {
+
+            KeyCode::Char(ch) => {
                 if self.workspace.has_documents() {
-                    self.move_cursor_to_line_start();
+                    self.delete_selection_if_any()?;
+                    self.insert_char_for_all_cursors(ch);
                 }
+                Ok(false)
             }
-            NormalAction::MoveToLineEnd => {
-                if self.workspace.has_documents() {
-                    self.move_cursor_to_line_end();
-                }
+
+            _ => Ok(false),
+        }
+    }
+
+    fn handle_jump_prefix_key(&mut self, key_event: KeyEvent) -> Result<bool> {
+        match key_event.code {
+            KeyCode::Char('d') => {
+                self.goto_symbol(GotoKind::Definition)?;
             }
-            NormalAction::JumpMatchingBracket => {
-                if self.workspace.has_documents() {
-                    self.jump_to_matching_bracket();
-                }
+            KeyCode::Char('i') => {
+                self.goto_symbol(GotoKind::Implementation)?;
             }
-            NormalAction::OpenLineBelow => {
-                if self.workspace.has_documents() {
-                    self.open_line_below();
-                }
+            KeyCode::Char('r') => {
+                self.show_references()?;
             }
-            NormalAction::Paste => {
-                if self.workspace.has_documents() {
-                    self.paste_after_cursor()?;
-                }
+            KeyCode::Char('D') => {
+                self.goto_symbol(GotoKind::Declaration)?;
             }
-            NormalAction::PasteBefore => {
-                if self.workspace.has_documents() {
-                    self.paste_before_cursor()?;
-                }
+            KeyCode::Char('e') => {
+                self.open_current_diagnostic_popup();
             }
-            NormalAction::Replay { reverse } => {
-                if self.workspace.has_documents() {
-                    self.replay_last_action(reverse)?;
-                }
+            KeyCode::Char('w') => {
+                self.jump_to_next_diagnostic(false);
             }
-            NormalAction::Undo => {
-                if self.workspace.has_documents() {
-                    self.undo_current_document();
-                }
+            KeyCode::Char('W') => {
+                self.jump_to_previous_diagnostic(false);
             }
-            NormalAction::Redo => {
-                if self.workspace.has_documents() {
-                    self.redo_current_document();
-                }
+            KeyCode::Char('n') => {
+                self.jump_to_next_diagnostic(true);
             }
-            NormalAction::JumpTop => self.jump_to_top(),
-            NormalAction::JumpBottom => self.jump_to_bottom(),
-            NormalAction::JumpNextGitHunk => {
+            KeyCode::Char('N') => {
+                self.jump_to_previous_diagnostic(true);
+            }
+            KeyCode::Char('g') => {
                 self.jump_to_next_git_marker();
                 self.last_replayable_action = Some(ReplayableAction::GitHunk { forward: true });
             }
-            NormalAction::JumpPreviousGitHunk => {
+            KeyCode::Char('G') => {
                 self.jump_to_previous_git_marker();
                 self.last_replayable_action = Some(ReplayableAction::GitHunk { forward: false });
             }
-            NormalAction::JumpNextDiagnostic { error_only } => {
-                self.jump_to_next_diagnostic(error_only);
+            KeyCode::Char('t') => {
+                self.jump_to_top();
             }
-            NormalAction::JumpPreviousDiagnostic { error_only } => {
-                self.jump_to_previous_diagnostic(error_only);
+            KeyCode::Char('b') => {
+                self.jump_to_bottom();
             }
-            NormalAction::RepeatSearch { forward } => {
-                if forward {
-                    self.repeat_search_forward()?;
-                } else {
-                    self.repeat_search_backward()?;
-                }
+            KeyCode::Char('f') => {
+                self.repeat_search_forward()?;
             }
-            NormalAction::Goto { kind } => {
-                self.goto_symbol(kind)?;
+            KeyCode::Char('F') => {
+                self.repeat_search_backward()?;
             }
-            NormalAction::ShowReferences => {
-                self.show_references()?;
-            }
-            NormalAction::FindMotion { kind, target } => {
-                self.run_find_motion(kind, target)?;
-            }
-            NormalAction::OperatorFind {
-                operator,
-                find_kind,
-                target,
-            } => {
-                self.run_operator_find(operator, find_kind, target)?;
-            }
-            NormalAction::OperatorSelectionRange { operator } => {
-                self.request_selection_range_operator(operator)?;
-            }
-            NormalAction::ChangeCurrentLine => {
-                self.change_current_line()?;
-            }
-            NormalAction::DeleteCurrentLine => {
-                self.delete_current_line()?;
-            }
-            NormalAction::YankCurrentLine => {
-                self.yank_current_line()?;
-            }
+            KeyCode::Esc => {} // cancel
+            _ => {}            // ignore unknown
         }
-
         Ok(false)
     }
 
@@ -662,28 +619,6 @@ impl App {
 
     /// 検索入力中のキー入力を処理する
     fn handle_search_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
-        if key_event.modifiers.contains(KeyModifiers::ALT) {
-            match key_event.code {
-                KeyCode::Char('c') => {
-                    self.search_input.options.case_sensitive =
-                        !self.search_input.options.case_sensitive;
-                    self.incremental_search_current_file();
-                    return Ok(false);
-                }
-                KeyCode::Char('w') => {
-                    self.search_input.options.whole_word = !self.search_input.options.whole_word;
-                    self.incremental_search_current_file();
-                    return Ok(false);
-                }
-                KeyCode::Char('r') => {
-                    self.search_input.options.use_regex = !self.search_input.options.use_regex;
-                    self.incremental_search_current_file();
-                    return Ok(false);
-                }
-                _ => {}
-            }
-        }
-
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
         {
@@ -695,7 +630,6 @@ impl App {
             && matches!(key_event.code, KeyCode::Char('f'))
         {
             self.cycle_search_scope();
-            self.incremental_search_current_file();
             return Ok(false);
         }
 
@@ -717,7 +651,6 @@ impl App {
             && matches!(key_event.code, KeyCode::Char('h'))
         {
             self.search_input.value.pop();
-            self.incremental_search_current_file();
             return Ok(false);
         }
 
@@ -732,12 +665,10 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.search_input.value.pop();
-                self.incremental_search_current_file();
                 Ok(false)
             }
             KeyCode::Char(ch) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.search_input.value.push(ch);
-                self.incremental_search_current_file();
                 Ok(false)
             }
             _ => Ok(false),
@@ -746,25 +677,6 @@ impl App {
 
     /// 置換入力中のキー入力を処理する
     fn handle_replace_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
-        if key_event.modifiers.contains(KeyModifiers::ALT) {
-            match key_event.code {
-                KeyCode::Char('c') => {
-                    self.replace_input.options.case_sensitive =
-                        !self.replace_input.options.case_sensitive;
-                    return Ok(false);
-                }
-                KeyCode::Char('w') => {
-                    self.replace_input.options.whole_word = !self.replace_input.options.whole_word;
-                    return Ok(false);
-                }
-                KeyCode::Char('r') => {
-                    self.replace_input.options.use_regex = !self.replace_input.options.use_regex;
-                    return Ok(false);
-                }
-                _ => {}
-            }
-        }
-
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
         {
@@ -808,145 +720,6 @@ impl App {
                 Ok(false)
             }
             _ => Ok(false),
-        }
-    }
-
-    /// インサートモードのキー入力を処理する
-    fn handle_insert_mode_key(&mut self, key_event: KeyEvent) -> Result<bool> {
-        if key_event.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key_event.code, KeyCode::Char('c'))
-        {
-            self.close_completion();
-            self.leave_insert_mode(false);
-            return Ok(false);
-        }
-
-        if key_event.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key_event.code, KeyCode::Char('s'))
-        {
-            self.save_current_document()?;
-            self.leave_insert_mode(false);
-            return Ok(false);
-        }
-
-        if key_event.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key_event.code, KeyCode::Char('h'))
-        {
-            self.backspace_char();
-            self.pending_insert_j = None;
-            return Ok(false);
-        }
-
-        if key_event.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key_event.code, KeyCode::Char('d'))
-        {
-            self.delete_forward_char();
-            self.pending_insert_j = None;
-            return Ok(false);
-        }
-
-        if key_event.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key_event.code, KeyCode::Char('j'))
-        {
-            self.insert_newline();
-            self.pending_insert_j = None;
-            return Ok(false);
-        }
-
-        match key_event.code {
-            KeyCode::Esc => {
-                self.close_completion();
-                self.leave_insert_mode(false);
-                Ok(false)
-            }
-            KeyCode::Up => {
-                self.close_completion();
-                self.move_cursor_up();
-                self.pending_insert_j = None;
-                Ok(false)
-            }
-            KeyCode::Left => {
-                self.close_completion();
-                self.move_cursor_left();
-                self.pending_insert_j = None;
-                Ok(false)
-            }
-            KeyCode::Down => {
-                self.close_completion();
-                self.move_cursor_down();
-                self.pending_insert_j = None;
-                Ok(false)
-            }
-            KeyCode::Right => {
-                self.close_completion();
-                self.move_cursor_right();
-                self.pending_insert_j = None;
-                Ok(false)
-            }
-            KeyCode::Home => {
-                self.close_completion();
-                self.move_cursor_to_line_start();
-                self.pending_insert_j = None;
-                Ok(false)
-            }
-            KeyCode::End => {
-                self.close_completion();
-                self.move_cursor_to_line_end();
-                self.pending_insert_j = None;
-                Ok(false)
-            }
-            KeyCode::Char('j') => {
-                let now = Instant::now();
-                if self.pending_insert_j.is_some_and(|previous| {
-                    now.duration_since(previous) <= super::insert_escape_timeout()
-                }) {
-                    self.backspace_char();
-                    self.close_completion();
-                    self.leave_insert_mode(false);
-                } else {
-                    self.insert_char('j');
-                    self.pending_insert_j = Some(now);
-                }
-                Ok(false)
-            }
-            KeyCode::Char('m') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert_newline();
-                self.pending_insert_j = None;
-                Ok(false)
-            }
-            KeyCode::Enter => {
-                self.insert_newline();
-                self.pending_insert_j = None;
-                Ok(false)
-            }
-            KeyCode::Char(ch) => {
-                self.insert_char(ch);
-                self.pending_insert_j = None;
-                Ok(false)
-            }
-            KeyCode::Tab => {
-                if !self.submit_completion() {
-                    self.close_completion();
-                    self.insert_tab();
-                }
-                self.pending_insert_j = None;
-                Ok(false)
-            }
-            KeyCode::Backspace => {
-                self.backspace_char();
-                self.pending_insert_j = None;
-                Ok(false)
-            }
-            KeyCode::Delete => {
-                self.delete_forward_char();
-                self.pending_insert_j = None;
-                Ok(false)
-            }
-            _ => {
-                self.close_completion();
-                self.pending_insert_j = None;
-                Ok(false)
-            }
         }
     }
 

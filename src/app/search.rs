@@ -36,7 +36,7 @@ impl App {
         };
     }
 
-    /// 入力中のクエリで現在ファイルをインクリメンタル検索し、最初のマッチへカーソルを移動する
+    #[allow(dead_code)]
     pub(super) fn incremental_search_current_file(&mut self) {
         if !self.search_input.active
             || self.search_input.scope != super::SearchScope::CurrentFile

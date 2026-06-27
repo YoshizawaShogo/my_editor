@@ -1,50 +1,59 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 
-#[derive(Deserialize, Clone, Debug)]
-pub struct LanguageEntry {
-    pub extension: String,
-    pub lsp_command: Option<String>,
-    #[serde(default)]
-    pub lsp_args: Vec<String>,
-    pub lsp_init_options: Option<serde_json::Value>,
-}
-
+/// ~/.my_editor_rc.toml の内容
+///
+/// ```toml
+/// [get_lang]
+/// rs = "rust"
+/// ts = "typescript"
+///
+/// [lang_lsp_map]
+/// rust = "rust-analyzer"
+/// typescript = "typescript-language-server --stdio"
+/// ```
 #[derive(Deserialize, Default)]
-struct LanguageConfigFile {
+struct RcFile {
     #[serde(default)]
-    language: Vec<LanguageEntry>,
+    get_lang: HashMap<String, String>,
+    #[serde(default)]
+    lang_lsp_map: HashMap<String, String>,
 }
 
-/// 設定ファイルのパス: ~/.config/my_editor/languages.toml
-fn config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/my_editor/languages.toml"))
+pub struct EditorRc {
+    get_lang: HashMap<String, String>,
+    lang_lsp_map: HashMap<String, String>,
 }
 
-/// 設定ファイルを読む。存在しなければ組み込みデフォルト（rs → rust-analyzer）を返す。
-pub fn load_language_config() -> Vec<LanguageEntry> {
-    if let Some(path) = config_path()
-        && let Ok(contents) = std::fs::read_to_string(&path)
-        && let Ok(file) = toml::from_str::<LanguageConfigFile>(&contents)
-    {
-        return file.language;
+impl EditorRc {
+    pub fn load() -> Self {
+        let rc = rc_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| toml::from_str::<RcFile>(&s).ok())
+            .unwrap_or_default();
+        Self {
+            get_lang: rc.get_lang,
+            lang_lsp_map: rc.lang_lsp_map,
+        }
     }
-    default_language_config()
+
+    /// パスの拡張子から LSP コマンドと引数を返す
+    pub fn lsp_for_path(&self, path: &Path) -> Option<(String, Vec<String>)> {
+        let ext = path.extension()?.to_str()?;
+        let lang = self.get_lang.get(ext)?;
+        let command_line = self.lang_lsp_map.get(lang)?;
+        let mut parts = command_line.split_whitespace();
+        let cmd = parts.next()?.to_owned();
+        let args = parts.map(str::to_owned).collect();
+        Some((cmd, args))
+    }
 }
 
-fn default_language_config() -> Vec<LanguageEntry> {
-    vec![LanguageEntry {
-        extension: "rs".to_owned(),
-        lsp_command: Some("rust-analyzer".to_owned()),
-        lsp_args: vec![],
-        lsp_init_options: None,
-    }]
-}
-
-/// 拡張子でマッチする LanguageEntry を返す
-pub fn detect_language<'a>(path: &Path, config: &'a [LanguageEntry]) -> Option<&'a LanguageEntry> {
-    let ext = path.extension()?.to_str()?;
-    config.iter().find(|e| e.extension == ext)
+fn rc_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".my_editor_rc.toml"))
 }

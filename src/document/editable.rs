@@ -4,6 +4,7 @@ use std::{
     io::BufWriter,
     path::{Path, PathBuf},
     process::Command,
+    time::SystemTime,
 };
 
 use lsp_types::{Position, TextEdit};
@@ -26,6 +27,8 @@ pub struct EditableDocument {
     pub redo_stack: Vec<Rope>,
     pub undo_group_active: bool,
     pub undo_group_snapshot_taken: bool,
+    pub disk_mtime: Option<SystemTime>,
+    pub is_dirty: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,6 +70,7 @@ impl EditableDocument {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         let rope = Rope::from_reader(file)?;
+        let disk_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
         Ok(Self {
             path: path.to_path_buf(),
             indent_width: detect_indent_width(&rope),
@@ -79,7 +83,22 @@ impl EditableDocument {
             redo_stack: Vec::new(),
             undo_group_active: false,
             undo_group_snapshot_taken: false,
+            disk_mtime,
+            is_dirty: false,
         })
+    }
+
+    pub fn reload(&mut self) -> Result<()> {
+        let file = File::open(&self.path)?;
+        self.rope = Rope::from_reader(file)?;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.is_dirty = false;
+        self.disk_mtime = std::fs::metadata(&self.path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        self.reload_git_gutter_markers();
+        Ok(())
     }
 
     pub fn begin_undo_group(&mut self) {
@@ -167,6 +186,8 @@ impl EditableDocument {
         let writer = BufWriter::new(file);
         self.rope.write_to(writer)?;
         self.reload_git_gutter_markers();
+        self.disk_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        self.is_dirty = false;
         Ok(())
     }
 
@@ -691,6 +712,7 @@ impl EditableDocument {
             })
     }
 
+    #[allow(dead_code)]
     pub fn clear_current_line(
         &mut self,
         display_row: usize,
@@ -924,6 +946,7 @@ impl EditableDocument {
             self.undo_group_snapshot_taken = true;
         }
 
+        self.is_dirty = true;
         self.undo_stack.push(self.rope.clone());
         self.redo_stack.clear();
     }
@@ -978,6 +1001,36 @@ impl EditableDocument {
         }
 
         None
+    }
+
+    pub fn text_for_display_range(
+        &self,
+        start_row: usize,
+        start_column: usize,
+        end_row: usize,
+        end_column: usize,
+        page_width: usize,
+    ) -> String {
+        let page_width = page_width.max(1);
+        let start_char_idx =
+            self.char_index_for_display_position(start_row, start_column, page_width);
+        let end_char_idx = self.char_index_for_display_position(end_row, end_column, page_width);
+        if end_char_idx <= start_char_idx {
+            return String::new();
+        }
+        self.rope.slice(start_char_idx..end_char_idx).to_string()
+    }
+
+    pub fn replace_line_display(&mut self, display_row: usize, new_text: &str, page_width: usize) {
+        let page_width = page_width.max(1);
+        let line_start = self.char_index_for_display_position(display_row, 0, page_width);
+        let line_width = self.display_line_width(display_row, page_width);
+        let line_end = self.char_index_for_display_position(display_row, line_width, page_width);
+        self.push_undo_snapshot();
+        self.rope.remove(line_start..line_end);
+        self.rope.insert(line_start, new_text);
+        self.clear_semantic_tokens();
+        self.reload_git_gutter_markers();
     }
 }
 
