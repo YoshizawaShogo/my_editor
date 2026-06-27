@@ -1,4 +1,3 @@
-/*
 use std::collections::HashMap;
 
 use lsp_types::{SemanticToken, SemanticTokens};
@@ -108,14 +107,8 @@ pub fn map_semantic_kind(kind: &str) -> Option<SyntaxHighlightKind> {
             SyntaxHighlightKind::String
         }
         "comment" => SyntaxHighlightKind::Comment,
-        "type"
-        | "struct"
-        | "enum"
-        | "interface"
-        | "typeParameter"
-        | "typeAlias"
-        | "builtinType"
-        | "selfType" => SyntaxHighlightKind::Type,
+        "type" | "struct" | "enum" | "interface" | "typeParameter" | "typeAlias"
+        | "builtinType" | "selfType" => SyntaxHighlightKind::Type,
         "function" | "method" => SyntaxHighlightKind::Function,
         "variable" => SyntaxHighlightKind::Variable,
         "parameter" | "lifetime" => SyntaxHighlightKind::Parameter,
@@ -227,4 +220,3 @@ mod tests {
         assert!(matches!(line1[1].kind, SyntaxHighlightKind::Variable));
     }
 }
-*/

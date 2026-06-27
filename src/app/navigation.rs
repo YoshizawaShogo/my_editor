@@ -1,4 +1,3 @@
-/*
 use crossterm::terminal;
 
 use super::{App, ReplayableAction};
@@ -7,7 +6,10 @@ impl App {
     /// 現在のカーソル位置をJumpPositionとして構築して返す
     fn current_jump_position(&self) -> super::JumpPosition {
         super::JumpPosition {
-            path: self.workspace.current_document_path().map(|path| path.to_path_buf()),
+            path: self
+                .workspace
+                .current_document_path()
+                .map(|path| path.to_path_buf()),
             row: self.cursor.row,
             column: self.cursor.column,
             viewport_row: self.viewport_row,
@@ -124,19 +126,9 @@ impl App {
         self.scroll_down(self.page_step() / 2);
     }
 
-    /// 1ページ分だけ下にスクロールする
-    pub(super) fn page_down_full(&mut self) {
-        self.scroll_down(self.page_step());
-    }
-
     /// 半ページ分だけ上にスクロールする
     pub(super) fn page_up_half(&mut self) {
         self.scroll_up(self.page_step() / 2);
-    }
-
-    /// 1ページ分だけ上にスクロールする
-    pub(super) fn page_up_full(&mut self) {
-        self.scroll_up(self.page_step());
     }
 
     /// ビューポートを指定ステップ数だけ下にスクロールし、カーソルを追随させる
@@ -155,10 +147,10 @@ impl App {
         self.viewport_row = self.viewport_row.saturating_sub(step.max(1));
         self.clamp_to_document_bounds();
         if self.viewport_row < previous_viewport_row {
-            self.cursor.row = self
-                .cursor
-                .row
-                .min(self.viewport_row.saturating_add(self.page_step().saturating_sub(1)));
+            self.cursor.row = self.cursor.row.min(
+                self.viewport_row
+                    .saturating_add(self.page_step().saturating_sub(1)),
+            );
         }
     }
 
@@ -242,11 +234,7 @@ impl App {
             return;
         }
 
-        let Some(total_rows) = self
-            .workspace
-            .current_document()
-            .total_rows(page_width)
-        else {
+        let Some(total_rows) = self.workspace.current_document().total_rows(page_width) else {
             return;
         };
 
@@ -268,9 +256,13 @@ impl App {
     fn jump_to_git_marker(&mut self, forward: bool) {
         let page_width = self.current_page_width();
         let row = if forward {
-            self.workspace.current_document().next_git_marker_row(self.cursor.row, page_width)
+            self.workspace
+                .current_document()
+                .next_git_marker_row(self.cursor.row, page_width)
         } else {
-            self.workspace.current_document().previous_git_marker_row(self.cursor.row, page_width)
+            self.workspace
+                .current_document()
+                .previous_git_marker_row(self.cursor.row, page_width)
         };
         if let Some(row) = row {
             self.push_jump_history();
@@ -292,14 +284,25 @@ impl App {
     fn jump_to_diagnostic(&mut self, error_only: bool, forward: bool) {
         let page_width = self.current_page_width();
         let row = if forward {
-            self.workspace.current_document().next_diagnostic_row(self.cursor.row, page_width, error_only)
+            self.workspace.current_document().next_diagnostic_row(
+                self.cursor.row,
+                page_width,
+                error_only,
+            )
         } else {
-            self.workspace.current_document().previous_diagnostic_row(self.cursor.row, page_width, error_only)
+            self.workspace.current_document().previous_diagnostic_row(
+                self.cursor.row,
+                page_width,
+                error_only,
+            )
         };
         if let Some(row) = row {
             self.push_jump_history();
             self.jump_with_context(row, page_width);
-            self.last_replayable_action = Some(ReplayableAction::Diagnostic { error_only, forward });
+            self.last_replayable_action = Some(ReplayableAction::Diagnostic {
+                error_only,
+                forward,
+            });
         }
     }
 
@@ -321,4 +324,3 @@ impl App {
         self.clamp_cursor_column_to_current_line();
     }
 }
-*/

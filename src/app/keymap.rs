@@ -1,4 +1,3 @@
-/*
 use std::time::Instant;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -36,8 +35,12 @@ enum NormalAction {
     OpenSearch,
     OpenReplace,
     OpenDiagnosticPopup,
-    OpenDiagnosticList { error_only: bool },
-    OpenWorkspaceDiagnosticList { error_only: bool },
+    OpenDiagnosticList {
+        error_only: bool,
+    },
+    OpenWorkspaceDiagnosticList {
+        error_only: bool,
+    },
     OpenScratchTarget,
     OpenHoverPopup,
     OpenRenameInput,
@@ -62,19 +65,32 @@ enum NormalAction {
     OpenLineBelow,
     Paste,
     PasteBefore,
-    Replay { reverse: bool },
+    Replay {
+        reverse: bool,
+    },
     Undo,
     Redo,
     JumpTop,
     JumpBottom,
     JumpNextGitHunk,
     JumpPreviousGitHunk,
-    JumpNextDiagnostic { error_only: bool },
-    JumpPreviousDiagnostic { error_only: bool },
-    RepeatSearch { forward: bool },
-    Goto { kind: super::GotoKind },
+    JumpNextDiagnostic {
+        error_only: bool,
+    },
+    JumpPreviousDiagnostic {
+        error_only: bool,
+    },
+    RepeatSearch {
+        forward: bool,
+    },
+    Goto {
+        kind: super::GotoKind,
+    },
     ShowReferences,
-    FindMotion { kind: FindKind, target: char },
+    FindMotion {
+        kind: FindKind,
+        target: char,
+    },
     OperatorFind {
         operator: PendingOperator,
         find_kind: FindKind,
@@ -129,7 +145,7 @@ fn transition_normal_input(
         (_, In::Ctrl('q')) => Dec::Quit,
         (None, In::Ctrl('j')) => Dec::Action(Act::OpenScratchTarget),
         (None, In::Ctrl('g')) => Dec::Action(Act::OpenGoInput),
-        (None, In::Ctrl('p')) => Dec::Action(Act::OpenPicker),
+        (None, In::Ctrl('t')) => Dec::Action(Act::OpenPicker),
         (None, In::Ctrl('f')) => Dec::Action(Act::OpenSearch),
         (None, In::Ctrl('h')) => Dec::Action(Act::OpenReplace),
         (None, In::Ctrl('w')) => Dec::Action(Act::CloseCurrentBuffer),
@@ -196,15 +212,15 @@ fn transition_normal_input(
         }
         (Some(State::GoPrefix), In::Char('f')) => Dec::Action(Act::RepeatSearch { forward: true }),
         (Some(State::GoPrefix), In::Char('F')) => Dec::Action(Act::RepeatSearch { forward: false }),
-        (Some(State::GoPrefix), In::Char('d')) => {
-            Dec::Action(Act::Goto { kind: super::GotoKind::Definition })
-        }
-        (Some(State::GoPrefix), In::Char('D')) => {
-            Dec::Action(Act::Goto { kind: super::GotoKind::Declaration })
-        }
-        (Some(State::GoPrefix), In::Char('i')) => {
-            Dec::Action(Act::Goto { kind: super::GotoKind::Implementation })
-        }
+        (Some(State::GoPrefix), In::Char('d')) => Dec::Action(Act::Goto {
+            kind: super::GotoKind::Definition,
+        }),
+        (Some(State::GoPrefix), In::Char('D')) => Dec::Action(Act::Goto {
+            kind: super::GotoKind::Declaration,
+        }),
+        (Some(State::GoPrefix), In::Char('i')) => Dec::Action(Act::Goto {
+            kind: super::GotoKind::Implementation,
+        }),
         (Some(State::GoPrefix), In::Char('r')) => Dec::Action(Act::ShowReferences),
 
         (Some(State::DiagnosticPrefix), In::Char('d')) => Dec::Action(Act::OpenDiagnosticPopup),
@@ -383,7 +399,8 @@ impl App {
                 self.request_workspace_diagnostic_list(error_only)?;
             }
             NormalAction::OpenScratchTarget => {
-                if self.workspace.has_documents() && self.workspace.current_document().is_scratch() {
+                if self.workspace.has_documents() && self.workspace.current_document().is_scratch()
+                {
                     self.open_scratch_target_under_cursor()?;
                 }
             }
@@ -588,7 +605,7 @@ impl App {
             _ => {
                 self.close_diagnostic_popup();
                 Ok(false)
-            },
+            }
         }
     }
 
@@ -645,6 +662,28 @@ impl App {
 
     /// 検索入力中のキー入力を処理する
     fn handle_search_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
+        if key_event.modifiers.contains(KeyModifiers::ALT) {
+            match key_event.code {
+                KeyCode::Char('c') => {
+                    self.search_input.options.case_sensitive =
+                        !self.search_input.options.case_sensitive;
+                    self.incremental_search_current_file();
+                    return Ok(false);
+                }
+                KeyCode::Char('w') => {
+                    self.search_input.options.whole_word = !self.search_input.options.whole_word;
+                    self.incremental_search_current_file();
+                    return Ok(false);
+                }
+                KeyCode::Char('r') => {
+                    self.search_input.options.use_regex = !self.search_input.options.use_regex;
+                    self.incremental_search_current_file();
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
         {
@@ -707,6 +746,25 @@ impl App {
 
     /// 置換入力中のキー入力を処理する
     fn handle_replace_input_key(&mut self, key_event: KeyEvent) -> Result<bool> {
+        if key_event.modifiers.contains(KeyModifiers::ALT) {
+            match key_event.code {
+                KeyCode::Char('c') => {
+                    self.replace_input.options.case_sensitive =
+                        !self.replace_input.options.case_sensitive;
+                    return Ok(false);
+                }
+                KeyCode::Char('w') => {
+                    self.replace_input.options.whole_word = !self.replace_input.options.whole_word;
+                    return Ok(false);
+                }
+                KeyCode::Char('r') => {
+                    self.replace_input.options.use_regex = !self.replace_input.options.use_regex;
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c'))
         {
@@ -839,10 +897,9 @@ impl App {
             }
             KeyCode::Char('j') => {
                 let now = Instant::now();
-                if self
-                    .pending_insert_j
-                    .is_some_and(|previous| now.duration_since(previous) <= super::insert_escape_timeout())
-                {
+                if self.pending_insert_j.is_some_and(|previous| {
+                    now.duration_since(previous) <= super::insert_escape_timeout()
+                }) {
                     self.backspace_char();
                     self.close_completion();
                     self.leave_insert_mode(false);
@@ -903,7 +960,7 @@ impl App {
         }
 
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key_event.code, KeyCode::Char('p'))
+            && matches!(key_event.code, KeyCode::Char('t'))
         {
             self.close_picker();
             return Ok(false);
@@ -1036,4 +1093,3 @@ impl App {
         }
     }
 }
-*/

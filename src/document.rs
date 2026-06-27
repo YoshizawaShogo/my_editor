@@ -1,4 +1,3 @@
-/*
 use std::{fs, path::Path};
 
 use lsp_types::{Position, TextEdit};
@@ -99,13 +98,21 @@ impl Document {
     }
 
     /// ドキュメント末尾にジャンプし、表示開始行を返す（Editable は行ベース管理のため None）
-    pub fn jump_to_bottom(&mut self, page_height: usize, page_width: usize) -> Result<Option<usize>> {
+    pub fn jump_to_bottom(
+        &mut self,
+        page_height: usize,
+        page_width: usize,
+    ) -> Result<Option<usize>> {
         let content_width = content_width_for_page(page_width);
 
         match self {
             Self::Editable(_) => Ok(None),
-            Self::LargeFile(document) => Ok(Some(document.jump_to_bottom(page_height, content_width)?)),
-            Self::Scratch(document) => Ok(Some(document.total_rows().saturating_sub(page_height.max(1)))),
+            Self::LargeFile(document) => {
+                Ok(Some(document.jump_to_bottom(page_height, content_width)?))
+            }
+            Self::Scratch(document) => Ok(Some(
+                document.total_rows().saturating_sub(page_height.max(1)),
+            )),
         }
     }
 
@@ -155,12 +162,9 @@ impl Document {
         let content_width = content_width_for_page(page_width);
 
         match self {
-            Self::Editable(document) => Some(document.insert_char(
-                display_row,
-                display_column,
-                content_width.max(1),
-                ch,
-            )),
+            Self::Editable(document) => {
+                Some(document.insert_char(display_row, display_column, content_width.max(1), ch))
+            }
             Self::LargeFile(_) => None,
             Self::Scratch(_) => None,
         }
@@ -175,11 +179,9 @@ impl Document {
         let content_width = content_width_for_page(page_width);
 
         match self {
-            Self::Editable(document) => Some(document.insert_newline(
-                display_row,
-                display_column,
-                content_width.max(1),
-            )),
+            Self::Editable(document) => {
+                Some(document.insert_newline(display_row, display_column, content_width.max(1)))
+            }
             Self::LargeFile(_) => None,
             Self::Scratch(_) => None,
         }
@@ -194,11 +196,9 @@ impl Document {
         let content_width = content_width_for_page(page_width);
 
         match self {
-            Self::Editable(document) => document.backspace(
-                display_row,
-                display_column,
-                content_width.max(1),
-            ),
+            Self::Editable(document) => {
+                document.backspace(display_row, display_column, content_width.max(1))
+            }
             Self::LargeFile(_) => None,
             Self::Scratch(_) => None,
         }
@@ -213,11 +213,9 @@ impl Document {
         let content_width = content_width_for_page(page_width);
 
         match self {
-            Self::Editable(document) => Some(document.insert_tab(
-                display_row,
-                display_column,
-                content_width.max(1),
-            )),
+            Self::Editable(document) => {
+                Some(document.insert_tab(display_row, display_column, content_width.max(1)))
+            }
             Self::LargeFile(_) => None,
             Self::Scratch(_) => None,
         }
@@ -232,11 +230,9 @@ impl Document {
         let content_width = content_width_for_page(page_width);
 
         match self {
-            Self::Editable(document) => document.delete_forward(
-                display_row,
-                display_column,
-                content_width.max(1),
-            ),
+            Self::Editable(document) => {
+                document.delete_forward(display_row, display_column, content_width.max(1))
+            }
             Self::LargeFile(_) => None,
             Self::Scratch(_) => None,
         }
@@ -246,7 +242,9 @@ impl Document {
         let content_width = content_width_for_page(page_width);
 
         match self {
-            Self::Editable(document) => document.next_git_marker_row(current_row, content_width.max(1)),
+            Self::Editable(document) => {
+                document.next_git_marker_row(current_row, content_width.max(1))
+            }
             Self::LargeFile(_) => None,
             Self::Scratch(_) => None,
         }
@@ -328,7 +326,9 @@ impl Document {
         let content_width = content_width_for_page(page_width);
 
         match self {
-            Self::Editable(document) => Ok(document.display_line_width(cursor_row, content_width.max(1))),
+            Self::Editable(document) => {
+                Ok(document.display_line_width(cursor_row, content_width.max(1)))
+            }
             Self::LargeFile(document) => {
                 let page = document.read_page(cursor_row, 1, content_width.max(1))?;
                 Ok(page
@@ -372,15 +372,17 @@ impl Document {
         }
     }
 
-    pub fn first_match_row(&self, query: &str, page_width: usize) -> Option<usize> {
-        self.first_match_position(query, page_width).map(|(row, _)| row)
-    }
-
-    pub fn first_match_position(&self, query: &str, page_width: usize) -> Option<(usize, usize)> {
+    pub fn first_match_position(
+        &self,
+        matcher: &crate::search_options::Matcher,
+        page_width: usize,
+    ) -> Option<(usize, usize)> {
         let content_width = content_width_for_page(page_width);
 
         match self {
-            Self::Editable(document) => document.first_match_position(query, content_width.max(1)),
+            Self::Editable(document) => {
+                document.first_match_position(matcher, content_width.max(1))
+            }
             Self::LargeFile(_) => None,
             Self::Scratch(_) => None,
         }
@@ -388,7 +390,7 @@ impl Document {
 
     pub fn next_match_position(
         &self,
-        query: &str,
+        matcher: &crate::search_options::Matcher,
         start_row: usize,
         start_column: usize,
         page_width: usize,
@@ -396,12 +398,9 @@ impl Document {
         let content_width = content_width_for_page(page_width);
 
         match self {
-            Self::Editable(document) => document.next_match_position(
-                query,
-                start_row,
-                start_column,
-                content_width.max(1),
-            ),
+            Self::Editable(document) => {
+                document.next_match_position(matcher, start_row, start_column, content_width.max(1))
+            }
             Self::LargeFile(_) => None,
             Self::Scratch(_) => None,
         }
@@ -409,7 +408,7 @@ impl Document {
 
     pub fn previous_match_position(
         &self,
-        query: &str,
+        matcher: &crate::search_options::Matcher,
         start_row: usize,
         start_column: usize,
         page_width: usize,
@@ -418,7 +417,7 @@ impl Document {
 
         match self {
             Self::Editable(document) => document.previous_match_position(
-                query,
+                matcher,
                 start_row,
                 start_column,
                 content_width.max(1),
@@ -455,7 +454,9 @@ impl Document {
         let content_width = content_width_for_page(page_width);
 
         match self {
-            Self::Editable(document) => Some(document.open_below(display_row, content_width.max(1))),
+            Self::Editable(document) => {
+                Some(document.open_below(display_row, content_width.max(1)))
+            }
             Self::LargeFile(_) => None,
             Self::Scratch(_) => None,
         }
@@ -465,7 +466,9 @@ impl Document {
         let content_width = content_width_for_page(page_width);
 
         match self {
-            Self::Editable(document) => Some(document.open_above(display_row, content_width.max(1))),
+            Self::Editable(document) => {
+                Some(document.open_above(display_row, content_width.max(1)))
+            }
             Self::LargeFile(_) => None,
             Self::Scratch(_) => None,
         }
@@ -619,9 +622,13 @@ impl Document {
         }
     }
 
-    pub fn replace_all(&mut self, find: &str, replace: &str) -> Option<usize> {
+    pub fn replace_all(
+        &mut self,
+        matcher: &crate::search_options::Matcher,
+        replace: &str,
+    ) -> Option<usize> {
         match self {
-            Self::Editable(document) => Some(document.replace_all(find, replace)),
+            Self::Editable(document) => Some(document.replace_all(matcher, replace)),
             Self::LargeFile(_) | Self::Scratch(_) => None,
         }
     }
@@ -701,4 +708,3 @@ fn build_render_line(
         syntax_spans,
     }
 }
-*/

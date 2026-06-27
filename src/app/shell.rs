@@ -1,4 +1,3 @@
-/*
 use std::{
     fs::File,
     io::{self, Read, Write},
@@ -196,7 +195,10 @@ impl App {
     pub(super) fn toggle_terminal_split(&mut self) -> Result<()> {
         self.reap_exited_shell();
         if self.shell.child.is_none()
-            && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single)
+            && matches!(
+                self.layout_mode,
+                LayoutMode::TerminalSplit | LayoutMode::Single
+            )
         {
             self.ensure_shell_started()?;
             if self.layout_mode == LayoutMode::Single {
@@ -226,11 +228,12 @@ impl App {
             return Ok(());
         };
 
-        let target_layout = if self.focused_pane == FocusedPane::Right && self.layout_mode == LayoutMode::Single {
-            LayoutMode::Single
-        } else {
-            LayoutMode::TerminalSplit
-        };
+        let target_layout =
+            if self.focused_pane == FocusedPane::Right && self.layout_mode == LayoutMode::Single {
+                LayoutMode::Single
+            } else {
+                LayoutMode::TerminalSplit
+            };
         let (rows, cols) = shell_size_for_layout(target_layout);
         if self.shell.rows == rows && self.shell.cols == cols {
             return Ok(());
@@ -280,7 +283,10 @@ impl App {
             self.shell.pty = None;
             self.shell.output_rx = None;
             self.shell.parser = None;
-            if matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single) {
+            if matches!(
+                self.layout_mode,
+                LayoutMode::TerminalSplit | LayoutMode::Single
+            ) {
                 self.layout_mode = LayoutMode::Single;
                 self.focused_pane = FocusedPane::Left;
                 self.mode = Mode::Normal;
@@ -299,10 +305,7 @@ fn shell_size_for_layout(layout_mode: LayoutMode) -> (u16, u16) {
     let content_rows = rows.saturating_sub(1).max(1);
     let content_cols = match layout_mode {
         LayoutMode::Single => columns.max(1),
-        LayoutMode::Dual | LayoutMode::TerminalSplit => {
-            (columns.saturating_sub(1) / 2).max(1)
-        }
+        LayoutMode::Dual | LayoutMode::TerminalSplit => (columns.saturating_sub(1) / 2).max(1),
     };
     (content_rows, content_cols)
 }
-*/

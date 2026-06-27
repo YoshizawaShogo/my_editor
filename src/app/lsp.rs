@@ -1,4 +1,3 @@
-/*
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -7,6 +6,8 @@ use std::{
 };
 
 use lsp_server::{Message, Notification, Request, RequestId};
+use lsp_types::notification::Notification as LspNotificationTrait;
+use lsp_types::request::Request as LspRequestTrait;
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionContext, CompletionParams,
     CompletionResponse, CompletionTextEdit, DiagnosticClientCapabilities,
@@ -14,19 +15,15 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, GotoDefinitionParams, Hover, HoverContents, HoverParams, Location,
     Position, ReferenceContext, ReferenceParams, RenameParams, SelectionRange,
-    SelectionRangeParams, SemanticTokenModifier, SemanticTokenType,
-    SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
-    SemanticTokensFullOptions, SemanticTokensParams, SelectionRangeClientCapabilities,
+    SelectionRangeClientCapabilities, SelectionRangeParams, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
+    SemanticTokensFullOptions, SemanticTokensParams, TextDocumentClientCapabilities,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams,
-    TextDocumentClientCapabilities, Uri,
-    TokenFormat, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
-    WorkspaceClientCapabilities, WorkspaceDiagnosticParams, WorkspaceDiagnosticReportResult,
-    WorkspaceDocumentDiagnosticReport, WorkspaceEdit,
+    TextDocumentPositionParams, TokenFormat, Uri, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceDiagnosticParams,
+    WorkspaceDiagnosticReportResult, WorkspaceDocumentDiagnosticReport, WorkspaceEdit,
     notification, request,
 };
-use lsp_types::notification::Notification as LspNotificationTrait;
-use lsp_types::request::Request as LspRequestTrait;
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -36,19 +33,19 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
 
+use super::PendingOperator;
+use super::completion::CompletionItem;
+use super::semantic::decode_semantic_tokens_response;
 use crate::{
     document::{DiagnosticEntry, DiagnosticSeverity, SyntaxTokenSpan},
     error::{AppError, Result},
 };
-use super::PendingOperator;
-use super::completion::CompletionItem;
-use super::semantic::decode_semantic_tokens_response;
 
 pub enum LspClientState {
     NotAvailable,
     Inactive,
-    Ready(RustLspClient),
-    Failed(String),
+    Ready(LspClient),
+    Failed(()),
 }
 
 #[derive(Default)]
@@ -188,22 +185,13 @@ enum PendingRequest {
     References,
     Hover,
     Rename,
-    SemanticTokens {
-        path: PathBuf,
-    },
-    SelectionRange {
-        operator: PendingOperator,
-    },
-    WorkspaceDiagnostics {
-        error_only: bool,
-    },
-    Completion {
-        path: PathBuf,
-        serial: u64,
-    },
+    SemanticTokens { path: PathBuf },
+    SelectionRange { operator: PendingOperator },
+    WorkspaceDiagnostics { error_only: bool },
+    Completion { path: PathBuf, serial: u64 },
 }
 
-pub struct RustLspClient {
+pub struct LspClient {
     tx: UnboundedSender<LspCommand>,
     rx: Receiver<LspEvent>,
     pending_events: Vec<LspEvent>,
@@ -211,12 +199,16 @@ pub struct RustLspClient {
     workspace_diagnostics_supported: bool,
 }
 
-fn append_tmp_log(_message: impl AsRef<str>) {
-}
+fn append_tmp_log(_message: impl AsRef<str>) {}
 
-impl RustLspClient {
-    /// rust-analyzerを別スレッドで起動してLSPクライアントを初期化する
-    pub fn start(root_path: &Path) -> Result<Self> {
+impl LspClient {
+    /// LSPサーバーを別スレッドで起動してクライアントを初期化する
+    pub fn start(
+        root_path: &Path,
+        command: String,
+        args: Vec<String>,
+        init_options: Option<serde_json::Value>,
+    ) -> Result<Self> {
         let (tx, rx_commands) = unbounded_channel();
         let (tx_events, rx) = mpsc::channel();
         let (tx_init, rx_init) = mpsc::channel();
@@ -230,22 +222,30 @@ impl RustLspClient {
                     let _ = tx_init.send(Err(AppError::CommandFailed(format!(
                         "failed to build tokio runtime: {error}"
                     ))));
-                    let _ = tx_events.send(LspEvent::Failed(format!("failed to build tokio runtime: {error}")));
+                    let _ = tx_events.send(LspEvent::Failed(format!(
+                        "failed to build tokio runtime: {error}"
+                    )));
                     return;
                 }
             };
 
-            if let Err(error) =
-                runtime.block_on(run_lsp_worker(root_path, rx_commands, tx_events.clone(), tx_init.clone()))
-            {
+            if let Err(error) = runtime.block_on(run_lsp_worker(
+                root_path,
+                command,
+                args,
+                init_options,
+                rx_commands,
+                tx_events.clone(),
+                tx_init.clone(),
+            )) {
                 let _ = tx_init.send(Err(AppError::CommandFailed(format!("{error:?}"))));
                 let _ = tx_events.send(LspEvent::Failed(format!("{error:?}")));
             }
         });
 
-        let workspace_diagnostics_supported = rx_init
-            .recv()
-            .map_err(|_| AppError::CommandFailed("failed to receive LSP init result".to_owned()))??;
+        let workspace_diagnostics_supported = rx_init.recv().map_err(|_| {
+            AppError::CommandFailed("failed to receive LSP init result".to_owned())
+        })??;
 
         Ok(Self {
             tx,
@@ -370,7 +370,7 @@ impl RustLspClient {
     pub fn workspace_diagnostics(&mut self, error_only: bool) -> Result<()> {
         if !self.workspace_diagnostics_supported {
             return Err(AppError::CommandFailed(
-                "workspace diagnostics unsupported by rust-analyzer".to_owned(),
+                "workspace diagnostics not supported by this LSP server".to_owned(),
             ));
         }
         self.send(LspCommand::WorkspaceDiagnostics { error_only })
@@ -407,14 +407,18 @@ pub fn hover_lines(hover: &Hover) -> Vec<String> {
     }
 }
 
-/// LSPの非同期コマンド/メッセージループをrust-analyzerの終了まで実行する
+/// LSPの非同期コマンド/メッセージループをサーバーの終了まで実行する
 async fn run_lsp_worker(
     root_path: PathBuf,
+    command: String,
+    args: Vec<String>,
+    init_options: Option<serde_json::Value>,
     mut rx_commands: UnboundedReceiver<LspCommand>,
     tx_events: Sender<LspEvent>,
     tx_init: Sender<Result<bool>>,
 ) -> Result<()> {
-    let mut child = Command::new("rust-analyzer")
+    let mut child = Command::new(&command)
+        .args(&args)
         .current_dir(&root_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -423,19 +427,25 @@ async fn run_lsp_worker(
     let stdin = child
         .stdin
         .take()
-        .ok_or_else(|| AppError::CommandFailed("failed to open rust-analyzer stdin".to_owned()))?;
+        .ok_or_else(|| AppError::CommandFailed(format!("failed to open {command} stdin")))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| AppError::CommandFailed("failed to open rust-analyzer stdout".to_owned()))?;
+        .ok_or_else(|| AppError::CommandFailed(format!("failed to open {command} stdout")))?;
 
     let mut writer = stdin;
     let mut reader = BufReader::new(stdout);
     let mut next_request_id = 1;
     let mut pending_requests = HashMap::<RequestId, PendingRequest>::new();
 
-    let (workspace_diagnostics_supported, semantic_token_legend) =
-        initialize_server(&mut writer, &mut reader, &root_path, &mut next_request_id).await?;
+    let (workspace_diagnostics_supported, semantic_token_legend) = initialize_server(
+        &mut writer,
+        &mut reader,
+        &root_path,
+        &mut next_request_id,
+        init_options,
+    )
+    .await?;
     let _ = tx_init.send(Ok(workspace_diagnostics_supported));
 
     loop {
@@ -469,19 +479,14 @@ async fn run_lsp_worker(
     Ok(())
 }
 
-/// rust-analyzerにInitializeリクエストを送信してサーバーケイパビリティを取得する
+/// LSPサーバーにInitializeリクエストを送信してサーバーケイパビリティを取得する
 async fn initialize_server(
     writer: &mut ChildStdin,
     reader: &mut BufReader<ChildStdout>,
     root_path: &Path,
     next_request_id: &mut i32,
+    init_options: Option<serde_json::Value>,
 ) -> Result<(bool, Vec<String>)> {
-    let rust_analyzer_settings = serde_json::json!({
-        "checkOnSave": true,
-        "check": {
-            "command": "check"
-        }
-    });
     let root_uri = path_to_uri(root_path)?;
     let workspace_folders = Some(vec![lsp_types::WorkspaceFolder {
         uri: root_uri,
@@ -571,7 +576,7 @@ async fn initialize_server(
         process_id: Some(std::process::id()),
         workspace_folders,
         capabilities,
-        initialization_options: Some(rust_analyzer_settings.clone()),
+        initialization_options: init_options.clone(),
         ..Default::default()
     };
 
@@ -594,10 +599,9 @@ async fn initialize_server(
                         error.code, error.message
                     )));
                 }
-                let result: lsp_types::InitializeResult = serde_json::from_value(
-                    response.result.unwrap_or(Value::Null),
-                )
-                .map_err(|error| AppError::CommandFailed(error.to_string()))?;
+                let result: lsp_types::InitializeResult =
+                    serde_json::from_value(response.result.unwrap_or(Value::Null))
+                        .map_err(|error| AppError::CommandFailed(error.to_string()))?;
                 break (
                     supports_workspace_diagnostics(&result.capabilities),
                     semantic_token_legend(&result.capabilities),
@@ -614,18 +618,16 @@ async fn initialize_server(
     )
     .await?;
 
-    let configuration = DidChangeConfigurationParams {
-        settings: serde_json::json!({
-            "rust-analyzer": rust_analyzer_settings,
-        }),
-    };
-    send_notification(
-        writer,
-        notification::DidChangeConfiguration::METHOD,
-        serde_json::to_value(configuration)
-            .map_err(|error| AppError::CommandFailed(error.to_string()))?,
-    )
-    .await?;
+    if let Some(settings) = init_options {
+        let configuration = DidChangeConfigurationParams { settings };
+        send_notification(
+            writer,
+            notification::DidChangeConfiguration::METHOD,
+            serde_json::to_value(configuration)
+                .map_err(|error| AppError::CommandFailed(error.to_string()))?,
+        )
+        .await?;
+    }
 
     Ok((workspace_diagnostics_supported, semantic_token_legend))
 }
@@ -674,7 +676,11 @@ async fn handle_command(
             )
             .await?;
         }
-        LspCommand::DidChange { path, version, text } => {
+        LspCommand::DidChange {
+            path,
+            version,
+            text,
+        } => {
             let params = DidChangeTextDocumentParams {
                 text_document: VersionedTextDocumentIdentifier {
                     uri: path_to_uri(&path)?,
@@ -846,7 +852,10 @@ async fn handle_command(
                 partial_result_params: Default::default(),
             };
             let id = next_request_id_value(next_request_id);
-            pending_requests.insert(id.clone(), PendingRequest::WorkspaceDiagnostics { error_only });
+            pending_requests.insert(
+                id.clone(),
+                PendingRequest::WorkspaceDiagnostics { error_only },
+            );
             send_request(
                 writer,
                 id,
@@ -902,14 +911,18 @@ async fn process_message(
     match message {
         Message::Notification(notification) => {
             if notification.method == notification::PublishDiagnostics::METHOD {
-                let params = serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(notification.params)
-                    .map_err(|error| AppError::CommandFailed(error.to_string()))?;
+                let params = serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(
+                    notification.params,
+                )
+                .map_err(|error| AppError::CommandFailed(error.to_string()))?;
                 if let Some(path) = uri_to_path(&params.uri) {
                     let mut diagnostics = HashMap::<usize, Vec<DiagnosticEntry>>::new();
                     for diagnostic in params.diagnostics {
                         let severity = match diagnostic.severity {
                             Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
-                            Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
+                            Some(lsp_types::DiagnosticSeverity::WARNING) => {
+                                DiagnosticSeverity::Warning
+                            }
                             _ => DiagnosticSeverity::Warning,
                         };
                         diagnostics
@@ -929,10 +942,7 @@ async fn process_message(
         }
         Message::Response(response) => {
             let Some(pending) = pending_requests.remove(&response.id) else {
-                append_tmp_log(format!(
-                    "[lsp] unmatched response id={:?}",
-                    response.id
-                ));
+                append_tmp_log(format!("[lsp] unmatched response id={:?}", response.id));
                 return Ok(());
             };
 
@@ -962,7 +972,10 @@ async fn process_message(
                     _ => {
                         send_event(
                             tx_events,
-                            LspEvent::Failed(format!("LSP error {}: {}", error.code, error.message)),
+                            LspEvent::Failed(format!(
+                                "LSP error {}: {}",
+                                error.code, error.message
+                            )),
                         );
                         return Ok(());
                     }
@@ -1005,15 +1018,15 @@ async fn process_message(
                     send_event(tx_events, LspEvent::PublishSemanticTokens { path, tokens });
                 }
                 PendingRequest::SelectionRange { operator } => {
-                    let ranges = flatten_selection_ranges(parse_selection_ranges_response(response.result)?);
+                    let ranges =
+                        flatten_selection_ranges(parse_selection_ranges_response(response.result)?);
                     send_event(
                         tx_events,
                         LspEvent::SelectionRangeResult { operator, ranges },
                     );
                 }
                 PendingRequest::WorkspaceDiagnostics { error_only } => {
-                    let items =
-                        parse_workspace_diagnostics_response(response.result, error_only)?;
+                    let items = parse_workspace_diagnostics_response(response.result, error_only)?;
                     send_event(
                         tx_events,
                         LspEvent::WorkspaceDiagnosticsResult { error_only, items },
@@ -1023,7 +1036,11 @@ async fn process_message(
                     let items = parse_completion_response(response.result)?;
                     send_event(
                         tx_events,
-                        LspEvent::CompletionResult { path, serial, items },
+                        LspEvent::CompletionResult {
+                            path,
+                            serial,
+                            items,
+                        },
                     );
                 }
             }
@@ -1065,10 +1082,7 @@ async fn send_semantic_tokens_request(
     pending_requests: &mut HashMap<RequestId, PendingRequest>,
     path: PathBuf,
 ) -> Result<()> {
-    append_tmp_log(format!(
-        "[lsp] semantic request path={}",
-        path.display()
-    ));
+    append_tmp_log(format!("[lsp] semantic request path={}", path.display()));
     let params = SemanticTokensParams {
         work_done_progress_params: WorkDoneProgressParams::default(),
         partial_result_params: Default::default(),
@@ -1087,8 +1101,7 @@ async fn send_semantic_tokens_request(
         writer,
         id,
         request::SemanticTokensFullRequest::METHOD,
-        serde_json::to_value(params)
-            .map_err(|error| AppError::CommandFailed(error.to_string()))?,
+        serde_json::to_value(params).map_err(|error| AppError::CommandFailed(error.to_string()))?,
     )
     .await
 }
@@ -1156,8 +1169,8 @@ where
         }
     }
 
-    let content_length =
-        content_length.ok_or_else(|| AppError::CommandFailed("missing content length".to_owned()))?;
+    let content_length = content_length
+        .ok_or_else(|| AppError::CommandFailed("missing content length".to_owned()))?;
     let mut body = vec![0; content_length];
     reader.read_exact(&mut body).await?;
     serde_json::from_slice(&body).map_err(|error| AppError::CommandFailed(error.to_string()))
@@ -1254,8 +1267,8 @@ fn parse_workspace_diagnostics_response(
         return Ok(Vec::new());
     }
 
-    let report: WorkspaceDiagnosticReportResult =
-        serde_json::from_value(value).map_err(|error| AppError::CommandFailed(error.to_string()))?;
+    let report: WorkspaceDiagnosticReportResult = serde_json::from_value(value)
+        .map_err(|error| AppError::CommandFailed(error.to_string()))?;
     let reports = match report {
         WorkspaceDiagnosticReportResult::Report(report) => report.items,
         WorkspaceDiagnosticReportResult::Partial(report) => report.items,
@@ -1308,8 +1321,8 @@ fn parse_completion_response(result: Option<Value>) -> Result<Vec<CompletionItem
         return Ok(Vec::new());
     }
 
-    let response: CompletionResponse =
-        serde_json::from_value(value).map_err(|error| AppError::CommandFailed(error.to_string()))?;
+    let response: CompletionResponse = serde_json::from_value(value)
+        .map_err(|error| AppError::CommandFailed(error.to_string()))?;
     let items = match response {
         CompletionResponse::Array(items) => items,
         CompletionResponse::List(list) => list.items,
@@ -1363,11 +1376,22 @@ fn supports_workspace_diagnostics(capabilities: &lsp_types::ServerCapabilities) 
 fn semantic_token_legend(capabilities: &lsp_types::ServerCapabilities) -> Vec<String> {
     match &capabilities.semantic_tokens_provider {
         Some(lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(options)) => {
-            options.legend.token_types.iter().map(|token| token.as_str().to_owned()).collect()
+            options
+                .legend
+                .token_types
+                .iter()
+                .map(|token| token.as_str().to_owned())
+                .collect()
         }
-        Some(lsp_types::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(options)) => {
-            options.semantic_tokens_options.legend.token_types.iter().map(|token| token.as_str().to_owned()).collect()
-        }
+        Some(lsp_types::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
+            options,
+        )) => options
+            .semantic_tokens_options
+            .legend
+            .token_types
+            .iter()
+            .map(|token| token.as_str().to_owned())
+            .collect(),
         None => Vec::new(),
     }
 }
@@ -1395,4 +1419,3 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     let stripped = value.strip_prefix("file://")?;
     Some(PathBuf::from(stripped))
 }
-*/

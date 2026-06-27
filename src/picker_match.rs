@@ -1,4 +1,3 @@
-/*
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 
 use crate::open_candidate::OpenCandidate;
@@ -7,13 +6,6 @@ use crate::open_candidate::OpenCandidate;
 pub struct PickerMatch {
     pub candidate: OpenCandidate,
     pub indices: Vec<usize>,
-}
-
-pub fn sort_open_candidates(candidates: &[OpenCandidate], query: &str) -> Vec<OpenCandidate> {
-    ranked_open_candidates(candidates, query)
-        .into_iter()
-        .map(|matched| matched.candidate)
-        .collect()
 }
 
 pub fn ranked_open_candidates(candidates: &[OpenCandidate], query: &str) -> Vec<PickerMatch> {
@@ -57,7 +49,11 @@ pub fn score_open_candidate<'a>(
     }
 
     let (score, _) = matcher.fuzzy_indices(&path, query)?;
-    Some((base_candidate_score(candidate) + score, candidate, Vec::new()))
+    Some((
+        base_candidate_score(candidate) + score,
+        candidate,
+        Vec::new(),
+    ))
 }
 
 fn base_candidate_score(candidate: &OpenCandidate) -> i64 {
@@ -66,4 +62,3 @@ fn base_candidate_score(candidate: &OpenCandidate) -> i64 {
         OpenCandidate::ProjectFile(_) => 0,
     }
 }
-*/

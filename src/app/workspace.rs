@@ -1,4 +1,3 @@
-/*
 use std::path::{Path, PathBuf};
 
 use crate::{
@@ -25,18 +24,6 @@ impl Workspace {
         &mut self.documents[self.current_index].document
     }
 
-    /// カレントドキュメントへの不変参照をOptionで返す
-    pub fn try_current_document(&self) -> Option<&Document> {
-        self.documents.get(self.current_index).map(|entry| &entry.document)
-    }
-
-    /// カレントドキュメントへの可変参照をOptionで返す
-    pub fn try_current_document_mut(&mut self) -> Option<&mut Document> {
-        self.documents
-            .get_mut(self.current_index)
-            .map(|entry| &mut entry.document)
-    }
-
     /// 開いているバッファをOpenCandidate::OpenBufferのリストとして返す
     pub fn open_buffer_candidates(&self) -> Vec<OpenCandidate> {
         self.documents
@@ -49,13 +36,6 @@ impl Workspace {
                 ))
             })
             .collect()
-    }
-
-    /// カレントドキュメントのファイル名を返す
-    pub fn current_document_name(&self) -> Option<String> {
-        self.documents
-            .get(self.current_index)
-            .map(|entry| super::display_name(&entry.path))
     }
 
     /// カレントドキュメントのパスを返す
@@ -128,7 +108,9 @@ impl Workspace {
         if self.documents.is_empty() {
             self.current_index = 0;
         } else {
-            self.current_index = self.current_index.min(self.documents.len().saturating_sub(1));
+            self.current_index = self
+                .current_index
+                .min(self.documents.len().saturating_sub(1));
         }
     }
 
@@ -143,4 +125,3 @@ impl Workspace {
         }
     }
 }
-*/

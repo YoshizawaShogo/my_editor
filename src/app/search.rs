@@ -1,11 +1,15 @@
-/*
 use std::{
     fs::File,
     io::{BufRead, BufReader},
     path::Path,
 };
 
-use crate::{document::Document, error::Result, open_candidate::collect_project_search_paths};
+use crate::{
+    document::Document,
+    error::Result,
+    open_candidate::collect_project_search_paths,
+    search_options::{Matcher, SearchOptions},
+};
 
 use super::{App, ReplayableAction};
 
@@ -42,12 +46,15 @@ impl App {
             return;
         }
 
+        let query = self.search_input.value.clone();
+        let opts = self.search_input.options.clone();
+        let page_width = self.current_page_width();
         if let Ok(Some((document_index, row, column))) =
-            self.search_current_file(&self.search_input.value, self.current_page_width())
+            self.search_current_file(&query, &opts, page_width)
         {
             self.make_document_current(document_index);
             self.cursor.column = column;
-            self.jump_with_context(row, self.current_page_width());
+            self.jump_with_context(row, page_width);
         }
     }
 
@@ -64,10 +71,16 @@ impl App {
             return Ok(());
         }
 
+        let opts = self.search_input.options.clone();
+        let page_width = self.current_page_width();
         let result = match self.search_input.scope {
-            super::SearchScope::CurrentFile => self.search_current_file(&query, self.current_page_width())?,
-            super::SearchScope::OpenBuffers => self.search_open_buffers(&query, self.current_page_width())?,
-            super::SearchScope::Project => self.search_project_files(&query, self.current_page_width())?,
+            super::SearchScope::CurrentFile => {
+                self.search_current_file(&query, &opts, page_width)?
+            }
+            super::SearchScope::OpenBuffers => {
+                self.search_open_buffers(&query, &opts, page_width)?
+            }
+            super::SearchScope::Project => self.search_project_files(&query, &opts, page_width)?,
         };
 
         if let Some((document_index, row, column)) = result {
@@ -79,8 +92,9 @@ impl App {
             self.last_search = Some(super::SearchState {
                 query,
                 scope: self.search_input.scope,
+                options: opts,
             });
-            self.jump_with_context(row, self.current_page_width());
+            self.jump_with_context(row, page_width);
         }
 
         self.close_search_input();
@@ -91,15 +105,19 @@ impl App {
     pub(super) fn search_current_file(
         &self,
         query: &str,
+        opts: &SearchOptions,
         page_width: usize,
     ) -> Result<Option<(usize, usize, usize)>> {
         if !self.workspace.has_documents() {
             return Ok(None);
         }
+        let Some(matcher) = Matcher::new(query, opts) else {
+            return Ok(None);
+        };
         Ok(self
             .workspace
             .current_document()
-            .first_match_position(query, page_width)
+            .first_match_position(&matcher, page_width)
             .map(|(row, column)| (self.workspace.current_index, row, column)))
     }
 
@@ -107,16 +125,20 @@ impl App {
     pub(super) fn search_open_buffers(
         &self,
         query: &str,
+        opts: &SearchOptions,
         page_width: usize,
     ) -> Result<Option<(usize, usize, usize)>> {
         if !self.workspace.has_documents() {
             return Ok(None);
         }
+        let Some(matcher) = Matcher::new(query, opts) else {
+            return Ok(None);
+        };
         for (index, entry) in self.workspace.documents.iter().enumerate() {
             if entry.document.is_scratch() {
                 continue;
             }
-            if let Some((row, column)) = entry.document.first_match_position(query, page_width) {
+            if let Some((row, column)) = entry.document.first_match_position(&matcher, page_width) {
                 return Ok(Some((index, row, column)));
             }
         }
@@ -128,26 +150,44 @@ impl App {
     pub(super) fn search_project_files(
         &mut self,
         query: &str,
+        opts: &SearchOptions,
         page_width: usize,
     ) -> Result<Option<(usize, usize, usize)>> {
-        if let Some(found) = self.search_open_buffers(query, page_width)? {
+        if let Some(found) = self.search_open_buffers(query, opts, page_width)? {
             return Ok(Some(found));
         }
-        self.search_unloaded_project_files(query, page_width)
+        self.search_unloaded_project_files(query, opts, page_width)
     }
 
     /// 未読み込みのプロジェクトファイルを先頭から検索して最初のマッチ位置を返す
     fn search_unloaded_project_files(
         &mut self,
         query: &str,
+        opts: &SearchOptions,
+        page_width: usize,
+    ) -> Result<Option<(usize, usize, usize)>> {
+        let Some(matcher) = Matcher::new(query, opts) else {
+            return Ok(None);
+        };
+        self.search_unloaded_project_files_with_matcher(&matcher, page_width)
+    }
+
+    fn search_unloaded_project_files_with_matcher(
+        &mut self,
+        matcher: &Matcher,
         page_width: usize,
     ) -> Result<Option<(usize, usize, usize)>> {
         for path in collect_project_search_paths()? {
-            if self.workspace.documents.iter().any(|entry| entry.path == path) {
+            if self
+                .workspace
+                .documents
+                .iter()
+                .any(|entry| entry.path == path)
+            {
                 continue;
             }
 
-            if let Some((line_number, column)) = first_matching_line_number(&path, query)? {
+            if let Some((line_number, column)) = first_matching_line_in_file(&path, matcher)? {
                 self.open_document(path.clone())?;
                 if let Some(row) = self
                     .workspace
@@ -177,6 +217,9 @@ impl App {
         let Some(search_state) = self.last_search.clone() else {
             return Ok(());
         };
+        let Some(matcher) = Matcher::new(&search_state.query, &search_state.options) else {
+            return Ok(());
+        };
         let page_width = self.current_page_width();
         let start_column = if forward {
             self.cursor.column.saturating_add(1)
@@ -188,14 +231,14 @@ impl App {
             super::SearchScope::CurrentFile => {
                 let position = if forward {
                     self.workspace.current_document().next_match_position(
-                        &search_state.query,
+                        &matcher,
                         self.cursor.row,
                         start_column,
                         page_width,
                     )
                 } else {
                     self.workspace.current_document().previous_match_position(
-                        &search_state.query,
+                        &matcher,
                         self.cursor.row,
                         start_column,
                         page_width,
@@ -204,7 +247,7 @@ impl App {
                 position.map(|(row, column)| (self.workspace.current_index, row, column))
             }
             super::SearchScope::OpenBuffers => self.search_open_buffers_from(
-                &search_state.query,
+                &matcher,
                 self.workspace.current_index,
                 self.cursor.row,
                 start_column,
@@ -212,7 +255,7 @@ impl App {
                 forward,
             )?,
             super::SearchScope::Project => self.search_project_from(
-                &search_state.query,
+                &matcher,
                 self.workspace.current_index,
                 self.cursor.row,
                 start_column,
@@ -235,7 +278,7 @@ impl App {
     /// 指定位置から開いているバッファを指定方向に検索し、マッチ位置を返す
     pub(super) fn search_open_buffers_from(
         &self,
-        query: &str,
+        matcher: &Matcher,
         start_document_index: usize,
         start_row: usize,
         start_column: usize,
@@ -243,15 +286,22 @@ impl App {
         forward: bool,
     ) -> Result<Option<(usize, usize, usize)>> {
         if forward {
-            for (index, entry) in self.workspace.documents.iter().enumerate().skip(start_document_index) {
+            for (index, entry) in self
+                .workspace
+                .documents
+                .iter()
+                .enumerate()
+                .skip(start_document_index)
+            {
                 if entry.document.is_scratch() {
                     continue;
                 }
                 let start = if index == start_document_index {
-                    entry.document
-                        .next_match_position(query, start_row, start_column, page_width)
+                    entry
+                        .document
+                        .next_match_position(matcher, start_row, start_column, page_width)
                 } else {
-                    entry.document.first_match_position(query, page_width)
+                    entry.document.first_match_position(matcher, page_width)
                 };
                 if let Some((row, column)) = start {
                     return Ok(Some((index, row, column)));
@@ -264,11 +314,14 @@ impl App {
                     continue;
                 }
                 let found = if index == start_document_index {
-                    entry
-                        .document
-                        .previous_match_position(query, start_row, start_column, page_width)
+                    entry.document.previous_match_position(
+                        matcher,
+                        start_row,
+                        start_column,
+                        page_width,
+                    )
                 } else {
-                    last_match_in_document(&entry.document, query, page_width)
+                    last_match_in_document(&entry.document, matcher, page_width)
                 };
                 if let Some((row, column)) = found {
                     return Ok(Some((index, row, column)));
@@ -282,7 +335,7 @@ impl App {
     /// 指定位置からバッファおよびプロジェクトファイルを指定方向に検索し、マッチ位置を返す
     pub(super) fn search_project_from(
         &mut self,
-        query: &str,
+        matcher: &Matcher,
         start_document_index: usize,
         start_row: usize,
         start_column: usize,
@@ -290,7 +343,7 @@ impl App {
         forward: bool,
     ) -> Result<Option<(usize, usize, usize)>> {
         if let Some(found) = self.search_open_buffers_from(
-            query,
+            matcher,
             start_document_index,
             start_row,
             start_column,
@@ -304,23 +357,20 @@ impl App {
             return Ok(None);
         }
 
-        self.search_unloaded_project_files(query, page_width)
+        self.search_unloaded_project_files_with_matcher(matcher, page_width)
     }
 }
 
-/// ファイルを行ごとに読み、クエリに最初にマッチする行番号(1始まり)と列を返す
-fn first_matching_line_number(path: &Path, query: &str) -> Result<Option<(usize, usize)>> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) => return Err(error.into()),
-    };
+/// ファイルを行ごとに読み、マッチャーに最初にマッチする行番号(1始まり)と列を返す
+fn first_matching_line_in_file(path: &Path, matcher: &Matcher) -> Result<Option<(usize, usize)>> {
+    let file = File::open(path)?;
     let reader = BufReader::new(file);
 
     for (index, line) in reader.lines().enumerate() {
         let Ok(line) = line else {
             return Ok(None);
         };
-        if let Some(column) = line.find(query) {
+        if let Some(column) = matcher.find(&line) {
             return Ok(Some((index + 1, column)));
         }
     }
@@ -328,13 +378,17 @@ fn first_matching_line_number(path: &Path, query: &str) -> Result<Option<(usize,
     Ok(None)
 }
 
-/// ドキュメント末尾からクエリの最後のマッチ位置を返す
+/// ドキュメント末尾からマッチャーの最後のマッチ位置を返す
 fn last_match_in_document(
     document: &Document,
-    query: &str,
+    matcher: &Matcher,
     page_width: usize,
 ) -> Option<(usize, usize)> {
     let total_rows = document.total_rows(page_width)?;
-    document.previous_match_position(query, total_rows.saturating_sub(1), usize::MAX, page_width)
+    document.previous_match_position(
+        matcher,
+        total_rows.saturating_sub(1),
+        usize::MAX,
+        page_width,
+    )
 }
-*/

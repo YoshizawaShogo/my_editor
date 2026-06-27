@@ -1,4 +1,3 @@
-/*
 use std::sync::{Arc, atomic::AtomicBool};
 
 use crossterm::{
@@ -75,8 +74,8 @@ impl SuspendSignalGuard {
         #[cfg(unix)]
         {
             let ignored = Arc::new(AtomicBool::new(false));
-            let signal_id =
-                flag::register(SIGTSTP, Arc::clone(&ignored)).expect("failed to register SIGTSTP handler");
+            let signal_id = flag::register(SIGTSTP, Arc::clone(&ignored))
+                .expect("failed to register SIGTSTP handler");
             Self {
                 signal_id,
                 _ignored: ignored,
@@ -111,4 +110,3 @@ impl Drop for TerminalSession {
         }
     }
 }
-*/

@@ -1,4 +1,3 @@
-/*
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -189,4 +188,3 @@ fn wrap_visible_segments(line: &str, left_column: usize, page_width: usize) -> V
         .map(|chunk| chunk.iter().collect())
         .collect()
 }
-*/

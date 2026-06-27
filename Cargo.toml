@@ -2,12 +2,13 @@
 name = "my_editor"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 clap = { version = "4.5.32", features = ["derive"] }
 crossterm = "0.28.1"
 fuzzy-matcher = "0.3.7"
+regex = "1"
 lsp-server = "0.7.8"
 lsp-types = "0.97.0"
 nix = { version = "0.31.1", features = ["fs", "process", "term"] }
@@ -15,6 +16,7 @@ ratatui = "0.29.0"
 ropey = "1.6.1"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+toml = "0.8"
 signal-hook = "0.3.18"
 tokio = { version = "1.47.1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 vt100 = "0.15.2"

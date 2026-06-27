@@ -11,29 +11,27 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(
-        large_file_threshold_bytes: u64,
-        large_file_read_window_bytes: usize,
-        shell_program: String,
-    ) -> Self {
-        Self {
-            large_file_threshold_bytes,
-            large_file_read_window_bytes,
-            shell_program,
-        }
-    }
-
     pub fn from_env() -> Self {
         Self {
             large_file_threshold_bytes: env_u64("LARGE_FILE_THRESHOLD_BYTES")
                 .unwrap_or(DEFAULT_LARGE_FILE_THRESHOLD_BYTES),
             large_file_read_window_bytes: env_usize("LARGE_FILE_READ_WINDOW_BYTES")
                 .unwrap_or(DEFAULT_LARGE_FILE_READ_WINDOW_BYTES),
-            shell_program: env::var("SHELL")
-                .unwrap_or_else(|_| DEFAULT_SHELL_PROGRAM.to_owned()),
+            shell_program: env::var("SHELL").unwrap_or_else(|_| DEFAULT_SHELL_PROGRAM.to_owned()),
         }
     }
+}
 
+pub fn large_file_threshold_bytes() -> u64 {
+    Config::from_env().large_file_threshold_bytes
+}
+
+pub fn large_file_read_window_bytes() -> usize {
+    Config::from_env().large_file_read_window_bytes
+}
+
+pub fn shell_program() -> String {
+    Config::from_env().shell_program
 }
 
 fn env_u64(key: &str) -> Option<u64> {

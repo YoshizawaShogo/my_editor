@@ -1,4 +1,3 @@
-/*
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -32,7 +31,10 @@ impl CompletionState {
     /// シリアル番号を進めて補完状態をデフォルトにリセットする
     pub fn invalidate(&mut self) {
         let next_serial = self.serial.saturating_add(1);
-        *self = Self { serial: next_serial, ..Default::default() };
+        *self = Self {
+            serial: next_serial,
+            ..Default::default()
+        };
     }
 }
 
@@ -117,7 +119,11 @@ pub fn rank_completion_items(
                 item.filter_text.as_str()
             };
             let (score, _) = matcher.fuzzy_indices(haystack, query)?;
-            let exact_prefix_bonus = if haystack.starts_with(query) { 10_000 } else { 0 };
+            let exact_prefix_bonus = if haystack.starts_with(query) {
+                10_000
+            } else {
+                0
+            };
             Some((score + exact_prefix_bonus, item))
         })
         .collect::<Vec<_>>();
@@ -195,8 +201,8 @@ fn is_completion_word_char(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_fallback_items, completion_prefix, has_empty_completion_trigger,
-        rank_completion_items, CompletionItem,
+        CompletionItem, collect_fallback_items, completion_prefix, has_empty_completion_trigger,
+        rank_completion_items,
     };
 
     #[test]
@@ -208,11 +214,7 @@ mod tests {
 
     #[test]
     fn fallback_items_prefix_match_and_dedupe() {
-        let items = collect_fallback_items(
-            "alpha beta alphabet alpha_beta alpha",
-            "alp",
-            8,
-        );
+        let items = collect_fallback_items("alpha beta alphabet alpha_beta alpha", "alp", 8);
         let labels = items.into_iter().map(|item| item.label).collect::<Vec<_>>();
         assert_eq!(labels, vec!["alpha", "alphabet", "alpha_beta"]);
     }
@@ -236,7 +238,10 @@ mod tests {
             },
         ];
         let ranked = rank_completion_items(items, "colle", 8);
-        let labels = ranked.into_iter().map(|item| item.label).collect::<Vec<_>>();
+        let labels = ranked
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
         assert_eq!(labels, vec!["collections"]);
     }
 
@@ -272,4 +277,3 @@ mod tests {
         assert_eq!(labels, vec!["alloc", "collections"]);
     }
 }
-*/

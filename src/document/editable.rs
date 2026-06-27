@@ -1,4 +1,3 @@
-/*
 use std::{
     collections::HashMap,
     fs::File,
@@ -11,9 +10,8 @@ use lsp_types::{Position, TextEdit};
 use ropey::Rope;
 
 use crate::{
-    app::semantic::slice_wrapped_syntax_spans,
-    document::DiagnosticEntry,
-    error::Result,
+    app::semantic::slice_wrapped_syntax_spans, document::DiagnosticEntry, error::Result,
+    search_options::Matcher,
 };
 
 pub struct EditableDocument {
@@ -279,7 +277,10 @@ impl EditableDocument {
         page_width: usize,
     ) -> Vec<DiagnosticEntry> {
         let line_number = self.line_number_for_display_row(display_row, page_width.max(1));
-        self.diagnostics.get(&line_number).cloned().unwrap_or_default()
+        self.diagnostics
+            .get(&line_number)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn collect_diagnostics(&self) -> Vec<(usize, Vec<DiagnosticEntry>)> {
@@ -337,40 +338,31 @@ impl EditableDocument {
         Some(self.display_row_for_line_number(line_number, page_width.max(1)))
     }
 
-    pub fn first_match_row(&self, query: &str, page_width: usize) -> Option<usize> {
-        self.first_match_position(query, page_width).map(|(row, _)| row)
-    }
-
-    pub fn first_match_position(&self, query: &str, page_width: usize) -> Option<(usize, usize)> {
-        if query.is_empty() {
-            return None;
-        }
-
+    pub fn first_match_position(
+        &self,
+        matcher: &Matcher,
+        page_width: usize,
+    ) -> Option<(usize, usize)> {
         for (line_index, line) in self.rope.lines().enumerate() {
             let text = line.to_string();
             let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
-            if let Some(column) = trimmed.find(query) {
+            if let Some(column) = matcher.find(trimmed) {
                 return Some((
                     self.display_row_for_line_number(line_index + 1, page_width.max(1)),
                     column,
                 ));
             }
         }
-
         None
     }
 
     pub fn next_match_position(
         &self,
-        query: &str,
+        matcher: &Matcher,
         start_row: usize,
         start_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
-        if query.is_empty() {
-            return None;
-        }
-
         let total_rows = self.total_rows(page_width.max(1));
         for row in start_row..total_rows {
             let line_text = self.display_line_text(row, page_width.max(1));
@@ -379,25 +371,20 @@ impl EditableDocument {
             } else {
                 0
             };
-            if let Some(offset) = line_text[search_start..].find(query) {
-                return Some((row, search_start + offset));
+            if let Some(pos) = matcher.find_from(&line_text, search_start) {
+                return Some((row, pos));
             }
         }
-
         None
     }
 
     pub fn previous_match_position(
         &self,
-        query: &str,
+        matcher: &Matcher,
         start_row: usize,
         start_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
-        if query.is_empty() {
-            return None;
-        }
-
         for row in (0..=start_row).rev() {
             let line_text = self.display_line_text(row, page_width.max(1));
             let search_end = if row == start_row {
@@ -405,12 +392,10 @@ impl EditableDocument {
             } else {
                 line_text.len()
             };
-            let haystack = &line_text[..search_end];
-            if let Some(column) = haystack.rfind(query) {
+            if let Some(column) = matcher.rfind_in(&line_text, search_end) {
                 return Some((row, column));
             }
         }
-
         None
     }
 
@@ -437,20 +422,29 @@ impl EditableDocument {
         self.rope.to_string()
     }
 
-    pub fn replace_all(&mut self, find: &str, replace: &str) -> usize {
-        if find.is_empty() {
-            return 0;
+    pub fn replace_all(&mut self, matcher: &Matcher, replace: &str) -> usize {
+        let text = self.rope.to_string();
+        let mut result = String::new();
+        let mut last_end = 0usize;
+        let mut count = 0usize;
+        let mut search_from = 0usize;
+
+        while let Some((start, end)) = matcher.find_match_from(&text, search_from) {
+            result.push_str(&text[last_end..start]);
+            result.push_str(replace);
+            last_end = end;
+            search_from = if end > start { end } else { end + 1 };
+            count += 1;
         }
 
-        let text = self.rope.to_string();
-        let count = text.match_indices(find).count();
         if count == 0 {
             return 0;
         }
 
+        result.push_str(&text[last_end..]);
         self.push_undo_snapshot();
         self.clear_semantic_tokens();
-        self.rope = Rope::from_str(&text.replace(find, replace));
+        self.rope = Rope::from_str(&result);
         self.reload_git_gutter_markers();
         count
     }
@@ -530,7 +524,8 @@ impl EditableDocument {
     ) -> (usize, usize) {
         self.push_undo_snapshot();
         self.clear_semantic_tokens();
-        let insert_char_idx = self.char_index_for_display_position(display_row, display_column, page_width);
+        let insert_char_idx =
+            self.char_index_for_display_position(display_row, display_column, page_width);
         self.rope.insert_char(insert_char_idx, ch);
         self.reload_git_gutter_markers();
         self.display_position_for_char_index(insert_char_idx.saturating_add(1), page_width)
@@ -544,7 +539,8 @@ impl EditableDocument {
     ) -> (usize, usize) {
         self.push_undo_snapshot();
         self.clear_semantic_tokens();
-        let insert_char_idx = self.char_index_for_display_position(display_row, display_column, page_width);
+        let insert_char_idx =
+            self.char_index_for_display_position(display_row, display_column, page_width);
         self.rope.insert_char(insert_char_idx, '\n');
         self.reload_git_gutter_markers();
         self.display_position_for_char_index(insert_char_idx.saturating_add(1), page_width)
@@ -556,7 +552,8 @@ impl EditableDocument {
         display_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
-        let cursor_char_idx = self.char_index_for_display_position(display_row, display_column, page_width);
+        let cursor_char_idx =
+            self.char_index_for_display_position(display_row, display_column, page_width);
         if cursor_char_idx == 0 {
             return None;
         }
@@ -574,14 +571,16 @@ impl EditableDocument {
         display_column: usize,
         page_width: usize,
     ) -> Option<(usize, usize)> {
-        let cursor_char_idx = self.char_index_for_display_position(display_row, display_column, page_width);
+        let cursor_char_idx =
+            self.char_index_for_display_position(display_row, display_column, page_width);
         if cursor_char_idx >= self.rope.len_chars() {
             return None;
         }
 
         self.push_undo_snapshot();
         self.clear_semantic_tokens();
-        self.rope.remove(cursor_char_idx..cursor_char_idx.saturating_add(1));
+        self.rope
+            .remove(cursor_char_idx..cursor_char_idx.saturating_add(1));
         self.reload_git_gutter_markers();
         Some(self.display_position_for_char_index(cursor_char_idx, page_width))
     }
@@ -596,8 +595,7 @@ impl EditableDocument {
     ) -> Option<(usize, usize)> {
         let start_char_idx =
             self.char_index_for_display_position(start_row, start_column, page_width);
-        let end_char_idx =
-            self.char_index_for_display_position(end_row, end_column, page_width);
+        let end_char_idx = self.char_index_for_display_position(end_row, end_column, page_width);
 
         if end_char_idx <= start_char_idx {
             return None;
@@ -721,10 +719,7 @@ impl EditableDocument {
 
         Some((
             removed,
-            self.display_position_for_char_index(
-                line_start.saturating_add(indent_len),
-                page_width,
-            ),
+            self.display_position_for_char_index(line_start.saturating_add(indent_len), page_width),
         ))
     }
 
@@ -814,7 +809,10 @@ impl EditableDocument {
                     .saturating_mul(page_width)
                     .saturating_add(display_column)
                     .min(line_char_len);
-                return self.rope.line_to_char(line_index).saturating_add(column_in_line);
+                return self
+                    .rope
+                    .line_to_char(line_index)
+                    .saturating_add(column_in_line);
             }
 
             current_row = current_row.saturating_add(wrapped_rows);
@@ -833,7 +831,11 @@ impl EditableDocument {
         line_start.saturating_add((position.character as usize).min(trimmed_len))
     }
 
-    fn display_position_for_char_index(&self, char_index: usize, page_width: usize) -> (usize, usize) {
+    fn display_position_for_char_index(
+        &self,
+        char_index: usize,
+        page_width: usize,
+    ) -> (usize, usize) {
         let page_width = page_width.max(1);
         let mut current_row = 0usize;
 
@@ -952,7 +954,10 @@ impl EditableDocument {
                 } else if ch == matching_bracket {
                     if depth == 0 {
                         return Some(
-                            self.display_position_for_char_index(index.saturating_add(1), page_width),
+                            self.display_position_for_char_index(
+                                index.saturating_add(1),
+                                page_width,
+                            ),
                         );
                     }
                     depth = depth.saturating_sub(1);
@@ -1046,7 +1051,7 @@ fn detect_indent_width(rope: &Rope) -> usize {
     }
 
     for candidate in [4usize, 2, 8] {
-        if indent_widths.iter().any(|width| *width == candidate)
+        if indent_widths.contains(&candidate)
             && indent_widths.iter().all(|width| width % candidate == 0)
         {
             return candidate;
@@ -1122,10 +1127,12 @@ fn load_git_gutter_markers(path: &Path) -> HashMap<usize, char> {
             continue;
         }
 
-        let Some((old_start, old_count)) = parse_diff_range(ranges[0].trim_start_matches('-')) else {
+        let Some((old_start, old_count)) = parse_diff_range(ranges[0].trim_start_matches('-'))
+        else {
             continue;
         };
-        let Some((new_start, new_count)) = parse_diff_range(ranges[1].trim_start_matches('+')) else {
+        let Some((new_start, new_count)) = parse_diff_range(ranges[1].trim_start_matches('+'))
+        else {
             continue;
         };
 
@@ -1156,4 +1163,3 @@ fn parse_diff_range(range: &str) -> Option<(usize, usize)> {
 
     Some((start.parse().ok()?, count.parse().ok()?))
 }
-*/

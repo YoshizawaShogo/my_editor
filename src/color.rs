@@ -1,5 +1,44 @@
 use ratatui::style::Color;
 
+pub struct AppColors;
+
+impl AppColors {
+    pub const BACKGROUND: Color = BACKGROUND;
+    pub const FOREGROUND: Color = FOREGROUND;
+    pub const MUTED: Color = MUTED;
+    pub const CURRENT_LINE_NUMBER: Color = CURRENT_LINE_NUMBER;
+    pub const INDENT_GUIDE: Color = INDENT_GUIDE;
+    pub const ACCENT: Color = ACCENT;
+    pub const SEARCH_HIGHLIGHT: Color = SEARCH_HIGHLIGHT;
+    pub const SELECTION_HIGHLIGHT: Color = SELECTION_HIGHLIGHT;
+    pub const WORD_HIGHLIGHT: Color = WORD_HIGHLIGHT;
+    pub const GIT_ADDED: Color = GIT_ADDED;
+    pub const GIT_MODIFIED: Color = GIT_MODIFIED;
+    pub const GIT_REMOVED: Color = GIT_REMOVED;
+    pub const DIAGNOSTIC_WARNING: Color = DIAGNOSTIC_WARNING;
+    pub const DIAGNOSTIC_ERROR: Color = DIAGNOSTIC_ERROR;
+    pub const PANEL: Color = PANEL;
+    pub const PANEL_ALT: Color = PANEL_ALT;
+    pub const EDITOR_PANE: Color = EDITOR_PANE;
+    pub const EDITOR_PANE_FOCUSED: Color = EDITOR_PANE_FOCUSED;
+    pub const SPLIT_DIVIDER: Color = SPLIT_DIVIDER;
+    pub const NORMAL_MODE: Color = NORMAL_MODE;
+    pub const INSERT_MODE: Color = INSERT_MODE;
+    pub const SHELL_MODE: Color = SHELL_MODE;
+    pub const SYNTAX_KEYWORD: Color = SYNTAX_KEYWORD;
+    pub const SYNTAX_STRING: Color = SYNTAX_STRING;
+    pub const SYNTAX_COMMENT: Color = SYNTAX_COMMENT;
+    pub const SYNTAX_TYPE: Color = SYNTAX_TYPE;
+    pub const SYNTAX_FUNCTION: Color = SYNTAX_FUNCTION;
+    pub const SYNTAX_VARIABLE: Color = SYNTAX_VARIABLE;
+    pub const SYNTAX_PARAMETER: Color = SYNTAX_PARAMETER;
+    pub const SYNTAX_NUMBER: Color = SYNTAX_NUMBER;
+    pub const SYNTAX_OPERATOR: Color = SYNTAX_OPERATOR;
+    pub const SYNTAX_MACRO: Color = SYNTAX_MACRO;
+    pub const SYNTAX_NAMESPACE: Color = SYNTAX_NAMESPACE;
+    pub const SYNTAX_PROPERTY: Color = SYNTAX_PROPERTY;
+}
+
 pub const BACKGROUND: Color = Color::Rgb(8, 8, 10);
 pub const FOREGROUND: Color = Color::Rgb(198, 204, 214);
 pub const MUTED: Color = Color::Rgb(132, 140, 152);
@@ -16,7 +55,6 @@ pub const DIAGNOSTIC_WARNING: Color = Color::Rgb(219, 184, 116);
 pub const DIAGNOSTIC_ERROR: Color = Color::Rgb(224, 108, 117);
 pub const PANEL: Color = Color::Rgb(20, 22, 26);
 pub const PANEL_ALT: Color = Color::Rgb(28, 31, 36);
-pub const PANEL_SOFT: Color = Color::Rgb(36, 40, 46);
 pub const EDITOR_PANE: Color = Color::Rgb(9, 12, 18);
 pub const EDITOR_PANE_FOCUSED: Color = Color::Rgb(14, 20, 34);
 pub const SPLIT_DIVIDER: Color = Color::Rgb(34, 40, 54);

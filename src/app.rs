@@ -1,10 +1,9 @@
-/*
 use std::{
     collections::{HashSet, VecDeque},
-    fs::File,
     fs,
+    fs::File,
     path::{Path, PathBuf},
-    process::{Child, Command},
+    process::Child,
     sync::mpsc::Receiver,
     time::{Duration, Instant, SystemTime},
 };
@@ -16,14 +15,11 @@ use crate::{
     config,
     document::{
         DiagnosticSeverity, DiagnosticSummary, Document, ScratchDocument, ScratchRow,
-        ScratchTarget,
-        SyntaxTokenSpan,
+        ScratchTarget, SyntaxTokenSpan,
     },
     error::Result,
     mode::Mode,
-    open_candidate::{
-        OpenCandidate, ProjectFileCandidate, collect_project_file_candidates,
-    },
+    open_candidate::{OpenCandidate, ProjectFileCandidate, collect_project_file_candidates},
     picker_match,
 };
 
@@ -32,8 +28,8 @@ mod completion;
 mod keymap;
 mod lsp;
 mod navigation;
-mod replace;
 mod render;
+mod replace;
 mod search;
 pub(crate) mod semantic;
 mod shell;
@@ -46,10 +42,11 @@ use self::completion::{
     has_empty_completion_trigger, rank_completion_items, text_end_position,
 };
 use self::lsp::{
-    GotoKind, HoverPopupState, LspClientState, LspEvent, RenameInputState, RustLspClient,
+    GotoKind, HoverPopupState, LspClient, LspClientState, LspEvent, RenameInputState,
     WorkspaceDiagnosticItem, uri_to_path,
 };
 use self::terminal_session::TerminalSession;
+use crate::language;
 
 pub struct App {
     pub mode: Mode,
@@ -81,10 +78,11 @@ pub struct App {
     pub workspace_diagnostics_cache: WorkspaceDiagnosticsCache,
     pub pending_semantic_tokens_path: Option<PathBuf>,
     pub lsp_document_cache: std::collections::HashMap<PathBuf, CachedLspDocumentState>,
+    pub language_config: Vec<language::LanguageEntry>,
+    pub silent: bool,
 }
 
-fn append_tmp_log(_message: impl AsRef<str>) {
-}
+fn append_tmp_log(_message: impl AsRef<str>) {}
 
 pub struct Workspace {
     pub documents: Vec<DocumentEntry>,
@@ -149,6 +147,7 @@ pub struct SearchInputState {
     pub active: bool,
     pub value: String,
     pub scope: SearchScope,
+    pub options: crate::search_options::SearchOptions,
 }
 
 #[derive(Default)]
@@ -158,6 +157,7 @@ pub struct ReplaceInputState {
     pub replace: String,
     pub scope: SearchScope,
     pub field: ReplaceField,
+    pub options: crate::search_options::SearchOptions,
 }
 
 #[derive(Default)]
@@ -209,12 +209,16 @@ pub struct ToastMessage {
 #[derive(Default)]
 pub struct WorkspaceDiagnosticsCache {
     pub rust_files: Option<Vec<PathBuf>>,
-    pub diagnostics: std::collections::HashMap<PathBuf, std::collections::HashMap<usize, Vec<crate::document::DiagnosticEntry>>>,
+    pub diagnostics: std::collections::HashMap<
+        PathBuf,
+        std::collections::HashMap<usize, Vec<crate::document::DiagnosticEntry>>,
+    >,
 }
 
 pub struct CachedLspDocumentState {
     pub modified: SystemTime,
-    pub diagnostics: Option<std::collections::HashMap<usize, Vec<crate::document::DiagnosticEntry>>>,
+    pub diagnostics:
+        Option<std::collections::HashMap<usize, Vec<crate::document::DiagnosticEntry>>>,
     pub semantic_tokens: Option<std::collections::HashMap<usize, Vec<SyntaxTokenSpan>>>,
 }
 
@@ -223,14 +227,22 @@ impl CachedLspDocumentState {
         modified: SystemTime,
         diagnostics: std::collections::HashMap<usize, Vec<crate::document::DiagnosticEntry>>,
     ) -> Self {
-        Self { modified, diagnostics: Some(diagnostics), semantic_tokens: None }
+        Self {
+            modified,
+            diagnostics: Some(diagnostics),
+            semantic_tokens: None,
+        }
     }
 
     pub fn with_semantic_tokens(
         modified: SystemTime,
         semantic_tokens: std::collections::HashMap<usize, Vec<SyntaxTokenSpan>>,
     ) -> Self {
-        Self { modified, diagnostics: None, semantic_tokens: Some(semantic_tokens) }
+        Self {
+            modified,
+            diagnostics: None,
+            semantic_tokens: Some(semantic_tokens),
+        }
     }
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -257,6 +269,7 @@ pub enum FocusedPane {
 pub struct SearchState {
     pub query: String,
     pub scope: SearchScope,
+    pub options: crate::search_options::SearchOptions,
 }
 
 #[derive(Clone)]
@@ -326,11 +339,13 @@ impl App {
             last_save_feedback: None,
             hover_popup: HoverPopupState::default(),
             rename_input: RenameInputState::default(),
-            lsp: initial_lsp_state(),
+            lsp: LspClientState::Inactive,
             toast: ToastState::default(),
             workspace_diagnostics_cache: WorkspaceDiagnosticsCache::default(),
             pending_semantic_tokens_path: None,
             lsp_document_cache: std::collections::HashMap::new(),
+            language_config: language::load_language_config(),
+            silent: false,
         };
         let _ = app.ensure_lsp_for_current_document();
         app.refresh_picker_candidates()?;
@@ -379,11 +394,6 @@ impl App {
         Ok(())
     }
 
-    /// ピッカーのクエリに一致する候補をソートして返す
-    pub fn picker_matches(&self) -> Vec<OpenCandidate> {
-        picker_match::sort_open_candidates(&self.picker.candidates, &self.picker.query)
-    }
-
     /// ピッカーの候補リストをバッファとプロジェクトファイルから更新する
     pub fn refresh_picker_candidates(&mut self) -> Result<()> {
         let mut candidates = self.workspace.open_buffer_candidates();
@@ -407,7 +417,11 @@ impl App {
 
     /// 現在のカーソル・ビューポート状態をバッファエントリに保存する
     fn save_current_buffer_view_state(&mut self) {
-        if let Some(entry) = self.workspace.documents.get_mut(self.workspace.current_index) {
+        if let Some(entry) = self
+            .workspace
+            .documents
+            .get_mut(self.workspace.current_index)
+        {
             entry.view_state = BufferViewState {
                 row: self.cursor.row,
                 column: self.cursor.column,
@@ -433,7 +447,10 @@ impl App {
     /// 右ペインがターミナルとしてフォーカス中かどうかを返す
     pub(crate) fn is_terminal_pane_focused(&self) -> bool {
         self.focused_pane == FocusedPane::Right
-            && matches!(self.layout_mode, LayoutMode::TerminalSplit | LayoutMode::Single)
+            && matches!(
+                self.layout_mode,
+                LayoutMode::TerminalSplit | LayoutMode::Single
+            )
     }
 
     /// 現在のレイアウトとフォーカスに基づいてページ幅を返す
@@ -512,12 +529,26 @@ impl App {
         }
     }
 
+    /// 言語設定からパスに対応する LSP コマンド情報を返す
+    fn lsp_command_for_path(
+        &self,
+        path: &Path,
+    ) -> Option<(String, Vec<String>, Option<serde_json::Value>)> {
+        let entry = language::detect_language(path, &self.language_config)?;
+        let cmd = entry.lsp_command.clone()?;
+        Some((cmd, entry.lsp_args.clone(), entry.lsp_init_options.clone()))
+    }
+
     /// 現在のドキュメントに対してLSPが動作中か確認し、必要なら起動してドキュメントを登録する
     fn ensure_lsp_for_current_document(&mut self) -> Result<()> {
-        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+        let Some(path) = self
+            .workspace
+            .current_document_path()
+            .map(ToOwned::to_owned)
+        else {
             return Ok(());
         };
-        if !is_rust_source_path(&path) {
+        if self.lsp_command_for_path(&path).is_none() {
             return Ok(());
         }
 
@@ -531,9 +562,18 @@ impl App {
         }
 
         if matches!(self.lsp, LspClientState::Inactive) {
-            self.lsp = match RustLspClient::start(Path::new(".")) {
-                Ok(client) => LspClientState::Ready(client),
-                Err(error) => LspClientState::Failed(format!("{error:?}")),
+            let lsp_info = self.lsp_command_for_path(&path);
+            self.lsp = match lsp_info {
+                Some((cmd, args, opts)) => {
+                    match LspClient::start(Path::new("."), cmd, args, opts) {
+                        Ok(client) => LspClientState::Ready(client),
+                        Err(error) => {
+                            self.show_toast(format!("LSP failed: {error:?}"));
+                            LspClientState::Failed(())
+                        }
+                    }
+                }
+                None => LspClientState::NotAvailable,
             };
         }
 
@@ -555,10 +595,14 @@ impl App {
     /// 現在のドキュメントをLSPに通知してセマンティックトークンをスケジュールする
     fn ensure_current_document_open_for_lsp(&mut self) -> Result<()> {
         let page_width = self.current_page_width();
-        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+        let Some(path) = self
+            .workspace
+            .current_document_path()
+            .map(ToOwned::to_owned)
+        else {
             return Ok(());
         };
-        if !is_rust_source_path(&path) {
+        if self.lsp_command_for_path(&path).is_none() {
             return Ok(());
         }
 
@@ -604,7 +648,10 @@ impl App {
                                 cached.diagnostics = Some(diagnostics.clone());
                             })
                             .or_insert_with(|| {
-                                CachedLspDocumentState::with_diagnostics(modified, diagnostics.clone())
+                                CachedLspDocumentState::with_diagnostics(
+                                    modified,
+                                    diagnostics.clone(),
+                                )
                             });
                     }
                     self.workspace_diagnostics_cache
@@ -642,7 +689,10 @@ impl App {
                                 cached.semantic_tokens = Some(tokens.clone());
                             })
                             .or_insert_with(|| {
-                                CachedLspDocumentState::with_semantic_tokens(modified, tokens.clone())
+                                CachedLspDocumentState::with_semantic_tokens(
+                                    modified,
+                                    tokens.clone(),
+                                )
                             });
                     }
                     if let Some(index) = self.workspace.find_document_index(&path) {
@@ -689,13 +739,17 @@ impl App {
                     self.clear_persistent_toast();
                     let _ = self.open_selection_input(operator, ranges);
                 }
-                LspEvent::CompletionResult { path, serial, items } => {
+                LspEvent::CompletionResult {
+                    path,
+                    serial,
+                    items,
+                } => {
                     self.handle_completion_result(path, serial, items);
                 }
                 LspEvent::Failed(message) => {
                     self.clear_persistent_toast();
-                    self.last_save_feedback = Some(message.clone());
-                    self.lsp = LspClientState::Failed(message);
+                    self.last_save_feedback = Some(message);
+                    self.lsp = LspClientState::Failed(());
                 }
             }
         }
@@ -715,10 +769,14 @@ impl App {
 
     /// 現在のドキュメントの保存をLSPに通知してセマンティックトークンをスケジュールする
     fn sync_current_document_save(&mut self) {
-        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+        let Some(path) = self
+            .workspace
+            .current_document_path()
+            .map(ToOwned::to_owned)
+        else {
             return;
         };
-        if !is_rust_source_path(&path) {
+        if self.lsp_command_for_path(&path).is_none() {
             return;
         }
         if self.ensure_lsp_for_current_document().is_err() {
@@ -760,7 +818,7 @@ impl App {
         let Some(entry) = self.workspace.documents.get(self.workspace.current_index) else {
             return;
         };
-        if !entry.lsp_open || !is_rust_source_path(&entry.path) {
+        if !entry.lsp_open || self.lsp_command_for_path(&entry.path).is_none() {
             return;
         }
         if let LspClientState::Ready(client) = &mut self.lsp {
@@ -839,15 +897,13 @@ impl App {
             return Ok(());
         };
 
-        let Some((start_row, start_column, end_row, end_column)) =
-            operator_range(
-                self.cursor.row,
-                self.cursor.column,
-                found_row,
-                found_column,
-                find_kind,
-            )
-        else {
+        let Some((start_row, start_column, end_row, end_column)) = operator_range(
+            self.cursor.row,
+            self.cursor.column,
+            found_row,
+            found_column,
+            find_kind,
+        ) else {
             return Ok(());
         };
 
@@ -930,7 +986,11 @@ impl App {
     }
 
     /// 指定方向で対象文字の最初のマッチ位置を返す
-    fn find_target_position(&self, find_kind: FindKind, target: char) -> Result<Option<(usize, usize)>> {
+    fn find_target_position(
+        &self,
+        find_kind: FindKind,
+        target: char,
+    ) -> Result<Option<(usize, usize)>> {
         let page_width = self.current_page_width();
         let document = self.workspace.current_document();
         let total_rows = document.total_rows(page_width).unwrap_or(0);
@@ -967,7 +1027,9 @@ impl App {
                         line_chars.len()
                     };
 
-                    if let Some(column) = (0..end_column).rev().find(|index| line_chars[*index] == target)
+                    if let Some(column) = (0..end_column)
+                        .rev()
+                        .find(|index| line_chars[*index] == target)
                     {
                         return Ok(Some((row, column)));
                     }
@@ -995,7 +1057,10 @@ impl App {
             ReplayableAction::Find(find_kind, target) => {
                 self.run_find_motion(invert_find_kind(find_kind, reverse), target)?;
             }
-            ReplayableAction::Diagnostic { error_only, forward } => {
+            ReplayableAction::Diagnostic {
+                error_only,
+                forward,
+            } => {
                 if forward ^ reverse {
                     self.jump_to_next_diagnostic(error_only);
                 } else {
@@ -1153,10 +1218,10 @@ impl App {
             .delete_current_line(self.cursor.row, page_width)
         {
             self.yank_buffer = YankBuffer::Linewise(line_text);
-        self.cursor.row = row;
-        self.cursor.column = column;
-        self.clamp_vertical_state();
-    }
+            self.cursor.row = row;
+            self.cursor.column = column;
+            self.clamp_vertical_state();
+        }
         self.workspace.current_document_mut().end_undo_group();
 
         Ok(())
@@ -1217,7 +1282,10 @@ impl App {
 
     /// 行番号入力UIを開く
     fn open_go_input(&mut self) {
-        self.go_input = GoInputState { active: true, ..Default::default() };
+        self.go_input = GoInputState {
+            active: true,
+            ..Default::default()
+        };
     }
 
     /// 行番号入力UIを閉じてデフォルト状態にリセットする
@@ -1588,7 +1656,7 @@ impl App {
         if let Some(index) = self.workspace.find_document_index(&path) {
             self.make_document_current(index);
         } else {
-                    self.open_document(path.clone())?;
+            self.open_document(path.clone())?;
         }
 
         if let Some((row, column)) = self
@@ -1603,26 +1671,31 @@ impl App {
         Ok(())
     }
 
-    /// 現在カーソルのRustファイルパスとLSP位置を返す
+    /// 現在カーソルのLSP対象ファイルパスとLSP位置を返す
     fn current_rust_lsp_position(&self) -> Option<(PathBuf, Position)> {
         let path = self.workspace.current_document_path()?.to_path_buf();
-        if !is_rust_source_path(&path) {
-            return None;
-        }
-        let position = self.workspace.current_document().lsp_position_for_display_position(
-            self.cursor.row,
-            self.cursor.column,
-            self.current_page_width(),
-        )?;
+        self.lsp_command_for_path(&path)?;
+        let position = self
+            .workspace
+            .current_document()
+            .lsp_position_for_display_position(
+                self.cursor.row,
+                self.cursor.column,
+                self.current_page_width(),
+            )?;
         Some((path, position))
     }
 
     /// ディスク上の現在ドキュメント内容をLSPに同期する
     fn sync_current_document_saved_state_for_lsp(&mut self) {
-        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+        let Some(path) = self
+            .workspace
+            .current_document_path()
+            .map(ToOwned::to_owned)
+        else {
             return;
         };
-        if !is_rust_source_path(&path) {
+        if self.lsp_command_for_path(&path).is_none() {
             return;
         }
         let Ok(text) = fs::read_to_string(&path) else {
@@ -1778,10 +1851,17 @@ impl App {
                 lsp_types::DocumentChanges::Edits(edits) => {
                     for change in edits {
                         if let Some(path) = uri_to_path(&change.text_document.uri) {
-                            self.apply_text_edits_to_path(path, &change.edits.into_iter().map(|edit| match edit {
-                                lsp_types::OneOf::Left(text_edit) => text_edit,
-                                lsp_types::OneOf::Right(annotated) => annotated.text_edit,
-                            }).collect::<Vec<_>>())?;
+                            self.apply_text_edits_to_path(
+                                path,
+                                &change
+                                    .edits
+                                    .into_iter()
+                                    .map(|edit| match edit {
+                                        lsp_types::OneOf::Left(text_edit) => text_edit,
+                                        lsp_types::OneOf::Right(annotated) => annotated.text_edit,
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )?;
                         }
                     }
                 }
@@ -1795,7 +1875,9 @@ impl App {
     /// 指定パスのドキュメントにテキスト編集を適用し、必要なら開いてから適用する
     fn apply_text_edits_to_path(&mut self, path: PathBuf, edits: &[TextEdit]) -> Result<()> {
         if let Some(index) = self.workspace.find_document_index(&path) {
-            self.workspace.documents[index].document.apply_text_edits(edits);
+            self.workspace.documents[index]
+                .document
+                .apply_text_edits(edits);
             self.workspace.documents[index].version += 1;
             if index == self.workspace.current_index {
                 self.clamp_vertical_state();
@@ -1805,7 +1887,9 @@ impl App {
 
         self.open_document(path.clone())?;
         let index = self.workspace.current_index;
-        self.workspace.documents[index].document.apply_text_edits(edits);
+        self.workspace.documents[index]
+            .document
+            .apply_text_edits(edits);
         self.workspace.documents[index].version += 1;
         Ok(())
     }
@@ -1813,17 +1897,16 @@ impl App {
     /// 行番号入力を確定して指定行にジャンプする
     fn submit_go_input(&mut self) -> Result<()> {
         let page_width = self.current_page_width();
-        if let Ok(line_number) = self.go_input.value.parse::<usize>() {
-            if let Some(row) = self
+        if let Ok(line_number) = self.go_input.value.parse::<usize>()
+            && let Some(row) = self
                 .workspace
                 .current_document()
                 .jump_row_for_line_number(line_number, page_width)
-            {
-                self.push_jump_history();
-                self.cursor.column = 0;
-                self.jump_with_context(row, page_width);
-                self.show_toast(format!("Go to line {line_number}"));
-            }
+        {
+            self.push_jump_history();
+            self.cursor.column = 0;
+            self.jump_with_context(row, page_width);
+            self.show_toast(format!("Go to line {line_number}"));
         }
 
         self.close_go_input();
@@ -1837,10 +1920,13 @@ impl App {
                 PickerScope::All => PickerScope::Buffers,
                 PickerScope::Buffers => PickerScope::All,
             };
-            self.show_toast(format!("Open [{}]", match self.picker.scope {
-                PickerScope::All => "all",
-                PickerScope::Buffers => "buffers",
-            }));
+            self.show_toast(format!(
+                "Open [{}]",
+                match self.picker.scope {
+                    PickerScope::All => "all",
+                    PickerScope::Buffers => "buffers",
+                }
+            ));
         } else {
             self.picker.active = true;
             self.picker.query.clear();
@@ -1923,10 +2009,14 @@ impl App {
 
     /// 現在のドキュメントの変更内容をLSPに送信してセマンティックトークンを再取得する
     fn refresh_current_document_semantic_tokens(&mut self) {
-        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+        let Some(path) = self
+            .workspace
+            .current_document_path()
+            .map(ToOwned::to_owned)
+        else {
             return;
         };
-        if !is_rust_source_path(&path) {
+        if self.lsp_command_for_path(&path).is_none() {
             return;
         }
         let Some(text) = self.workspace.current_document().full_text() else {
@@ -1934,9 +2024,15 @@ impl App {
         };
 
         if matches!(self.lsp, LspClientState::Inactive) {
-            self.lsp = match RustLspClient::start(Path::new(".")) {
-                Ok(client) => LspClientState::Ready(client),
-                Err(_) => return,
+            let lsp_info = self.lsp_command_for_path(&path);
+            self.lsp = match lsp_info {
+                Some((cmd, args, opts)) => {
+                    match LspClient::start(Path::new("."), cmd, args, opts) {
+                        Ok(client) => LspClientState::Ready(client),
+                        Err(_) => return,
+                    }
+                }
+                None => return,
             };
         }
 
@@ -1958,16 +2054,20 @@ impl App {
 
     /// 現在のドキュメントをディスクに保存してLSPへ通知しトーストを表示する
     fn save_current_document(&mut self) -> Result<()> {
-        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+        let Some(path) = self
+            .workspace
+            .current_document_path()
+            .map(ToOwned::to_owned)
+        else {
             return Ok(());
         };
         self.workspace.current_document_mut().save(&path)?;
-        if is_rust_source_path(&path) {
+        if self.lsp_command_for_path(&path).is_some() {
             self.sync_current_document_save();
             self.poll_lsp();
             let summary = self.current_diagnostic_summary();
             self.last_save_feedback =
-                Some(format!("rust-analyzer E{} W{}", summary.errors, summary.warnings));
+                Some(format!("LSP E{} W{}", summary.errors, summary.warnings));
         } else {
             self.last_save_feedback = Some("saved".to_owned());
         }
@@ -2061,15 +2161,17 @@ impl App {
 
     /// シングルペインレイアウトに戻してフォーカスを左ペインにする
     fn collapse_to_single_pane(&mut self) {
-        if self.focused_pane == FocusedPane::Right && self.layout_mode == LayoutMode::TerminalSplit {
+        if self.focused_pane == FocusedPane::Right && self.layout_mode == LayoutMode::TerminalSplit
+        {
             self.layout_mode = LayoutMode::Single;
             return;
         }
 
-        if self.layout_mode == LayoutMode::Dual && self.focused_pane == FocusedPane::Right {
-            if let Some(other_index) = self.workspace.secondary_index() {
-                self.select_current_document(other_index);
-            }
+        if self.layout_mode == LayoutMode::Dual
+            && self.focused_pane == FocusedPane::Right
+            && let Some(other_index) = self.workspace.secondary_index()
+        {
+            self.select_current_document(other_index);
         }
 
         self.layout_mode = LayoutMode::Single;
@@ -2159,11 +2261,15 @@ impl App {
 
     /// 補完の更新をスケジュールし、条件を満たさない場合は補完を閉じる
     fn schedule_completion_refresh(&mut self) {
-        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+        let Some(path) = self
+            .workspace
+            .current_document_path()
+            .map(ToOwned::to_owned)
+        else {
             self.close_completion();
             return;
         };
-        if !is_rust_source_path(&path) {
+        if self.lsp_command_for_path(&path).is_none() {
             self.close_completion();
             return;
         }
@@ -2195,7 +2301,11 @@ impl App {
 
     /// 遅延補完リクエストの送信タイミングを確認して送信し、変更があればtrueを返す
     fn poll_completion(&mut self) -> bool {
-        if self.mode != Mode::Insert || self.picker.active || self.search_input.active || self.replace_input.active {
+        if self.mode != Mode::Insert
+            || self.picker.active
+            || self.search_input.active
+            || self.replace_input.active
+        {
             return false;
         }
 
@@ -2219,11 +2329,15 @@ impl App {
 
     /// LSPまたはフォールバックで補完を要求する
     fn request_completion(&mut self, serial: u64) {
-        let Some(path) = self.workspace.current_document_path().map(ToOwned::to_owned) else {
+        let Some(path) = self
+            .workspace
+            .current_document_path()
+            .map(ToOwned::to_owned)
+        else {
             self.apply_completion_fallback(serial);
             return;
         };
-        if !is_rust_source_path(&path) {
+        if self.lsp_command_for_path(&path).is_none() {
             self.close_completion();
             return;
         }
@@ -2248,9 +2362,18 @@ impl App {
                 self.apply_completion_fallback(serial);
             }
             LspClientState::Inactive => {
-                self.lsp = match RustLspClient::start(Path::new(".")) {
-                    Ok(client) => LspClientState::Ready(client),
-                    Err(_) => {
+                let lsp_info = self.lsp_command_for_path(&path);
+                self.lsp = match lsp_info {
+                    Some((cmd, args, opts)) => {
+                        match LspClient::start(Path::new("."), cmd, args, opts) {
+                            Ok(client) => LspClientState::Ready(client),
+                            Err(_) => {
+                                self.apply_completion_fallback(serial);
+                                return;
+                            }
+                        }
+                    }
+                    None => {
                         self.apply_completion_fallback(serial);
                         return;
                     }
@@ -2296,19 +2419,19 @@ impl App {
     }
 
     /// LSPから受け取った補完結果をランク付けして補完リストに反映する
-    fn handle_completion_result(
-        &mut self,
-        path: PathBuf,
-        serial: u64,
-        items: Vec<CompletionItem>,
-    ) {
+    fn handle_completion_result(&mut self, path: PathBuf, serial: u64, items: Vec<CompletionItem>) {
         if self.mode != Mode::Insert {
             return;
         }
         if self.completion.serial != serial {
             return;
         }
-        if self.completion.path.as_ref().is_some_and(|current| current != &path) {
+        if self
+            .completion
+            .path
+            .as_ref()
+            .is_some_and(|current| current != &path)
+        {
             return;
         }
 
@@ -2367,7 +2490,10 @@ impl App {
         });
 
         let cursor_position = text_end_position(edit.range.start, &edit.new_text);
-        let applied = self.workspace.current_document_mut().apply_text_edits(&[edit]);
+        let applied = self
+            .workspace
+            .current_document_mut()
+            .apply_text_edits(&[edit]);
         if applied {
             self.workspace.documents[self.workspace.current_index].version += 1;
             if let Some((row, column)) = self
@@ -2482,12 +2608,7 @@ fn operator_range(
             found_column.saturating_add(1),
         ),
         FindKind::TillForward => (cursor_row, cursor_column, found_row, found_column),
-        FindKind::Backward => (
-            found_row,
-            found_column,
-            cursor_row,
-            cursor_column,
-        ),
+        FindKind::Backward => (found_row, found_column, cursor_row, cursor_column),
         FindKind::TillBackward => (
             found_row,
             found_column.saturating_add(1),
@@ -2496,27 +2617,12 @@ fn operator_range(
         ),
     };
 
-    (start_row < end_row || end_column > start_column)
-        .then_some((start_row, start_column, end_row, end_column))
-}
-
-/// rust-analyzerコマンドが実行可能かを確認する
-fn rust_analyzer_available() -> bool {
-    Command::new("rust-analyzer")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-/// rust-analyzerとCargo.tomlの有無からLSP初期状態を返す
-fn initial_lsp_state() -> LspClientState {
-    let available = rust_analyzer_available() && Path::new("Cargo.toml").exists();
-    if available {
-        LspClientState::Inactive
-    } else {
-        LspClientState::NotAvailable
-    }
+    (start_row < end_row || end_column > start_column).then_some((
+        start_row,
+        start_column,
+        end_row,
+        end_column,
+    ))
 }
 
 /// 診断の重大度を表示ラベル文字列に変換する
@@ -2525,11 +2631,6 @@ fn diagnostic_label(severity: DiagnosticSeverity) -> &'static str {
         DiagnosticSeverity::Warning => "Warning",
         DiagnosticSeverity::Error => "Error",
     }
-}
-
-/// パスが.rs拡張子のRustソースファイルかを返す
-fn is_rust_source_path(path: &Path) -> bool {
-    path.extension().and_then(|ext| ext.to_str()) == Some("rs")
 }
 
 /// セマンティックトークンリクエストを診断の後まで遅延すべきかを返す
@@ -2544,4 +2645,3 @@ fn should_wait_for_diagnostics_before_semantic(path: &Path) -> bool {
 fn _project_file_display_name(candidate: &ProjectFileCandidate) -> &str {
     &candidate.display_name
 }
-*/

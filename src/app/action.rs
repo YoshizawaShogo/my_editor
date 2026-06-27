@@ -1,7 +1,7 @@
 #[derive(Clone, Copy)]
 pub enum ReplayableAction {
     GitHunk { forward: bool },
-    Find { kind: FindKind, ch: char },
+    Find(FindKind, char),
     Diagnostic { error_only: bool, forward: bool },
     Search { forward: bool },
 }
@@ -10,9 +10,9 @@ pub enum ReplayableAction {
 pub enum PendingNormalAction {
     GoPrefix,
     DiagnosticPrefix,
-    Find { kind: FindKind },
-    Operator { operator: PendingOperator },
-    OperatorFind { operator: PendingOperator, find_kind: FindKind },
+    Find(FindKind),
+    Operator(PendingOperator),
+    OperatorFind(PendingOperator, FindKind),
 }
 
 #[derive(Clone, Copy)]

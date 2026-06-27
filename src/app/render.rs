@@ -1,4 +1,3 @@
-/*
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -53,11 +52,8 @@ impl App {
             self.render_content(frame, layout[0]);
             frame.render_widget(footer, footer_layout[0]);
 
-            let pending = Paragraph::new(format!(" {command_hint} ")).style(
-                Style::default()
-                    .fg(AppColors::ACCENT)
-                    .bg(AppColors::PANEL),
-            );
+            let pending = Paragraph::new(format!(" {command_hint} "))
+                .style(Style::default().fg(AppColors::ACCENT).bg(AppColors::PANEL));
             frame.render_widget(pending, footer_layout[1]);
 
             if self.go_input.active {
@@ -69,7 +65,11 @@ impl App {
                             .borders(Borders::ALL)
                             .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
                     )
-                    .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
+                    .style(
+                        Style::default()
+                            .bg(AppColors::PANEL)
+                            .fg(AppColors::FOREGROUND),
+                    );
                 frame.render_widget(Clear, popup);
                 frame.render_widget(input, popup);
             }
@@ -83,7 +83,11 @@ impl App {
                             .borders(Borders::ALL)
                             .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
                     )
-                    .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
+                    .style(
+                        Style::default()
+                            .bg(AppColors::PANEL)
+                            .fg(AppColors::FOREGROUND),
+                    );
                 frame.render_widget(Clear, popup);
                 frame.render_widget(input, popup);
             }
@@ -93,15 +97,31 @@ impl App {
             }
 
             if self.search_input.active {
-                let popup = centered_rect(36, 3, area);
+                let opts = &self.search_input.options;
+                let opts_str = format!(
+                    " [{}][{}][{}]",
+                    if opts.case_sensitive { "Aa" } else { "aa" },
+                    if opts.whole_word { "\\b" } else { ".." },
+                    if opts.use_regex { ".*" } else { "--" },
+                );
+                let title = format!(
+                    " Search [{}]{}: ",
+                    self.search_input.scope.label(),
+                    opts_str,
+                );
+                let popup = top_right_rect(50, 3, area);
                 let input = Paragraph::new(self.search_input.value.clone())
                     .block(
                         Block::default()
-                            .title(format!(" Search [{}]: ", self.search_input.scope.label()))
+                            .title(title)
                             .borders(Borders::ALL)
                             .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
                     )
-                    .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
+                    .style(
+                        Style::default()
+                            .bg(AppColors::PANEL)
+                            .fg(AppColors::FOREGROUND),
+                    );
                 frame.render_widget(Clear, popup);
                 frame.render_widget(input, popup);
             }
@@ -118,12 +138,24 @@ impl App {
                 self.render_picker(frame, area);
             }
 
-            if self.completion.active && !self.completion.items.is_empty() && self.mode == Mode::Insert {
+            if self.completion.active
+                && !self.completion.items.is_empty()
+                && self.mode == Mode::Insert
+            {
                 self.render_completion_popup(frame, layout[0]);
             }
 
-            if !self.toast.transient_messages.is_empty() || self.toast.persistent_message.is_some() {
+            if !self.toast.transient_messages.is_empty() || self.toast.persistent_message.is_some()
+            {
                 self.render_toasts(frame, layout[0]);
+            }
+
+            if !self.silent
+                && self.workspace.has_documents()
+                && !self.search_input.active
+                && !self.replace_input.active
+            {
+                self.render_which_key_popup(frame, layout[0]);
             }
 
             let cursor_position = if self.go_input.active {
@@ -226,8 +258,12 @@ impl App {
     }
 
     fn active_document(&self) -> Option<&crate::document::Document> {
-        self.active_document_index()
-            .and_then(|index| self.workspace.documents.get(index).map(|entry| &entry.document))
+        self.active_document_index().and_then(|index| {
+            self.workspace
+                .documents
+                .get(index)
+                .map(|entry| &entry.document)
+        })
     }
 
     fn active_document_name(&self) -> Option<String> {
@@ -265,7 +301,7 @@ impl App {
                 ])
                 .split(area);
                 self.render_split_divider(frame, panes[1]);
-                let left_index = self.workspace.documents.get(0).map(|_| 0);
+                let left_index = self.workspace.documents.first().map(|_| 0);
                 let right_index = self.workspace.documents.get(1).map(|_| 1);
                 if let Some(index) = left_index {
                     self.render_document_pane(
@@ -341,11 +377,12 @@ impl App {
             .document
             .render_first_page(viewport_row, area.height as usize, area.width as usize)
             .expect("document render should succeed during draw");
-        let search_query = if self.search_input.active && document_index == self.workspace.current_index {
-            Some(self.search_input.value.as_str())
-        } else {
-            None
-        };
+        let search_query =
+            if self.search_input.active && document_index == self.workspace.current_index {
+                Some(self.search_input.value.as_str())
+            } else {
+                None
+            };
         let pane_background = if focused {
             AppColors::EDITOR_PANE_FOCUSED
         } else {
@@ -391,7 +428,11 @@ impl App {
     ) {
         let widget = Paragraph::new(label.to_owned()).style(
             Style::default()
-                .fg(if focused { AppColors::ACCENT } else { AppColors::MUTED })
+                .fg(if focused {
+                    AppColors::ACCENT
+                } else {
+                    AppColors::MUTED
+                })
                 .bg(if focused {
                     AppColors::EDITOR_PANE_FOCUSED
                 } else {
@@ -403,8 +444,7 @@ impl App {
 
     fn render_terminal_pane(&self, frame: &mut ratatui::Frame<'_>, area: Rect, focused: bool) {
         let lines = self.terminal_screen_lines(area);
-        let widget = Paragraph::new(lines)
-        .style(
+        let widget = Paragraph::new(lines).style(
             Style::default()
                 .fg(if focused {
                     AppColors::SHELL_MODE
@@ -417,9 +457,8 @@ impl App {
     }
 
     fn render_split_divider(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let divider = Paragraph::new(vec![Line::from(" "); area.height as usize]).style(
-            Style::default().bg(AppColors::SPLIT_DIVIDER),
-        );
+        let divider = Paragraph::new(vec![Line::from(" "); area.height as usize])
+            .style(Style::default().bg(AppColors::SPLIT_DIVIDER));
         frame.render_widget(divider, area);
     }
 
@@ -430,10 +469,16 @@ impl App {
             .style(Style::default().bg(AppColors::BACKGROUND));
         frame.render_widget(block, area);
 
-        let art = vec![Line::from(Span::styled(
-            "Press Ctrl-P to open a file.",
-            Style::default().fg(AppColors::ACCENT),
-        ))];
+        let art = vec![
+            Line::from(Span::styled(
+                "Press Ctrl-T to open a file.",
+                Style::default().fg(AppColors::ACCENT),
+            )),
+            Line::from(Span::styled(
+                "Press Ctrl-Q to quit.",
+                Style::default().fg(AppColors::MUTED),
+            )),
+        ];
 
         let inner = Rect::new(
             area.x.saturating_add(2),
@@ -441,8 +486,11 @@ impl App {
             area.width.saturating_sub(4),
             area.height.saturating_sub(2),
         );
-        let widget = Paragraph::new(art)
-            .style(Style::default().fg(AppColors::FOREGROUND).bg(AppColors::BACKGROUND));
+        let widget = Paragraph::new(art).style(
+            Style::default()
+                .fg(AppColors::FOREGROUND)
+                .bg(AppColors::BACKGROUND),
+        );
         frame.render_widget(widget, inner);
     }
 
@@ -485,13 +533,17 @@ impl App {
                     .borders(Borders::ALL)
                     .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
             )
-            .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
+            .style(
+                Style::default()
+                    .bg(AppColors::PANEL)
+                    .fg(AppColors::FOREGROUND),
+            );
         frame.render_widget(Clear, popup);
         frame.render_widget(widget, popup);
     }
 
     fn render_replace_popup(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let popup = centered_rect(64, 9, area);
+        let popup = top_right_rect(64, 9, area);
         let inner = Layout::vertical([
             Constraint::Length(3),
             Constraint::Length(3),
@@ -508,8 +560,19 @@ impl App {
         } else {
             Style::default().fg(AppColors::FOREGROUND)
         };
+        let opts = &self.replace_input.options;
+        let opts_str = format!(
+            "[{}][{}][{}]",
+            if opts.case_sensitive { "Aa" } else { "aa" },
+            if opts.whole_word { "\\b" } else { ".." },
+            if opts.use_regex { ".*" } else { "--" },
+        );
         let frame_widget = Block::default()
-            .title(format!(" Replace [{}] ", self.replace_input.scope.label()))
+            .title(format!(
+                " Replace [{}] {} ",
+                self.replace_input.scope.label(),
+                opts_str
+            ))
             .borders(Borders::ALL)
             .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT));
         frame.render_widget(Clear, popup);
@@ -520,25 +583,26 @@ impl App {
                 Block::default()
                     .title(" From ")
                     .borders(Borders::ALL)
-                    .style(Style::default().bg(AppColors::PANEL).fg(if self.replace_input.field == ReplaceField::Find {
-                        AppColors::ACCENT
-                    } else {
-                        AppColors::MUTED
-                    })),
+                    .style(Style::default().bg(AppColors::PANEL).fg(
+                        if self.replace_input.field == ReplaceField::Find {
+                            AppColors::ACCENT
+                        } else {
+                            AppColors::MUTED
+                        },
+                    )),
             )
             .style(find_style.bg(AppColors::PANEL))
             .wrap(Wrap { trim: false });
         let to = Paragraph::new(self.replace_input.replace.clone())
-            .block(
-                Block::default()
-                    .title(" To ")
-                    .borders(Borders::ALL)
-                    .style(Style::default().bg(AppColors::PANEL).fg(if self.replace_input.field == ReplaceField::Replace {
+            .block(Block::default().title(" To ").borders(Borders::ALL).style(
+                Style::default().bg(AppColors::PANEL).fg(
+                    if self.replace_input.field == ReplaceField::Replace {
                         AppColors::ACCENT
                     } else {
                         AppColors::MUTED
-                    })),
-            )
+                    },
+                ),
+            ))
             .style(replace_style.bg(AppColors::PANEL))
             .wrap(Wrap { trim: false });
         frame.render_widget(from, inner[0]);
@@ -565,7 +629,11 @@ impl App {
                     .borders(Borders::ALL)
                     .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
             )
-            .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
+            .style(
+                Style::default()
+                    .bg(AppColors::PANEL)
+                    .fg(AppColors::FOREGROUND),
+            );
         frame.render_widget(Clear, popup);
         frame.render_widget(widget, popup);
     }
@@ -590,7 +658,11 @@ impl App {
                     .borders(Borders::ALL)
                     .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
             )
-            .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
+            .style(
+                Style::default()
+                    .bg(AppColors::PANEL)
+                    .fg(AppColors::FOREGROUND),
+            );
         frame.render_widget(Clear, popup);
         frame.render_widget(widget, popup);
     }
@@ -606,12 +678,12 @@ impl App {
             .max()
             .unwrap_or(8)
             .min(48) as u16;
-        let width = max_label_width.saturating_add(2).clamp(12, area.width.min(50));
+        let width = max_label_width
+            .saturating_add(2)
+            .clamp(12, area.width.min(50));
         let item_count = self.completion.items.len().min(8) as u16;
         let height = item_count.saturating_add(2).min(area.height.max(3));
-        let x = cursor
-            .x
-            .min(area.x + area.width.saturating_sub(width));
+        let x = cursor.x.min(area.x + area.width.saturating_sub(width));
         let mut y = cursor.y.saturating_add(1);
         if y + height > area.y + area.height {
             y = cursor.y.saturating_sub(height.saturating_sub(1));
@@ -643,7 +715,11 @@ impl App {
                     .borders(Borders::ALL)
                     .style(Style::default().bg(AppColors::PANEL).fg(AppColors::ACCENT)),
             )
-            .style(Style::default().bg(AppColors::PANEL).fg(AppColors::FOREGROUND));
+            .style(
+                Style::default()
+                    .bg(AppColors::PANEL)
+                    .fg(AppColors::FOREGROUND),
+            );
         frame.render_widget(Clear, popup);
         frame.render_widget(widget, popup);
     }
@@ -675,35 +751,87 @@ impl App {
             let x = area.x + area.width.saturating_sub(popup_width);
             let y = area.y + area.height.saturating_sub(rendered_height + height);
             let popup = Rect::new(x, y, popup_width, height);
-            let widget = Paragraph::new(
-                wrapped
-                    .into_iter()
-                    .map(Line::from)
-                    .collect::<Vec<_>>(),
-            )
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .style(Style::default().bg(AppColors::PANEL_ALT).fg(if persistent {
+            let widget = Paragraph::new(wrapped.into_iter().map(Line::from).collect::<Vec<_>>())
+                .block(Block::default().borders(Borders::ALL).style(
+                    Style::default().bg(AppColors::PANEL_ALT).fg(if persistent {
                         AppColors::ACCENT
                     } else {
                         AppColors::FOREGROUND
-                    })),
-            )
-            .style(
-                Style::default()
-                    .fg(if persistent {
-                        AppColors::ACCENT
-                    } else {
-                        AppColors::FOREGROUND
-                    })
-                    .bg(AppColors::PANEL_ALT),
-            )
-            .wrap(Wrap { trim: false });
+                    }),
+                ))
+                .style(
+                    Style::default()
+                        .fg(if persistent {
+                            AppColors::ACCENT
+                        } else {
+                            AppColors::FOREGROUND
+                        })
+                        .bg(AppColors::PANEL_ALT),
+                )
+                .wrap(Wrap { trim: false });
             frame.render_widget(Clear, popup);
             frame.render_widget(widget, popup);
             rendered_height = rendered_height.saturating_add(height);
         }
+    }
+
+    fn render_which_key_popup(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        use crate::keymap_hints;
+
+        let hints: &[keymap_hints::KeyHint] = match self.pending_normal_action {
+            Some(PendingNormalAction::GoPrefix) => keymap_hints::GO_PREFIX_HINTS,
+            Some(PendingNormalAction::DiagnosticPrefix) => keymap_hints::DIAGNOSTIC_PREFIX_HINTS,
+            Some(PendingNormalAction::Operator(PendingOperator::Change)) => {
+                keymap_hints::CHANGE_OPERATOR_HINTS
+            }
+            Some(PendingNormalAction::Operator(PendingOperator::Delete)) => {
+                keymap_hints::DELETE_OPERATOR_HINTS
+            }
+            Some(PendingNormalAction::Operator(PendingOperator::Yank)) => {
+                keymap_hints::YANK_OPERATOR_HINTS
+            }
+            _ => keymap_hints::TOP_LEVEL_HINTS,
+        };
+
+        let key_col_width: u16 = 8;
+        let desc_col_width: u16 = 22;
+        let inner_width = key_col_width + desc_col_width;
+        let popup_width = inner_width + 2;
+        let popup_height = hints.len() as u16 + 2;
+
+        if area.width < popup_width || area.height < popup_height {
+            return;
+        }
+
+        let x = area.x + area.width.saturating_sub(popup_width);
+        let y = area.y;
+        let popup = Rect::new(x, y, popup_width, popup_height);
+
+        let lines: Vec<Line<'_>> = hints
+            .iter()
+            .map(|h| {
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {:<width$}", h.key, width = key_col_width as usize - 1),
+                        Style::default().fg(AppColors::ACCENT),
+                    ),
+                    Span::styled(h.description, Style::default().fg(AppColors::MUTED)),
+                ])
+            })
+            .collect();
+
+        let widget = Paragraph::new(lines)
+            .block(
+                Block::default().borders(Borders::ALL).style(
+                    Style::default()
+                        .bg(AppColors::PANEL_ALT)
+                        .fg(AppColors::MUTED),
+                ),
+            )
+            .style(Style::default().bg(AppColors::PANEL_ALT));
+
+        frame.render_widget(Clear, popup);
+        frame.render_widget(widget, popup);
     }
 
     fn pending_input_text(&self) -> Option<String> {
@@ -720,9 +848,10 @@ impl App {
             Some(PendingNormalAction::OperatorFind(PendingOperator::Change, FindKind::Forward)) => {
                 Some("cf".to_owned())
             }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Change, FindKind::Backward)) => {
-                Some("cF".to_owned())
-            }
+            Some(PendingNormalAction::OperatorFind(
+                PendingOperator::Change,
+                FindKind::Backward,
+            )) => Some("cF".to_owned()),
             Some(PendingNormalAction::OperatorFind(
                 PendingOperator::Change,
                 FindKind::TillForward,
@@ -734,9 +863,10 @@ impl App {
             Some(PendingNormalAction::OperatorFind(PendingOperator::Delete, FindKind::Forward)) => {
                 Some("df".to_owned())
             }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Delete, FindKind::Backward)) => {
-                Some("dF".to_owned())
-            }
+            Some(PendingNormalAction::OperatorFind(
+                PendingOperator::Delete,
+                FindKind::Backward,
+            )) => Some("dF".to_owned()),
             Some(PendingNormalAction::OperatorFind(
                 PendingOperator::Delete,
                 FindKind::TillForward,
@@ -751,12 +881,14 @@ impl App {
             Some(PendingNormalAction::OperatorFind(PendingOperator::Yank, FindKind::Backward)) => {
                 Some("yF".to_owned())
             }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Yank, FindKind::TillForward)) => {
-                Some("yt".to_owned())
-            }
-            Some(PendingNormalAction::OperatorFind(PendingOperator::Yank, FindKind::TillBackward)) => {
-                Some("yT".to_owned())
-            }
+            Some(PendingNormalAction::OperatorFind(
+                PendingOperator::Yank,
+                FindKind::TillForward,
+            )) => Some("yt".to_owned()),
+            Some(PendingNormalAction::OperatorFind(
+                PendingOperator::Yank,
+                FindKind::TillBackward,
+            )) => Some("yT".to_owned()),
             None => None,
         }
     }
@@ -767,8 +899,12 @@ impl App {
             Some(ReplayableAction::GitHunk { forward: false }) => Some("gG".to_owned()),
             Some(ReplayableAction::Find(FindKind::Forward, target)) => Some(format!("f{target}")),
             Some(ReplayableAction::Find(FindKind::Backward, target)) => Some(format!("F{target}")),
-            Some(ReplayableAction::Find(FindKind::TillForward, target)) => Some(format!("t{target}")),
-            Some(ReplayableAction::Find(FindKind::TillBackward, target)) => Some(format!("T{target}")),
+            Some(ReplayableAction::Find(FindKind::TillForward, target)) => {
+                Some(format!("t{target}"))
+            }
+            Some(ReplayableAction::Find(FindKind::TillBackward, target)) => {
+                Some(format!("T{target}"))
+            }
             Some(ReplayableAction::Diagnostic {
                 error_only: false,
                 forward: true,
@@ -835,8 +971,12 @@ impl App {
             };
             let (row, col) = parser.screen().cursor_position();
             return Position::new(
-                pane_area.x.saturating_add(col.min(pane_area.width.saturating_sub(1))),
-                pane_area.y.saturating_add(row.min(pane_area.height.saturating_sub(1))),
+                pane_area
+                    .x
+                    .saturating_add(col.min(pane_area.width.saturating_sub(1))),
+                pane_area
+                    .y
+                    .saturating_add(row.min(pane_area.height.saturating_sub(1))),
             );
         }
 
@@ -859,7 +999,8 @@ impl App {
     fn go_input_cursor_position(&self, area: Rect) -> Position {
         let popup = centered_rect(24, 3, area);
         Position::new(
-            popup.x
+            popup
+                .x
                 .saturating_add(5 + self.go_input.value.chars().count() as u16),
             popup.y.saturating_add(1),
         )
@@ -868,7 +1009,8 @@ impl App {
     fn search_input_cursor_position(&self, area: Rect) -> Position {
         let popup = centered_rect(36, 3, area);
         Position::new(
-            popup.x
+            popup
+                .x
                 .saturating_add(1 + self.search_input.value.chars().count() as u16),
             popup.y.saturating_add(1),
         )
@@ -884,14 +1026,19 @@ impl App {
         .split(popup);
         let content_width = inner[0].width.saturating_sub(2).max(1);
         match self.replace_input.field {
-            ReplaceField::Find => wrapped_text_cursor_position(inner[0], &self.replace_input.find, content_width),
+            ReplaceField::Find => {
+                wrapped_text_cursor_position(inner[0], &self.replace_input.find, content_width)
+            }
             ReplaceField::Replace => {
                 wrapped_text_cursor_position(inner[1], &self.replace_input.replace, content_width)
             }
         }
     }
 
-    fn current_selection_range_in_view(&self, viewport_row: usize) -> Option<(usize, usize, usize, usize)> {
+    fn current_selection_range_in_view(
+        &self,
+        viewport_row: usize,
+    ) -> Option<(usize, usize, usize, usize)> {
         let range = self.selection_input.current_range()?;
         let start_row = range.start_row.checked_sub(viewport_row)?;
         let end_row = range.end_row.checked_sub(viewport_row)?;
@@ -901,7 +1048,8 @@ impl App {
     fn rename_input_cursor_position(&self, area: Rect) -> Position {
         let popup = centered_rect(36, 3, area);
         Position::new(
-            popup.x
+            popup
+                .x
                 .saturating_add(1 + self.rename_input.value.chars().count() as u16),
             popup.y.saturating_add(1),
         )
@@ -910,7 +1058,8 @@ impl App {
     fn picker_cursor_position(&self, area: Rect) -> Position {
         let popup = centered_rect(72, 12, area);
         Position::new(
-            popup.x
+            popup
+                .x
                 .saturating_add(1 + self.picker.query.chars().count() as u16),
             popup.y.saturating_add(1),
         )
@@ -966,7 +1115,10 @@ impl App {
                     current_text.push_str(&text);
                 } else {
                     if !current_text.is_empty() {
-                        spans.push(Span::styled(std::mem::take(&mut current_text), current_style.unwrap_or_default()));
+                        spans.push(Span::styled(
+                            std::mem::take(&mut current_text),
+                            current_style.unwrap_or_default(),
+                        ));
                     }
                     current_text = text;
                     current_style = Some(style);
@@ -974,7 +1126,10 @@ impl App {
             }
 
             if !current_text.is_empty() {
-                spans.push(Span::styled(current_text, current_style.unwrap_or_default()));
+                spans.push(Span::styled(
+                    current_text,
+                    current_style.unwrap_or_default(),
+                ));
             }
             if spans.is_empty() {
                 spans.push(Span::raw(" "));
@@ -1048,13 +1203,23 @@ fn format_render_lines(
                 (index, start_row, start_col, end_row, end_col)
             }),
             &line.syntax_spans,
-            current_word.map(|highlight| CurrentWordHighlight {
-                row: highlight.row,
-                start: if highlight.row == index { highlight.start } else { 0 },
-                end: if highlight.row == index { highlight.end } else { 0 },
-                word: highlight.word.clone(),
-                jumpable: highlight.jumpable && highlight.row == index,
-            }).as_ref(),
+            current_word
+                .map(|highlight| CurrentWordHighlight {
+                    row: highlight.row,
+                    start: if highlight.row == index {
+                        highlight.start
+                    } else {
+                        0
+                    },
+                    end: if highlight.row == index {
+                        highlight.end
+                    } else {
+                        0
+                    },
+                    word: highlight.word.clone(),
+                    jumpable: highlight.jumpable && highlight.row == index,
+                })
+                .as_ref(),
         ));
         previous_guide_width = current_guide_width;
     }
@@ -1062,6 +1227,7 @@ fn format_render_lines(
     formatted_lines
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_render_line(
     line: &DocumentRenderLine,
     indent_width: usize,
@@ -1166,24 +1332,25 @@ fn render_text_with_indent_guides(
             &text.chars().skip(leading_spaces).collect::<String>(),
             search_query,
             selection_context.map(|(index, start_row, start_col, end_row, end_col)| {
-                let selection = adjusted_selection_for_trimmed_prefix(
+                adjusted_selection_for_trimmed_prefix(
                     index,
                     start_row,
                     start_col,
                     end_row,
                     end_col,
                     leading_spaces,
-                );
-                selection
+                )
             }),
             &trimmed_syntax_spans,
-            current_word.map(|highlight| CurrentWordHighlight {
-                row: highlight.row,
-                start: highlight.start.saturating_sub(leading_spaces),
-                end: highlight.end.saturating_sub(leading_spaces),
-                word: highlight.word.clone(),
-                jumpable: highlight.jumpable,
-            }).as_ref(),
+            current_word
+                .map(|highlight| CurrentWordHighlight {
+                    row: highlight.row,
+                    start: highlight.start.saturating_sub(leading_spaces),
+                    end: highlight.end.saturating_sub(leading_spaces),
+                    word: highlight.word.clone(),
+                    jumpable: highlight.jumpable,
+                })
+                .as_ref(),
         ));
     }
 
@@ -1224,8 +1391,8 @@ fn render_search_highlighted_text(
         let in_search = search_matches
             .iter()
             .any(|(start, end)| index >= *start && index < *end);
-        let in_selection = selection_bounds
-            .is_some_and(|(start, end)| index >= start && index < end);
+        let in_selection =
+            selection_bounds.is_some_and(|(start, end)| index >= start && index < end);
         let in_word_match = word_matches
             .iter()
             .any(|(start, end)| index >= *start && index < *end);
@@ -1245,7 +1412,9 @@ fn render_search_highlighted_text(
             style = style.bg(AppColors::SELECTION_HIGHLIGHT);
         }
         if in_search {
-            style = style.fg(AppColors::BACKGROUND).bg(AppColors::SEARCH_HIGHLIGHT);
+            style = style
+                .fg(AppColors::BACKGROUND)
+                .bg(AppColors::SEARCH_HIGHLIGHT);
         }
         if underline_current_word {
             style = style.add_modifier(Modifier::UNDERLINED);
@@ -1273,7 +1442,10 @@ fn render_search_highlighted_text(
     }
 
     if spans.is_empty() {
-        spans.push(Span::styled(text.to_owned(), Style::default().fg(AppColors::FOREGROUND)));
+        spans.push(Span::styled(
+            text.to_owned(),
+            Style::default().fg(AppColors::FOREGROUND),
+        ));
     }
 
     spans
@@ -1326,7 +1498,9 @@ fn wrapped_text_cursor_position(area: Rect, text: &str, content_width: u16) -> P
     let wrapped_col = chars % width;
     Position::new(
         area.x.saturating_add(1 + wrapped_col as u16),
-        area.y.saturating_add(1 + wrapped_row as u16).min(area.y.saturating_add(area.height.saturating_sub(2))),
+        area.y
+            .saturating_add(1 + wrapped_row as u16)
+            .min(area.y.saturating_add(area.height.saturating_sub(2))),
     )
 }
 
@@ -1573,7 +1747,14 @@ fn wrap_toast_message(message: &str, width: usize) -> Vec<String> {
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
-    let y = area.y.saturating_add(area.height.saturating_sub(height) / 2);
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(height) / 2);
     Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
-*/
+
+fn top_right_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let x = area.x.saturating_add(area.width.saturating_sub(width));
+    let y = area.y;
+    Rect::new(x, y, width.min(area.width), height.min(area.height))
+}

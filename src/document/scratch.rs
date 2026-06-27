@@ -1,4 +1,3 @@
-/*
 use std::path::PathBuf;
 
 use crate::document::{DocumentRender, DocumentRenderLine};
@@ -39,7 +38,9 @@ impl ScratchDocument {
 
     pub fn render_first_page(&self, viewport_row: usize, page_height: usize) -> DocumentRender {
         let content_height = page_height.saturating_sub(1);
-        let end_row = viewport_row.saturating_add(content_height).min(self.rows.len());
+        let end_row = viewport_row
+            .saturating_add(content_height)
+            .min(self.rows.len());
         let mut lines = self.rows[viewport_row.min(self.rows.len())..end_row]
             .iter()
             .enumerate()
@@ -100,4 +101,3 @@ impl ScratchDocument {
             .and_then(|row| row.target.clone())
     }
 }
-*/
