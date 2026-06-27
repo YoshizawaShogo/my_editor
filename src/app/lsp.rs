@@ -10,18 +10,18 @@ use lsp_types::notification::Notification as LspNotificationTrait;
 use lsp_types::request::Request as LspRequestTrait;
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionContext, CompletionParams,
-    CompletionResponse, CompletionTextEdit, DiagnosticClientCapabilities,
-    DiagnosticWorkspaceClientCapabilities, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams, Hover,
-    HoverContents, HoverParams, Location, Position, ReferenceContext, ReferenceParams,
-    RenameParams, SelectionRange, SelectionRangeClientCapabilities, SelectionRangeParams,
-    SemanticTokenModifier, SemanticTokenType, SemanticTokensClientCapabilities,
-    SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions, SemanticTokensParams,
-    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, TokenFormat, Uri,
-    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceClientCapabilities,
-    WorkspaceDiagnosticParams, WorkspaceDiagnosticReportResult, WorkspaceDocumentDiagnosticReport,
-    WorkspaceEdit, notification, request,
+    CompletionResponse, CompletionTextEdit, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    GotoDefinitionParams, Hover, HoverContents, HoverParams, Location, Position, ReferenceContext,
+    ReferenceParams, RenameParams, SelectionRange, SelectionRangeClientCapabilities,
+    SelectionRangeParams, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
+    SemanticTokensFullOptions, SemanticTokensParams, TextDocumentClientCapabilities,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, TokenFormat, Uri, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceDiagnosticParams,
+    WorkspaceDiagnosticReportResult, WorkspaceDocumentDiagnosticReport, WorkspaceEdit,
+    notification, request,
 };
 use serde_json::Value;
 use tokio::{
@@ -206,7 +206,16 @@ pub struct LspClient {
     pub workspace_diagnostics_supported: bool,
 }
 
-fn append_tmp_log(_message: impl AsRef<str>) {}
+fn append_tmp_log(message: impl AsRef<str>) {
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/my_editor_debug.log")
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{}", message.as_ref())
+        });
+}
 
 impl LspClient {
     /// LSPサーバーを別スレッドで起動する。初期化はバックグラウンドで進み、
@@ -434,12 +443,14 @@ async fn run_lsp_worker(
         workspace_diagnostics_supported,
     });
 
+    append_tmp_log("[lsp] entering select! loop");
     loop {
         select! {
             maybe_command = rx_commands.recv() => {
                 let Some(command) = maybe_command else {
                     break;
                 };
+                append_tmp_log(format!("[lsp] sending command {:?}", std::mem::discriminant(&command)));
                 handle_command(
                     command,
                     &mut writer,
@@ -449,6 +460,7 @@ async fn run_lsp_worker(
             }
             message = read_message(&mut reader) => {
                 let message = message?;
+                append_tmp_log("[lsp] received message from server");
                 process_message(
                     message,
                     &mut writer,
@@ -485,16 +497,9 @@ async fn initialize_server(
         workspace: Some(WorkspaceClientCapabilities {
             workspace_folders: Some(true),
             configuration: Some(true),
-            diagnostic: Some(DiagnosticWorkspaceClientCapabilities {
-                refresh_support: Some(true),
-            }),
             ..Default::default()
         }),
         text_document: Some(TextDocumentClientCapabilities {
-            diagnostic: Some(DiagnosticClientCapabilities {
-                dynamic_registration: Some(false),
-                related_document_support: Some(false),
-            }),
             selection_range: Some(SelectionRangeClientCapabilities {
                 dynamic_registration: Some(false),
             }),
@@ -883,11 +888,17 @@ async fn process_message(
 ) -> Result<()> {
     match message {
         Message::Notification(notification) => {
+            append_tmp_log(format!("[lsp] notification method={}", notification.method));
             if notification.method == notification::PublishDiagnostics::METHOD {
                 let params = serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(
                     notification.params,
                 )
                 .map_err(|error| AppError::CommandFailed(error.to_string()))?;
+                append_tmp_log(format!(
+                    "[lsp] publishDiagnostics uri={:?} count={}",
+                    params.uri,
+                    params.diagnostics.len()
+                ));
                 if let Some(path) = uri_to_path(&params.uri) {
                     let mut diagnostics = HashMap::<usize, Vec<DiagnosticEntry>>::new();
                     for diagnostic in params.diagnostics {
@@ -1020,6 +1031,7 @@ async fn process_message(
             }
         }
         Message::Request(request) => {
+            append_tmp_log(format!("[lsp] server request method={}", request.method));
             let result = if request.method == request::WorkspaceConfiguration::METHOD {
                 serde_json::json!([{
                     "checkOnSave": true,

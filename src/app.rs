@@ -664,6 +664,7 @@ impl App {
                 ) {
                     client.workspace_diagnostics_supported = workspace_diagnostics_supported;
                     self.lsp = LspClientState::Ready(client);
+                    append_tmp_log("[app] LSP initialized -> Ready");
                     let _ = self.ensure_lsp_for_current_document();
                 }
                 return true;
