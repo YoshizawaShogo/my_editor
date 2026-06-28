@@ -31,7 +31,7 @@ pub struct EditableDocument {
     pub is_dirty: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DiagnosticSeverity {
     Warning,
     Error,
@@ -1218,4 +1218,110 @@ fn parse_diff_range(range: &str) -> Option<(usize, usize)> {
     };
 
     Some((start.parse().ok()?, count.parse().ok()?))
+}
+
+#[cfg(test)]
+impl EditableDocument {
+    pub fn for_test(content: &str) -> Self {
+        Self {
+            path: PathBuf::from("test.rs"),
+            rope: Rope::from_str(content),
+            indent_width: 4,
+            use_hard_tabs: false,
+            git_gutter_markers: HashMap::new(),
+            diagnostics: HashMap::new(),
+            semantic_tokens: HashMap::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            undo_group_active: false,
+            undo_group_snapshot_taken: false,
+            disk_mtime: None,
+            is_dirty: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::DiagnosticEntry;
+
+    fn error_on(line: usize) -> HashMap<usize, Vec<DiagnosticEntry>> {
+        HashMap::from([(
+            line,
+            vec![DiagnosticEntry {
+                severity: DiagnosticSeverity::Error,
+                message: "error".to_string(),
+            }],
+        )])
+    }
+
+    fn warning_on(line: usize) -> HashMap<usize, Vec<DiagnosticEntry>> {
+        HashMap::from([(
+            line,
+            vec![DiagnosticEntry {
+                severity: DiagnosticSeverity::Warning,
+                message: "warning".to_string(),
+            }],
+        )])
+    }
+
+    #[test]
+    fn no_marker_when_no_diagnostics() {
+        let doc = EditableDocument::for_test("line 1\nline 2\n");
+        assert_eq!(doc.diagnostic_marker(1), None);
+        assert_eq!(doc.diagnostic_marker(2), None);
+    }
+
+    #[test]
+    fn error_marker_shown_on_error_line() {
+        let mut doc = EditableDocument::for_test("line 1\nline 2\n");
+        doc.set_diagnostics(error_on(2));
+        assert_eq!(doc.diagnostic_marker(2), Some(DiagnosticSeverity::Error));
+    }
+
+    #[test]
+    fn error_marker_clears_when_empty_diagnostics_received() {
+        let mut doc = EditableDocument::for_test("line 1\nline 2\n");
+        doc.set_diagnostics(error_on(2));
+        assert_eq!(doc.diagnostic_marker(2), Some(DiagnosticSeverity::Error));
+
+        doc.set_diagnostics(HashMap::new());
+
+        assert_eq!(doc.diagnostic_marker(2), None);
+    }
+
+    #[test]
+    fn error_marker_wins_over_warning_on_same_line() {
+        let mut doc = EditableDocument::for_test("line 1\n");
+        doc.set_diagnostics(HashMap::from([(
+            1,
+            vec![
+                DiagnosticEntry {
+                    severity: DiagnosticSeverity::Warning,
+                    message: "warning".to_string(),
+                },
+                DiagnosticEntry {
+                    severity: DiagnosticSeverity::Error,
+                    message: "error".to_string(),
+                },
+            ],
+        )]));
+        assert_eq!(doc.diagnostic_marker(1), Some(DiagnosticSeverity::Error));
+    }
+
+    #[test]
+    fn warning_marker_shown_when_no_error() {
+        let mut doc = EditableDocument::for_test("line 1\n");
+        doc.set_diagnostics(warning_on(1));
+        assert_eq!(doc.diagnostic_marker(1), Some(DiagnosticSeverity::Warning));
+    }
+
+    #[test]
+    fn error_marker_does_not_bleed_to_adjacent_lines() {
+        let mut doc = EditableDocument::for_test("line 1\nline 2\nline 3\n");
+        doc.set_diagnostics(error_on(2));
+        assert_eq!(doc.diagnostic_marker(1), None);
+        assert_eq!(doc.diagnostic_marker(3), None);
+    }
 }

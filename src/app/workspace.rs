@@ -1,7 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use crate::{
-    document::Document,
+    document::{DiagnosticEntry, Document},
     error::Result,
     open_candidate::{OpenBufferCandidate, OpenCandidate},
 };
@@ -114,6 +117,19 @@ impl Workspace {
         }
     }
 
+    /// パスに一致する開いているドキュメントにLSP診断を適用する
+    pub fn apply_lsp_diagnostics(
+        &mut self,
+        path: &Path,
+        diagnostics: HashMap<usize, Vec<DiagnosticEntry>>,
+    ) {
+        if let Some(index) = self.find_document_index(path) {
+            self.documents[index]
+                .document
+                .set_rust_diagnostics(diagnostics);
+        }
+    }
+
     /// カレント以外のドキュメントのインデックスを返す
     pub fn secondary_index(&self) -> Option<usize> {
         if self.documents.len() < 2 {
@@ -123,5 +139,74 @@ impl Workspace {
         } else {
             Some(0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::document::{
+        DiagnosticEntry, DiagnosticSeverity, Document, editable::EditableDocument,
+    };
+
+    use super::*;
+
+    fn workspace_with_document(path: &str, content: &str) -> Workspace {
+        let doc = Document::Editable(EditableDocument::for_test(content));
+        Workspace {
+            documents: vec![DocumentEntry {
+                path: PathBuf::from(path),
+                document: doc,
+                view_state: BufferViewState {
+                    row: 0,
+                    column: 0,
+                    viewport_row: 0,
+                },
+                version: 1,
+                lsp_open: false,
+            }],
+            current_index: 0,
+        }
+    }
+
+    fn error_on(line: usize) -> HashMap<usize, Vec<DiagnosticEntry>> {
+        HashMap::from([(
+            line,
+            vec![DiagnosticEntry {
+                severity: DiagnosticSeverity::Error,
+                message: "error".to_string(),
+            }],
+        )])
+    }
+
+    #[test]
+    fn apply_lsp_diagnostics_sets_error_on_open_document() {
+        let path = "/project/src/main.rs";
+        let mut ws = workspace_with_document(path, "fn main() {}\n");
+
+        ws.apply_lsp_diagnostics(Path::new(path), error_on(1));
+
+        assert_eq!(ws.current_document().diagnostic_summary().errors, 1);
+    }
+
+    #[test]
+    fn apply_lsp_diagnostics_clears_errors_when_empty_received() {
+        let path = "/project/src/main.rs";
+        let mut ws = workspace_with_document(path, "fn main() {}\n");
+        ws.apply_lsp_diagnostics(Path::new(path), error_on(1));
+
+        ws.apply_lsp_diagnostics(Path::new(path), HashMap::new());
+
+        assert_eq!(ws.current_document().diagnostic_summary().errors, 0);
+    }
+
+    #[test]
+    fn apply_lsp_diagnostics_for_unknown_path_does_nothing() {
+        let mut ws = workspace_with_document("/project/src/main.rs", "fn main() {}\n");
+
+        ws.apply_lsp_diagnostics(Path::new("/project/src/other.rs"), error_on(1));
+
+        assert_eq!(ws.current_document().diagnostic_summary().errors, 0);
     }
 }

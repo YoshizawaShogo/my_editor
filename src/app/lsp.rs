@@ -900,23 +900,7 @@ async fn process_message(
                     params.diagnostics.len()
                 ));
                 if let Some(path) = uri_to_path(&params.uri) {
-                    let mut diagnostics = HashMap::<usize, Vec<DiagnosticEntry>>::new();
-                    for diagnostic in params.diagnostics {
-                        let severity = match diagnostic.severity {
-                            Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
-                            Some(lsp_types::DiagnosticSeverity::WARNING) => {
-                                DiagnosticSeverity::Warning
-                            }
-                            _ => DiagnosticSeverity::Warning,
-                        };
-                        diagnostics
-                            .entry(diagnostic.range.start.line as usize + 1)
-                            .or_default()
-                            .push(DiagnosticEntry {
-                                severity,
-                                message: diagnostic.message,
-                            });
-                    }
+                    let diagnostics = parse_publish_diagnostics(params.diagnostics);
                     send_event(
                         tx_events,
                         LspEvent::PublishDiagnostics { path, diagnostics },
@@ -1270,11 +1254,7 @@ fn parse_workspace_diagnostics_response(
         };
 
         for diagnostic in report.full_document_diagnostic_report.items {
-            let severity = match diagnostic.severity {
-                Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
-                Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
-                _ => DiagnosticSeverity::Warning,
-            };
+            let severity = map_lsp_severity(diagnostic.severity);
             if error_only && severity != DiagnosticSeverity::Error {
                 continue;
             }
@@ -1404,4 +1384,109 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     let value = uri.as_str();
     let stripped = value.strip_prefix("file://")?;
     Some(PathBuf::from(stripped))
+}
+
+/// LSPのDiagnosticSeverityを内部表現に変換する。不明・未指定はWarningとして扱う
+fn map_lsp_severity(severity: Option<lsp_types::DiagnosticSeverity>) -> DiagnosticSeverity {
+    match severity {
+        Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
+        _ => DiagnosticSeverity::Warning,
+    }
+}
+
+/// LSP診断リストを行番号(1始まり)ごとのエントリマップに変換する
+fn parse_publish_diagnostics(
+    lsp_diagnostics: Vec<lsp_types::Diagnostic>,
+) -> HashMap<usize, Vec<DiagnosticEntry>> {
+    let mut result: HashMap<usize, Vec<DiagnosticEntry>> = HashMap::new();
+    for diagnostic in lsp_diagnostics {
+        let severity = map_lsp_severity(diagnostic.severity);
+        result
+            .entry(diagnostic.range.start.line as usize + 1)
+            .or_default()
+            .push(DiagnosticEntry {
+                severity,
+                message: diagnostic.message,
+            });
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lsp_types::{Diagnostic, Position, Range};
+
+    fn lsp_diagnostic(
+        line: u32,
+        severity: Option<lsp_types::DiagnosticSeverity>,
+        msg: &str,
+    ) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position { line, character: 0 },
+                end: Position { line, character: 0 },
+            },
+            severity,
+            message: msg.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn map_lsp_severity_error_to_error() {
+        assert_eq!(
+            map_lsp_severity(Some(lsp_types::DiagnosticSeverity::ERROR)),
+            DiagnosticSeverity::Error
+        );
+    }
+
+    #[test]
+    fn map_lsp_severity_warning_to_warning() {
+        assert_eq!(
+            map_lsp_severity(Some(lsp_types::DiagnosticSeverity::WARNING)),
+            DiagnosticSeverity::Warning
+        );
+    }
+
+    #[test]
+    fn map_lsp_severity_none_defaults_to_warning() {
+        assert_eq!(map_lsp_severity(None), DiagnosticSeverity::Warning);
+    }
+
+    #[test]
+    fn parse_publish_diagnostics_empty_gives_empty_map() {
+        assert!(parse_publish_diagnostics(vec![]).is_empty());
+    }
+
+    #[test]
+    fn parse_publish_diagnostics_converts_line_to_one_based() {
+        let result = parse_publish_diagnostics(vec![lsp_diagnostic(
+            0,
+            Some(lsp_types::DiagnosticSeverity::ERROR),
+            "err",
+        )]);
+        assert!(result.contains_key(&1), "LSP line 0 should map to line 1");
+        assert!(!result.contains_key(&0), "line 0 should not exist");
+    }
+
+    #[test]
+    fn parse_publish_diagnostics_groups_multiple_on_same_line() {
+        let result = parse_publish_diagnostics(vec![
+            lsp_diagnostic(4, Some(lsp_types::DiagnosticSeverity::ERROR), "first"),
+            lsp_diagnostic(4, Some(lsp_types::DiagnosticSeverity::WARNING), "second"),
+        ]);
+        assert_eq!(result.get(&5).map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn parse_publish_diagnostics_separates_different_lines() {
+        let result = parse_publish_diagnostics(vec![
+            lsp_diagnostic(0, Some(lsp_types::DiagnosticSeverity::ERROR), "line 1"),
+            lsp_diagnostic(4, Some(lsp_types::DiagnosticSeverity::ERROR), "line 5"),
+        ]);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains_key(&1));
+        assert!(result.contains_key(&5));
+    }
 }

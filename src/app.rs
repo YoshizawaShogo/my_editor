@@ -703,11 +703,7 @@ impl App {
                     self.workspace_diagnostics_cache
                         .diagnostics
                         .insert(path.clone(), diagnostics.clone());
-                    if let Some(index) = self.workspace.find_document_index(&path) {
-                        self.workspace.documents[index]
-                            .document
-                            .set_rust_diagnostics(diagnostics);
-                    }
+                    self.workspace.apply_lsp_diagnostics(&path, diagnostics);
                     append_tmp_log(format!(
                         "[diag] path={} pending={:?}",
                         path.display(),
