@@ -86,17 +86,6 @@ pub struct App {
     pub extra_cursors: Vec<CursorState>,
 }
 
-fn append_tmp_log(message: impl AsRef<str>) {
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/my_editor_debug.log")
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "{}", message.as_ref())
-        });
-}
-
 pub struct Workspace {
     pub documents: Vec<DocumentEntry>,
     pub current_index: usize,
@@ -555,6 +544,13 @@ impl App {
         self.editor_rc.lsp_for_path(path)
     }
 
+    /// パスに対応する LSP の languageId を返す。未設定の場合は "plaintext"
+    fn lsp_language_id_for_path(&self, path: &Path) -> String {
+        self.editor_rc
+            .language_id_for_path(path)
+            .unwrap_or_else(|| "plaintext".to_owned())
+    }
+
     /// 現在のドキュメントに対してLSPが動作中か確認し、必要なら起動してドキュメントを登録する
     fn ensure_lsp_for_current_document(&mut self) -> Result<()> {
         let Some(path) = self
@@ -631,8 +627,9 @@ impl App {
         let version = self.workspace.documents[current_index].version;
 
         self.show_lsp_sync_toast(&path, "sync");
+        let language_id = self.lsp_language_id_for_path(&path);
         if let LspClientState::Ready(client) = &mut self.lsp {
-            client.ensure_open(&path, version, &text)?;
+            client.ensure_open(&path, &language_id, version, &text)?;
             let _ = client.did_save(&path, &text);
             self.workspace.documents[current_index].lsp_open = true;
         }
@@ -664,7 +661,6 @@ impl App {
                 ) {
                     client.workspace_diagnostics_supported = workspace_diagnostics_supported;
                     self.lsp = LspClientState::Ready(client);
-                    append_tmp_log("[app] LSP initialized -> Ready");
                     let _ = self.ensure_lsp_for_current_document();
                 }
                 return true;
@@ -704,11 +700,6 @@ impl App {
                         .diagnostics
                         .insert(path.clone(), diagnostics.clone());
                     self.workspace.apply_lsp_diagnostics(&path, diagnostics);
-                    append_tmp_log(format!(
-                        "[diag] path={} pending={:?}",
-                        path.display(),
-                        self.pending_semantic_tokens_path
-                    ));
                     if self
                         .pending_semantic_tokens_path
                         .as_ref()
@@ -722,13 +713,6 @@ impl App {
                     }
                 }
                 LspEvent::PublishSemanticTokens { path, tokens } => {
-                    let token_count: usize = tokens.values().map(Vec::len).sum();
-                    append_tmp_log(format!(
-                        "[app] apply semantic path={} lines={} spans={}",
-                        path.display(),
-                        tokens.len(),
-                        token_count
-                    ));
                     if let Some(modified) = path_modified_time(&path) {
                         self.lsp_document_cache
                             .entry(path.clone())
@@ -795,10 +779,6 @@ impl App {
                     self.handle_completion_result(path, serial, items);
                 }
                 LspEvent::SemanticTokensFailed { path } => {
-                    append_tmp_log(format!(
-                        "[app] semantic tokens failed path={}",
-                        path.display()
-                    ));
                     if self
                         .workspace
                         .current_document_path()
@@ -924,16 +904,8 @@ impl App {
     /// セマンティックトークンリクエストを診断待機またはLSPへの即時送信としてスケジュールする
     fn schedule_semantic_tokens_request(&mut self, path: &std::path::Path) {
         if should_wait_for_diagnostics_before_semantic(path) {
-            append_tmp_log(format!(
-                "[schedule] waiting diag for path={}",
-                path.display()
-            ));
             self.pending_semantic_tokens_path = Some(path.to_path_buf());
         } else {
-            append_tmp_log(format!(
-                "[schedule] immediate semantic for path={}",
-                path.display()
-            ));
             self.pending_semantic_tokens_path = None;
             if let LspClientState::Ready(client) = &mut self.lsp {
                 let _ = client.request_semantic_tokens(path);
@@ -976,10 +948,14 @@ impl App {
         };
 
         for path in rust_files {
+            let language_id = self
+                .editor_rc
+                .language_id_for_path(&path)
+                .unwrap_or_else(|| "plaintext".to_owned());
             if let Some(index) = self.workspace.find_document_index(&path) {
                 if let Some(text) = self.workspace.documents[index].document.full_text() {
                     let version = self.workspace.documents[index].version;
-                    client.ensure_open(&path, version, &text)?;
+                    client.ensure_open(&path, &language_id, version, &text)?;
                     let _ = client.did_save(&path, &text);
                     self.workspace.documents[index].lsp_open = true;
                 }
@@ -989,7 +965,7 @@ impl App {
             let Ok(text) = fs::read_to_string(&path) else {
                 continue;
             };
-            client.ensure_open(&path, 1, &text)?;
+            client.ensure_open(&path, &language_id, 1, &text)?;
             let _ = client.did_save(&path, &text);
         }
 
@@ -1847,8 +1823,9 @@ impl App {
         let current_index = self.workspace.current_index;
         self.workspace.documents[current_index].version += 1;
         let version = self.workspace.documents[current_index].version;
+        let language_id = self.lsp_language_id_for_path(&path);
         if let LspClientState::Ready(client) = &mut self.lsp {
-            let _ = client.ensure_open(&path, version, &text);
+            let _ = client.ensure_open(&path, &language_id, version, &text);
             let _ = client.did_change(&path, version, &text);
             self.workspace.documents[current_index].lsp_open = true;
         }
@@ -2183,9 +2160,13 @@ impl App {
         let current_index = self.workspace.current_index;
         self.workspace.documents[current_index].version += 1;
         let version = self.workspace.documents[current_index].version;
+        let language_id = self.lsp_language_id_for_path(&path);
 
         if let LspClientState::Ready(client) = &mut self.lsp {
-            if client.ensure_open(&path, version, &text).is_err() {
+            if client
+                .ensure_open(&path, &language_id, version, &text)
+                .is_err()
+            {
                 return;
             }
             self.workspace.documents[current_index].lsp_open = true;
@@ -2546,11 +2527,12 @@ impl App {
         let current_index = self.workspace.current_index;
         self.workspace.documents[current_index].version += 1;
         let version = self.workspace.documents[current_index].version;
+        let language_id = self.lsp_language_id_for_path(&path);
         let LspClientState::Ready(client) = &mut self.lsp else {
             self.apply_completion_fallback(serial);
             return Ok(());
         };
-        client.ensure_open(&path, version, &text)?;
+        client.ensure_open(&path, &language_id, version, &text)?;
         self.workspace.documents[current_index].lsp_open = true;
         client.did_change(&path, version, &text)?;
         client.completion(&path, position, serial)?;
@@ -2986,13 +2968,18 @@ fn path_modified_time(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
 
-/// 相対パスをカレントディレクトリを基準に絶対パスに変換する
+/// 相対パスをカレントディレクトリを基準に絶対パスへ変換し、可能ならcanonicalizeする。
+///
+/// LSPサーバー（rust-analyzer等）はシンボリックリンクを解決した正規パスでURIを返すため、
+/// ドキュメントのキーも同じ正規形に揃えておかないと診断・セマンティックトークンが一致しない。
+/// 未作成ファイルなどcanonicalizeできない場合は絶対パスのまま返す。
 fn normalize_workspace_path(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        Ok(std::env::current_dir()?.join(path))
-    }
+        std::env::current_dir()?.join(path)
+    };
+    Ok(absolute.canonicalize().unwrap_or(absolute))
 }
 
 /// 指定ディレクトリ配下の.rsファイルを再帰的に収集する

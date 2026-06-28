@@ -51,6 +51,12 @@ impl EditorRc {
         let args = parts.map(str::to_owned).collect();
         Some((cmd, args))
     }
+
+    /// パスの拡張子に対応する LSP の languageId を返す
+    pub fn language_id_for_path(&self, path: &Path) -> Option<String> {
+        let ext = path.extension()?.to_str()?;
+        self.get_lang.get(ext).cloned()
+    }
 }
 
 fn rc_path() -> Option<PathBuf> {

@@ -136,6 +136,7 @@ pub struct WorkspaceDiagnosticItem {
 enum LspCommand {
     EnsureOpen {
         path: PathBuf,
+        language_id: String,
         version: i32,
         text: String,
     },
@@ -206,17 +207,6 @@ pub struct LspClient {
     pub workspace_diagnostics_supported: bool,
 }
 
-fn append_tmp_log(message: impl AsRef<str>) {
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/my_editor_debug.log")
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "{}", message.as_ref())
-        });
-}
-
 impl LspClient {
     /// LSPサーバーを別スレッドで起動する。初期化はバックグラウンドで進み、
     /// 完了時に LspEvent::Initialized が届く。
@@ -270,13 +260,20 @@ impl LspClient {
     }
 
     /// 未登録のドキュメントをLSPにオープン通知して登録する
-    pub fn ensure_open(&mut self, path: &Path, version: i32, text: &str) -> Result<()> {
+    pub fn ensure_open(
+        &mut self,
+        path: &Path,
+        language_id: &str,
+        version: i32,
+        text: &str,
+    ) -> Result<()> {
         if self.opened_documents.contains(path) {
             return Ok(());
         }
 
         self.send(LspCommand::EnsureOpen {
             path: path.to_path_buf(),
+            language_id: language_id.to_owned(),
             version,
             text: text.to_owned(),
         })?;
@@ -443,14 +440,35 @@ async fn run_lsp_worker(
         workspace_diagnostics_supported,
     });
 
-    append_tmp_log("[lsp] entering select! loop");
+    // サーバーからのメッセージ読み取りは専用タスクに分離する。
+    // read_message は read_line/read_exact を await するためキャンセル安全ではなく、
+    // select! の中で直接 await すると別分岐の発火時に読みかけのバイトが失われ、
+    // 以降のLSPプロトコルが破綻する。チャネル受信はキャンセル安全なので、
+    // 読み取りをタスク内で完結させてメッセージ単位で受け渡す。
+    let (tx_messages, mut rx_messages) = unbounded_channel::<Message>();
+    let reader_events = tx_events.clone();
+    tokio::spawn(async move {
+        loop {
+            match read_message(&mut reader).await {
+                Ok(message) => {
+                    if tx_messages.send(message).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = reader_events.send(LspEvent::Failed(format!("{error:?}")));
+                    break;
+                }
+            }
+        }
+    });
+
     loop {
         select! {
             maybe_command = rx_commands.recv() => {
                 let Some(command) = maybe_command else {
                     break;
                 };
-                append_tmp_log(format!("[lsp] sending command {:?}", std::mem::discriminant(&command)));
                 handle_command(
                     command,
                     &mut writer,
@@ -458,9 +476,10 @@ async fn run_lsp_worker(
                     &mut pending_requests,
                 ).await?;
             }
-            message = read_message(&mut reader) => {
-                let message = message?;
-                append_tmp_log("[lsp] received message from server");
+            maybe_message = rx_messages.recv() => {
+                let Some(message) = maybe_message else {
+                    break;
+                };
                 process_message(
                     message,
                     &mut writer,
@@ -620,13 +639,14 @@ async fn handle_command(
     match command {
         LspCommand::EnsureOpen {
             path,
+            language_id,
             version,
             text,
         } => {
             let params = DidOpenTextDocumentParams {
                 text_document: TextDocumentItem {
                     uri: path_to_uri(&path)?,
-                    language_id: "rust".to_owned(),
+                    language_id,
                     version,
                     text,
                 },
@@ -888,17 +908,11 @@ async fn process_message(
 ) -> Result<()> {
     match message {
         Message::Notification(notification) => {
-            append_tmp_log(format!("[lsp] notification method={}", notification.method));
             if notification.method == notification::PublishDiagnostics::METHOD {
                 let params = serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(
                     notification.params,
                 )
                 .map_err(|error| AppError::CommandFailed(error.to_string()))?;
-                append_tmp_log(format!(
-                    "[lsp] publishDiagnostics uri={:?} count={}",
-                    params.uri,
-                    params.diagnostics.len()
-                ));
                 if let Some(path) = uri_to_path(&params.uri) {
                     let diagnostics = parse_publish_diagnostics(params.diagnostics);
                     send_event(
@@ -910,20 +924,12 @@ async fn process_message(
         }
         Message::Response(response) => {
             let Some(pending) = pending_requests.remove(&response.id) else {
-                append_tmp_log(format!("[lsp] unmatched response id={:?}", response.id));
                 return Ok(());
             };
 
             if let Some(error) = response.error {
                 match pending {
                     PendingRequest::SemanticTokens { path } => {
-                        append_tmp_log(format!(
-                            "[lsp] semantic error id={:?} path={} code={} message={}",
-                            response.id,
-                            path.display(),
-                            error.code,
-                            error.message
-                        ));
                         send_event(tx_events, LspEvent::SemanticTokensFailed { path });
                         return Ok(());
                     }
@@ -976,14 +982,6 @@ async fn process_message(
                 PendingRequest::SemanticTokens { path } => {
                     let tokens =
                         decode_semantic_tokens_response(response.result, semantic_token_legend)?;
-                    let token_count: usize = tokens.values().map(Vec::len).sum();
-                    append_tmp_log(format!(
-                        "[lsp] semantic response id={:?} path={} lines={} spans={}",
-                        response.id,
-                        path.display(),
-                        tokens.len(),
-                        token_count
-                    ));
                     send_event(tx_events, LspEvent::PublishSemanticTokens { path, tokens });
                 }
                 PendingRequest::SelectionRange { operator } => {
@@ -1015,7 +1013,6 @@ async fn process_message(
             }
         }
         Message::Request(request) => {
-            append_tmp_log(format!("[lsp] server request method={}", request.method));
             let result = if request.method == request::WorkspaceConfiguration::METHOD {
                 serde_json::json!([{
                     "checkOnSave": true,
@@ -1052,7 +1049,6 @@ async fn send_semantic_tokens_request(
     pending_requests: &mut HashMap<RequestId, PendingRequest>,
     path: PathBuf,
 ) -> Result<()> {
-    append_tmp_log(format!("[lsp] semantic request path={}", path.display()));
     let params = SemanticTokensParams {
         work_done_progress_params: WorkDoneProgressParams::default(),
         partial_result_params: Default::default(),
@@ -1061,11 +1057,6 @@ async fn send_semantic_tokens_request(
         },
     };
     let id = next_request_id_value(next_request_id);
-    append_tmp_log(format!(
-        "[lsp] semantic request id={:?} path={}",
-        id,
-        path.display()
-    ));
     pending_requests.insert(id.clone(), PendingRequest::SemanticTokens { path });
     send_request(
         writer,
@@ -1362,7 +1353,8 @@ fn semantic_token_legend(capabilities: &lsp_types::ServerCapabilities) -> Vec<St
     }
 }
 
-/// ファイルパスをLSP用のfile://URIに変換する
+/// ファイルパスをLSP用のfile://URIに変換する。
+/// パスに含まれる空白などURIで許されない文字はパーセントエンコードする。
 pub fn path_to_uri(path: &Path) -> Result<Uri> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -1370,20 +1362,57 @@ pub fn path_to_uri(path: &Path) -> Result<Uri> {
         std::env::current_dir()?.join(path)
     };
     let path_str = absolute.to_string_lossy().replace('\\', "/");
-    let uri = if path_str.starts_with('/') {
-        format!("file://{path_str}")
+    let encoded = percent_encode_path(&path_str);
+    let uri = if encoded.starts_with('/') {
+        format!("file://{encoded}")
     } else {
-        format!("file:///{path_str}")
+        format!("file:///{encoded}")
     };
     uri.parse()
         .map_err(|error| AppError::CommandFailed(format!("failed to convert path to uri: {error}")))
 }
 
-/// file://URIをファイルパスに変換する
+/// パス文字列のうち URI の unreserved 文字とパス区切り以外をパーセントエンコードする
+fn percent_encode_path(input: &str) -> String {
+    // unreserved (RFC 3986) に '/' を加えた集合はそのまま通す
+    const KEEP: &[u8] = b"-._~/";
+    let mut out = String::with_capacity(input.len());
+    for &byte in input.as_bytes() {
+        if byte.is_ascii_alphanumeric() || KEEP.contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// パーセントエンコードされた文字列をデコードしてバイト列に戻す
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// file://URIをファイルパスに変換する。パーセントエンコードはデコードする。
 pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     let value = uri.as_str();
     let stripped = value.strip_prefix("file://")?;
-    Some(PathBuf::from(stripped))
+    Some(PathBuf::from(percent_decode(stripped)))
 }
 
 /// LSPのDiagnosticSeverityを内部表現に変換する。不明・未指定はWarningとして扱う
@@ -1488,5 +1517,145 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result.contains_key(&1));
         assert!(result.contains_key(&5));
+    }
+
+    /// Content-Lengthヘッダ付きのLSP-RPCフレームを組み立てる
+    fn framed(message: &Message) -> Vec<u8> {
+        let body = serde_json::to_vec(message).unwrap();
+        let mut bytes = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    fn notification(method: &str) -> Message {
+        Message::Notification(Notification {
+            method: method.to_owned(),
+            params: serde_json::json!({ "method": method }),
+        })
+    }
+
+    /// 1つのストリームに連結された2つのフレームを、境界を取り違えずに順番通り読めること。
+    /// read_message のフレーミングは専用リーダータスクの前提であり、ここが崩れると
+    /// 後続メッセージがヘッダとして誤読されプロトコルが破綻する。
+    #[tokio::test]
+    async fn read_message_reads_consecutive_frames_in_order() {
+        let mut stream = framed(&notification("first"));
+        stream.extend_from_slice(&framed(&notification("second")));
+
+        let mut reader = BufReader::new(&stream[..]);
+
+        let Message::Notification(first) = read_message(&mut reader).await.unwrap() else {
+            panic!("expected notification");
+        };
+        assert_eq!(first.method, "first");
+
+        let Message::Notification(second) = read_message(&mut reader).await.unwrap() else {
+            panic!("expected notification");
+        };
+        assert_eq!(second.method, "second");
+    }
+
+    /// ストリーム終端では明示的なエラーを返すこと（無限ループや無言の停止を避ける）
+    #[tokio::test]
+    async fn read_message_at_eof_returns_error() {
+        let empty: &[u8] = &[];
+        let mut reader = BufReader::new(empty);
+        assert!(read_message(&mut reader).await.is_err());
+    }
+
+    fn location_json(uri: &str, line: u32) -> Value {
+        serde_json::json!({
+            "uri": uri,
+            "range": {
+                "start": { "line": line, "character": 0 },
+                "end": { "line": line, "character": 1 },
+            },
+        })
+    }
+
+    #[test]
+    fn parse_locations_response_accepts_single_location() {
+        let value = location_json("file:///a.rs", 3);
+        let locations = parse_locations_response(Some(value)).unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].range.start.line, 3);
+    }
+
+    #[test]
+    fn parse_locations_response_accepts_location_array() {
+        let value = Value::Array(vec![
+            location_json("file:///a.rs", 1),
+            location_json("file:///b.rs", 2),
+        ]);
+        let locations = parse_locations_response(Some(value)).unwrap();
+        assert_eq!(locations.len(), 2);
+    }
+
+    /// LocationLink形式（rust-analyzerが返す形）をLocationへ変換できること
+    #[test]
+    fn parse_locations_response_converts_location_links() {
+        let value = serde_json::json!([{
+            "targetUri": "file:///a.rs",
+            "targetRange": {
+                "start": { "line": 5, "character": 0 },
+                "end": { "line": 5, "character": 4 },
+            },
+            "targetSelectionRange": {
+                "start": { "line": 5, "character": 2 },
+                "end": { "line": 5, "character": 3 },
+            },
+        }]);
+        let locations = parse_locations_response(Some(value)).unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].uri.as_str(), "file:///a.rs");
+        // targetSelectionRange が採用されること
+        assert_eq!(locations[0].range.start.character, 2);
+    }
+
+    #[test]
+    fn parse_locations_response_null_is_empty() {
+        assert!(
+            parse_locations_response(Some(Value::Null))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_locations_response(None).unwrap().is_empty());
+    }
+
+    /// 空白や非ASCIIを含む絶対パスが path -> uri -> path で元に戻ること。
+    /// ここが崩れると診断のパスがドキュメントと一致せず表示されなくなる。
+    #[test]
+    fn path_uri_round_trip_preserves_special_characters() {
+        for original in [
+            "/home/user/My Project/src/main.rs",
+            "/tmp/データ/メイン.rs",
+            "/a/b+c/d#e/f%g.rs",
+        ] {
+            let uri = path_to_uri(Path::new(original)).unwrap();
+            let restored = uri_to_path(&uri).unwrap();
+            assert_eq!(
+                restored,
+                PathBuf::from(original),
+                "round trip failed for {original}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_to_uri_encodes_space_as_percent_20() {
+        let uri = path_to_uri(Path::new("/a b/c.rs")).unwrap();
+        assert!(
+            uri.as_str().contains("%20"),
+            "space should be encoded: {}",
+            uri.as_str()
+        );
+        assert!(!uri.as_str().contains(' '), "raw space must not remain");
+    }
+
+    /// path区切りの '/' はエンコードされず残ること
+    #[test]
+    fn path_to_uri_keeps_path_separators() {
+        let uri = path_to_uri(Path::new("/a/b/c.rs")).unwrap();
+        assert_eq!(uri.as_str(), "file:///a/b/c.rs");
     }
 }
