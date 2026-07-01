@@ -3,7 +3,7 @@
 ## 1. コンセプト
 
 - **利用形態**: Linux サーバへ SSH した先で動かす TUI テキストエディタ。ローカルでも動くが、最適化・設計判断は常に「SSH 越し・端末上」を前提にする。
-- **操作感**: VSCode ライク（非モーダル、`Ctrl+P` ファイル検索、`Ctrl+Shift+P` コマンドパレット、マルチカーソル、統合ターミナル）。ただし VSCode の全機能を再現するのではなく、必要なショートカット／機能に絞る（§7.4 は整理途中）。
+- **操作感**: VSCode ライク（非モーダル、`Ctrl+T` ファイル検索、マルチカーソル、統合ターミナル）。ただし VSCode の全機能は再現せず、必要なショートカット／機能に絞る（確定キーマップは §7.4）。
 - **非対応（明示的な非目標）**: プラグイン／拡張機構は一切持たない。機能はすべてコアに内蔵する。
 
 ### 1.1 非目標（v1 で作らないもの）
@@ -87,7 +87,7 @@ impl Runtime {
                 effects.extend(self.editor.update(ev));
             }
             for eff in effects {
-                self.execute(eff).await;       // spawn 中心。即時失敗は AppEvent::error へ
+                self.execute(eff).await;       // spawn 中心。即時失敗は AppEvent::Error へ
             }
             if self.editor.take_dirty() {
                 self.draw()?;
@@ -276,15 +276,14 @@ struct PersistedHistory {
 
 ### 4.6 Overlay（フローティング補助 UI、具体 enum）
 
-パネル／サイドバーを持たないため、補助 UI はすべてエディタ上に浮かぶオーバーレイとして描画し、開いている間 focus を奪う。各 state 型はそれぞれのモジュールで独立に定義し、`From` で `Overlay` に接続する。
+パネル／サイドバーを持たないため、補助 UI はエディタ上に浮かぶオーバーレイとして描画する。テキスト入力や選択を伴うもの（Picker/Search/Rename/Completion/Confirm）は開いている間 focus を奪う。**Hover は例外で focus を奪わない**（カーソル静止／マウスで自動表示するツールチップで、編集を妨げない。LSP hover 情報とその位置の診断本文を集約＝§9.6）。各 state 型はそれぞれのモジュールで独立に定義し、`From` で `Overlay` に接続する。
 
 ```rust
 enum Overlay {
     Picker(PickerState),           // Ctrl+T ディレクトリ以下 / Ctrl+G 全バッファ（§13）
     Search(SearchState),           // Ctrl+F 検索 / Ctrl+H 置換。スコープ循環（§13）
     Completion(CompletionState),   // Ctrl+Space トグル。矢印選択/Enter・Tab確定（§8.5）
-    Hover(HoverState),             // LSPホバー（カーソル静止/マウスで自動表示）
-    Diagnostics(DiagnosticsList),  // 診断一覧
+    Hover(HoverState),             // LSPホバー＋カーソル位置の診断本文（自動表示・focus奪わない。§9.6）
     Rename(RenameState),           // LSPリネーム入力
     Confirm(ConfirmState),         // 未保存終了などの確認
 }
@@ -464,7 +463,7 @@ impl Editor {
 
 ### 5.3 Command（高レベルコマンド）
 
-keymap とコマンドパレットが生成する単位。**採用するコマンドの確定リストは §7.4 のショートカット整理タスクで決める**。ここでは構造の例のみ示す:
+keymap（§7.4 で確定）が生成する単位。コマンドパレットは MVP 不採用のため、生成元は keymap とマウスのみ。以下は主なもの:
 
 ```rust
 enum Command {
@@ -594,7 +593,7 @@ fn translate(
 struct KeyChordState { prefix: Option<KeyPress> }   // 例: Ctrl+K 押下後
 ```
 
-`Ctrl+K` などの prefix を受けたら `pending` に保持し、次キーで確定。タイムアウト・不一致で破棄。**chord を採用するか（採用する場合どの操作に割り当てるか）は §7.4 の整理で決める**。
+`Ctrl+K` などの prefix を受けたら `pending` に保持し、次キーで確定。タイムアウト・不一致で破棄。ただし **MVP の確定キーマップ（§7.4）には chord 割当が無い**ため、`KeyChordState` は将来用の最小スタブに留める（実装は後回し可）。
 
 ### 7.3 マウス（基本対応）
 
@@ -826,7 +825,7 @@ TUI ではミニマップや overview ruler を作らない。代わりに「ビ
 
 - **エッジ手掛かり**: ビューポートの上端より上／下端より下に対象があれば、上端行の右側に `↑ …`、下端行の右側に `↓ …` のバッジを出す。0 件の種別は出さない。色は §9.3 に従う（error=`RED`、warning=`ORANGE`、git=`BLUE`、検索=アクセント）。
   - 例: 上に error2・warning1・git変更3・ヒット4 → `↑ ●2 ▲1 ~3 ⌕4`（グリフは端末安全のため ASCII フォールバックあり）。
-- **ステータスバー要約**: ファイル名 ＋ **未保存インジケータ**（`Editable.modified` が真なら名前の横に `●`）、診断総数 `E:5 W:2`、検索 `3/47`（現在/総数）、位置 `Ln 12/340 (12%)`。=「数」と「現在位置」を常時提示。外部変更が未解決なら名前の横に別マーク（例 `⚠`）も出す（§14.1）。
+- **ステータスバー要約**: ファイル名 ＋ **未保存インジケータ**（`Editable.modified` が真なら名前の横に `●`）、診断総数 `E:5 W:2`、検索 `3/47`（現在/総数）、位置 `Ln 12/340 (12%)`、**カーソル行に診断があればその主メッセージを1行**（例 `⚠ unused variable \`a\``。§9.6）。=「数」と「現在位置」と「今いる行の問題」を常時提示。外部変更が未解決なら名前の横に別マーク（例 `⚠`）も出す（§14.1）。
 - **横方向（長い行）**: 行が右へはみ出していれば右端に `»`、左スクロール中なら左端に `«`。
 - **算出**: `View.scroll` と表示高から、上/下それぞれの件数を集計する**純粋関数** `offscreen_cues(diagnostics, git_gutter, search_hits, scroll, height) -> OffscreenCues` にまとめてテストする。追加の `AppEvent`/`Effect` は不要（描画時に既存状態から計算）。
 
@@ -836,6 +835,14 @@ struct EdgeSummary { errors: usize, warnings: usize, git_changes: usize, search_
 ```
 
 - 検索ヒットのエッジ/要約は、検索が有効な間（`Overlay::Search` 表示中）に出す。診断・git は常時。大容量ファイルは行位置（`Ln x/N`）のみ。
+
+### 9.6 診断メッセージの表示（ホバー＋ステータスバー）
+
+診断の**場所**（ガター §9.4／波線下線 §9.3／件数・画面外バッジ §9.5）に加え、**メッセージ本文**（例 `unused variable \`a\``）は 2 箇所に出す。専用の診断一覧オーバーレイは持たない。
+
+- **ステータスバー**: カーソル行に診断があれば、最優先（error > warning）1 件のメッセージを 1 行で常時表示。ソースも添える（例 `⚠ unused variable \`a\` — rustc(unused_variables)`）。at-a-glance 用。
+- **ホバー tooltip（`Overlay::Hover`, §4.6）**: カーソルが診断範囲上で静止、またはマウスホバーで、**LSP hover 情報 ＋ その位置の全診断**を集約表示（focus を奪わない）。同一位置に複数あれば列挙。
+- 波線下線の色は severity に対応（error=`RED` / warning=`ORANGE`, §9.3）。`Editable.diagnostics` が唯一の source（gutter・下線・ステータス・ホバーはすべてここから描画時に導出）。
 
 ## 10. クリップボード
 
@@ -1103,8 +1110,9 @@ src/
     theme.rs              # 内蔵テーマ, token→color
   overlay/
     mod.rs                # Overlay enum（+ From）
-    finder.rs palette.rs grep.rs search.rs
-    completion.rs hover.rs diagnostics.rs rename.rs confirm.rs
+    picker.rs             # Ctrl+T/Ctrl+G ピッカー＋パス直接オープン（§13）
+    search.rs             # 検索/置換・スコープ循環・置換プレビュー（§13）
+    completion.rs hover.rs rename.rs confirm.rs   # hover は診断本文も集約（§9.6）
   lsp/
     mod.rs                # LspRegistry, ServerId, pending管理
     actor.rs              # 子プロセス＋read/write スレッド（lsp-server）
@@ -1160,15 +1168,15 @@ src/
 
 - **P0 ランタイム骨格**: event loop、`AppEvent`/`Effect`/`update` の空実装、描画スケルトン、終了処理、raw mode。
 - **P1 エディタコア**: Document/Rope、単一カーソルの移動・挿入・削除、スクロール、行番号描画、undo。
-- **P2 マルチカーソル**: `Selections`、選択拡張、`Ctrl+D`/カーソル追加、コピー・カット・ペースト（内部＋OSC52）。
+- **P2 マルチカーソル＋基本マウス**: `Selections`、選択拡張、`Ctrl+D`/カーソル追加、コピー・カット・ペースト（内部＋OSC52）、**基本マウス（クリック/ドラッグ選択/ホイールスクロール/ダブル・トリプルクリック）**。マウスが操作の主役のため早期に入れる。
 - **P3 ファイル入出力**: open/save、行末保持、config 読込、言語判定、**undo 履歴の永続化（§4.5.1）**、**大容量ファイルの mmap ページング（§4.2.1）**。
-- **P4 オーバーレイ基盤**: overlay 描画・focus、ファジーファインダー（ignore 走査＋fuzzy）、コマンドパレット。
+- **P4 オーバーレイ基盤**: overlay 描画・focus、ピッカー（`Ctrl+T`/`Ctrl+G`, ignore 走査＋fuzzy＋パス直接オープン）、スタートページ（§4.12）。
 - **P5 検索**: バッファ内検索・置換、プロジェクト grep（grep クレート）。
 - **P6 tree-sitter ハイライト**: TOML/Markdown/JSON、増分パース。
 - **P7 LSP 基盤**: アクター（lsp-server フレーミング）、initialize、ドキュメント同期、診断表示、**ガター（診断＋git 差分列, §9.4）**。
 - **P8 LSP 機能**: 補完・ホバー・定義ジャンプ・リネーム・整形、semantic tokens ハイライト。
 - **P9 統合ターミナル**: PTY（nix）、vt100、分割モード 2、入力転送・リサイズ。
-- **P10 仕上げ**: マウス対応、レイアウト切替の磨き込み、エラー通知 UX。
+- **P10 仕上げ**: マウスの高度機能（サイドボタン undo/redo・`Ctrl+`クリック定義ジャンプ）、レイアウト切替の磨き込み、エラー通知 UX。
 
 ## 19. 決定ログ / 次タスク
 
@@ -1191,3 +1199,4 @@ src/
   - シェル終了でペインを閉じる（§12）。ディレクトリ/無指定起動は**スタートページ**（§4.12）。
   - 編集補助（オートインデント・単語境界・括弧対応, §5.5）。
   - LSP: didChange 150ms デバウンス、異常終了は指数バックオフ再起動（§8.3, 既定は当方推奨）。
+  - 診断メッセージ本文の表示先＝**ホバー＋ステータスバー**（§9.6）。**診断一覧オーバーレイは廃止**（§4.6・§15 から削除）。
