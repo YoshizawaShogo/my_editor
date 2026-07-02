@@ -23,26 +23,44 @@ pub enum Layout {
 impl Layout {
     pub fn active_editor(&self, focus: Focus) -> Option<&EditorPane> {
         match (self, focus) {
-            (Self::EditorFull(pane), Focus::Editor(Side::Left)) => Some(pane),
-            (Self::EditorFull(pane), Focus::Overlay) => Some(pane),
-            (Self::EditorAndShell { editor }, Focus::Editor(_) | Focus::Overlay) => Some(editor),
-            (Self::EditorAndEditor { left, .. }, Focus::Editor(Side::Left) | Focus::Overlay) => {
-                Some(left)
+            (Self::EditorFull(pane), Focus::Editor(Side::Left) | Focus::Completion(Side::Left)) => {
+                Some(pane)
             }
-            (Self::EditorAndEditor { right, .. }, Focus::Editor(Side::Right)) => Some(right),
+            (Self::EditorFull(pane), Focus::Overlay) => Some(pane),
+            (
+                Self::EditorAndShell { editor },
+                Focus::Editor(_) | Focus::Completion(_) | Focus::Overlay,
+            ) => Some(editor),
+            (
+                Self::EditorAndEditor { left, .. },
+                Focus::Editor(Side::Left) | Focus::Completion(Side::Left) | Focus::Overlay,
+            ) => Some(left),
+            (
+                Self::EditorAndEditor { right, .. },
+                Focus::Editor(Side::Right) | Focus::Completion(Side::Right),
+            ) => Some(right),
             _ => None,
         }
     }
 
     pub fn active_editor_mut(&mut self, focus: Focus) -> Option<&mut EditorPane> {
         match (self, focus) {
-            (Self::EditorFull(pane), Focus::Editor(Side::Left)) => Some(pane),
-            (Self::EditorFull(pane), Focus::Overlay) => Some(pane),
-            (Self::EditorAndShell { editor }, Focus::Editor(_) | Focus::Overlay) => Some(editor),
-            (Self::EditorAndEditor { left, .. }, Focus::Editor(Side::Left) | Focus::Overlay) => {
-                Some(left)
+            (Self::EditorFull(pane), Focus::Editor(Side::Left) | Focus::Completion(Side::Left)) => {
+                Some(pane)
             }
-            (Self::EditorAndEditor { right, .. }, Focus::Editor(Side::Right)) => Some(right),
+            (Self::EditorFull(pane), Focus::Overlay) => Some(pane),
+            (
+                Self::EditorAndShell { editor },
+                Focus::Editor(_) | Focus::Completion(_) | Focus::Overlay,
+            ) => Some(editor),
+            (
+                Self::EditorAndEditor { left, .. },
+                Focus::Editor(Side::Left) | Focus::Completion(Side::Left) | Focus::Overlay,
+            ) => Some(left),
+            (
+                Self::EditorAndEditor { right, .. },
+                Focus::Editor(Side::Right) | Focus::Completion(Side::Right),
+            ) => Some(right),
             _ => None,
         }
     }

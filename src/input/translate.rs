@@ -86,23 +86,37 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
     if ctrl && key.code == KeyCode::Char('h') {
         return Some(Command::OpenReplace.into());
     }
-    if ctrl && key.code == KeyCode::Char(' ') {
+    if ctrl
+        && matches!(
+            key.code,
+            KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Null
+        )
+    {
         return Some(Command::ToggleCompletion.into());
     }
-    if ctrl && key.code == KeyCode::Char('@') {
+    if ctrl && key.code == KeyCode::Char('o') {
         return Some(Command::ToggleShell.into());
     }
-    if key.code == KeyCode::Null {
-        return Some(Command::ToggleShell.into());
-    }
-    if ctrl && key.code == KeyCode::Char('\\') {
+    if ctrl && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5')) {
         return Some(Command::ToggleSplit.into());
     }
-    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('h') {
-        return Some(Command::ToggleHintGuide.into());
+    if matches!(focus, Focus::Overlay | Focus::Completion(_))
+        && ctrl
+        && key.code == KeyCode::Char('c')
+    {
+        return Some(Command::PickerCancel.into());
     }
     if matches!(focus, Focus::Shell) {
         return shell_key(key).map(AppEvent::TerminalInput);
+    }
+    if matches!(focus, Focus::Completion(_)) {
+        match key.code {
+            KeyCode::Esc => return Some(Command::PickerCancel.into()),
+            KeyCode::Enter => return Some(Command::PickerConfirm.into()),
+            KeyCode::Up => return Some(Command::PickerUp.into()),
+            KeyCode::Down => return Some(Command::PickerDown.into()),
+            _ => {}
+        }
     }
     if matches!(focus, Focus::Overlay) {
         return match key.code {
@@ -137,7 +151,7 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
             _ => None,
         };
     }
-    if !matches!(focus, Focus::Editor(_)) {
+    if !matches!(focus, Focus::Editor(_) | Focus::Completion(_)) {
         return None;
     }
     match key.code {
@@ -330,6 +344,104 @@ mod tests {
         assert_eq!(
             translate(raw, &Focus::Editor(Side::Left), &mut pending),
             Some(AppEvent::Command(Command::OpenCommandPalette))
+        );
+    }
+
+    #[test]
+    fn replacement_shortcuts_map_to_completion_shell_and_split() {
+        let mut pending = KeyChordState::default();
+        assert_eq!(
+            translate(
+                raw_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)),
+                &Focus::Editor(Side::Left),
+                &mut pending,
+            ),
+            Some(AppEvent::Command(Command::ToggleCompletion))
+        );
+        assert_eq!(
+            translate(
+                raw_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+                &Focus::Editor(Side::Left),
+                &mut pending,
+            ),
+            Some(AppEvent::Command(Command::ToggleShell))
+        );
+        assert_eq!(
+            translate(
+                raw_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL)),
+                &Focus::Editor(Side::Left),
+                &mut pending,
+            ),
+            Some(AppEvent::Command(Command::ToggleSplit))
+        );
+        assert_eq!(
+            translate(
+                raw_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL)),
+                &Focus::Editor(Side::Left),
+                &mut pending,
+            ),
+            Some(AppEvent::Command(Command::ToggleSplit))
+        );
+    }
+
+    #[test]
+    fn ctrl_c_cancels_an_overlay_but_remains_shell_input() {
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut pending = KeyChordState::default();
+        assert_eq!(
+            translate(raw_key(key), &Focus::Overlay, &mut pending),
+            Some(AppEvent::Command(Command::PickerCancel))
+        );
+        assert_eq!(
+            translate(raw_key(key), &Focus::Shell, &mut pending),
+            Some(AppEvent::TerminalInput(vec![3]))
+        );
+    }
+
+    #[test]
+    fn completion_only_captures_navigation_confirmation_and_cancel() {
+        let focus = Focus::Completion(Side::Right);
+        let mut pending = KeyChordState::default();
+
+        assert!(matches!(
+            translate(
+                raw_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+                &focus,
+                &mut pending,
+            ),
+            Some(AppEvent::TextInputAt { character: 'x', .. })
+        ));
+        assert_eq!(
+            translate(
+                raw_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+                &focus,
+                &mut pending,
+            ),
+            Some(Command::DeleteBackward.into())
+        );
+        assert_eq!(
+            translate(
+                raw_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                &focus,
+                &mut pending,
+            ),
+            Some(Command::PickerUp.into())
+        );
+        assert_eq!(
+            translate(
+                raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &focus,
+                &mut pending,
+            ),
+            Some(Command::PickerConfirm.into())
+        );
+        assert_eq!(
+            translate(
+                raw_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL)),
+                &focus,
+                &mut pending,
+            ),
+            Some(Command::ToggleCompletion.into())
         );
     }
 

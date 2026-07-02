@@ -31,6 +31,7 @@ pub enum LspEvent {
     },
     Initialized {
         server: u64,
+        incremental_sync: bool,
     },
     Diagnostics {
         uri: String,
@@ -38,7 +39,7 @@ pub enum LspEvent {
     },
     Progress {
         server: u64,
-        message: String,
+        message: Option<String>,
     },
     Response {
         id: i64,
@@ -50,5 +51,13 @@ pub enum LspEvent {
     },
     RestartDue {
         server: u64,
+    },
+    SemanticRefreshDue {
+        doc: crate::document::DocumentId,
+        version: i32,
+    },
+    CompletionRefreshDue {
+        doc: crate::document::DocumentId,
+        version: i32,
     },
 }

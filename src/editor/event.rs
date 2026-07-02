@@ -1,7 +1,7 @@
 use crossterm::event::MouseEvent;
 
 use crate::config::Config;
-use crate::document::{DiskState, DocumentId, LargeFile, PersistedHistory};
+use crate::document::{DiskState, DocumentId, LargeFile};
 use crate::lsp::LspEvent;
 
 use super::Command;
@@ -35,7 +35,14 @@ pub enum AppEvent {
 #[derive(Debug, Eq, PartialEq)]
 pub struct GitEvent {
     pub doc: DocumentId,
-    pub result: Result<Vec<GitLine>, String>,
+    pub result: Result<GitInfo, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitInfo {
+    pub lines: Vec<GitLine>,
+    pub branch: Option<String>,
+    pub status: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,13 +116,6 @@ pub enum IoEvent {
     },
     ExternalEditsFinished {
         result: Result<std::path::PathBuf, String>,
-    },
-    UndoHistoryLoaded {
-        id: DocumentId,
-        result: Result<Option<PersistedHistory>, String>,
-    },
-    UndoHistorySaved {
-        result: Result<(), String>,
     },
     DiskStateObserved {
         id: DocumentId,

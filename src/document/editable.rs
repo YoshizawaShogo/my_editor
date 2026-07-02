@@ -1,10 +1,9 @@
 use ropey::Rope;
 
-use std::path::Path;
 use std::time::Instant;
 
 use crate::{
-    document::{Change, History, LineEnding, PersistedHistory, Revision, content_hash},
+    document::{Change, History, LineEnding, Revision, content_hash},
     position::{CharIdx, char_idx_to_line_col},
     view::{Selection, Selections},
 };
@@ -14,11 +13,13 @@ pub struct Editable {
     text: Rope,
     pub line_ending: LineEnding,
     pub modified: bool,
+    saved_hash: u64,
     history: History,
     pub diagnostics: Vec<crate::lsp::Diagnostic>,
     pub git_lines: Vec<crate::editor::GitLine>,
     pub semantic_spans: Vec<crate::lsp::SemanticSpan>,
     pub syntax: Option<crate::highlight::IncrementalHighlighter>,
+    pending_lsp_changes: Vec<lsp_types::TextDocumentContentChangeEvent>,
 }
 
 impl Default for Editable {
@@ -33,11 +34,13 @@ impl Editable {
             text: Rope::from_str(text),
             line_ending: LineEnding::Lf,
             modified: false,
+            saved_hash: content_hash(text),
             history: History::default(),
             diagnostics: Vec::new(),
             git_lines: Vec::new(),
             semantic_spans: Vec::new(),
             syntax: None,
+            pending_lsp_changes: Vec::new(),
         }
     }
 
@@ -54,6 +57,7 @@ impl Editable {
     }
 
     pub fn mark_saved(&mut self) {
+        self.saved_hash = content_hash(&self.text.to_string());
         self.modified = false;
     }
 
@@ -62,31 +66,20 @@ impl Editable {
             crate::highlight::IncrementalHighlighter::new(language, &self.text.to_string());
     }
 
-    pub fn persisted_history(&self, path: &Path) -> PersistedHistory {
-        let (past, future) = self.history.snapshot();
-        PersistedHistory {
-            path: path.to_path_buf(),
-            base_hash: content_hash(&self.text.to_string()),
-            line_ending: self.line_ending,
-            past,
-            future,
-        }
-    }
-
-    pub fn restore_history(&mut self, history: PersistedHistory) {
-        self.history.restore(history.past, history.future);
+    pub fn take_lsp_changes(&mut self) -> Vec<lsp_types::TextDocumentContentChangeEvent> {
+        std::mem::take(&mut self.pending_lsp_changes)
     }
 
     pub fn insert(&mut self, selections: &mut Selections, inserted: &str) {
         let targets: Vec<_> = selections.iter().copied().collect();
         let replacements = vec![inserted.to_owned(); targets.len()];
-        self.replace_ranges(selections, targets, replacements, None);
+        self.replace_ranges(selections, targets, replacements, None, None);
     }
 
     pub fn insert_timed(&mut self, selections: &mut Selections, inserted: &str, at: Instant) {
         let targets: Vec<_> = selections.iter().copied().collect();
         let replacements = vec![inserted.to_owned(); targets.len()];
-        self.replace_ranges(selections, targets, replacements, Some(at));
+        self.replace_ranges(selections, targets, replacements, Some(at), None);
     }
 
     pub fn insert_fragments(&mut self, selections: &mut Selections, fragments: &[String]) {
@@ -96,25 +89,60 @@ impl Editable {
         } else {
             vec![fragments.join("\n"); targets.len()]
         };
-        self.replace_ranges(selections, targets, replacements, None);
+        self.replace_ranges(selections, targets, replacements, None, None);
     }
 
-    pub fn insert_newline(&mut self, selections: &mut Selections) {
+    pub fn insert_linewise_fragments(&mut self, selections: &mut Selections, fragments: &[String]) {
+        let targets: Vec<_> = selections
+            .iter()
+            .map(|selection| {
+                let line = self
+                    .text
+                    .char_to_line(selection.head.0.min(self.text.len_chars()));
+                Selection::caret(CharIdx(self.text.line_to_char(line)))
+            })
+            .collect();
+        let replacements = if fragments.len() == targets.len() {
+            fragments
+                .iter()
+                .map(|fragment| format!("{fragment}\n"))
+                .collect()
+        } else {
+            vec![format!("{}\n", fragments.join("\n")); targets.len()]
+        };
+        self.replace_ranges(selections, targets, replacements, None, None);
+    }
+
+    pub fn insert_newline(&mut self, selections: &mut Selections, line_comment: Option<&str>) {
         let targets: Vec<_> = selections.iter().copied().collect();
         let replacements = targets
             .iter()
             .map(|selection| {
-                let (line, _) = char_idx_to_line_col(&self.text, selection.head);
-                let indentation: String = self
-                    .text
-                    .line(line)
+                let insertion = selection.range().start;
+                let (line, column) = char_idx_to_line_col(&self.text, CharIdx(insertion));
+                let line_text = self.text.line(line);
+                let full_indentation: String = line_text
                     .chars()
                     .take_while(|character| matches!(character, ' ' | '\t'))
                     .collect();
-                format!("\n{indentation}")
+                let indentation = if column < full_indentation.chars().count() {
+                    line_text.chars().take(column).collect()
+                } else {
+                    full_indentation
+                };
+                let prefix: String = self
+                    .text
+                    .slice(self.text.line_to_char(line)..insertion)
+                    .into();
+                let comment = line_comment
+                    .and_then(|marker| continued_line_comment(&prefix, &indentation, marker));
+                comment.map_or_else(
+                    || format!("\n{indentation}"),
+                    |comment| format!("\n{indentation}{comment} "),
+                )
             })
             .collect();
-        self.replace_ranges(selections, targets, replacements, None);
+        self.replace_ranges(selections, targets, replacements, None, None);
     }
 
     pub fn delete_backward(&mut self, selections: &mut Selections) {
@@ -132,7 +160,7 @@ impl Editable {
             })
             .collect();
         let replacements = vec![String::new(); targets.len()];
-        self.replace_ranges(selections, targets, replacements, None);
+        self.replace_ranges(selections, targets, replacements, None, None);
     }
 
     pub fn delete_forward(&mut self, selections: &mut Selections) {
@@ -150,7 +178,58 @@ impl Editable {
             })
             .collect();
         let replacements = vec![String::new(); targets.len()];
-        self.replace_ranges(selections, targets, replacements, None);
+        self.replace_ranges(selections, targets, replacements, None, None);
+    }
+
+    pub fn delete_lines(&mut self, selections: &mut Selections) {
+        let mut lines: Vec<_> = selections
+            .iter()
+            .map(|selection| {
+                self.text
+                    .char_to_line(selection.head.0.min(self.text.len_chars()))
+            })
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        let mut ranges = Vec::<std::ops::Range<usize>>::new();
+        for line in lines {
+            let mut start = self.text.line_to_char(line);
+            let end = if line + 1 < self.text.len_lines() {
+                self.text.line_to_char(line + 1)
+            } else {
+                if line > 0 {
+                    start = start.saturating_sub(1);
+                }
+                self.text.len_chars()
+            };
+            if let Some(previous) = ranges.last_mut()
+                && start <= previous.end
+            {
+                previous.end = previous.end.max(end);
+            } else {
+                ranges.push(start..end);
+            }
+        }
+        let targets: Vec<_> = ranges
+            .into_iter()
+            .map(|range| Selection {
+                anchor: CharIdx(range.start),
+                head: CharIdx(range.end),
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let selections_before = selections.clone();
+        *selections = Selections::from_vec(targets.clone(), 0);
+        let replacements = vec![String::new(); targets.len()];
+        self.replace_ranges(
+            selections,
+            targets,
+            replacements,
+            None,
+            Some(selections_before),
+        );
     }
 
     pub fn selected_texts(&self, selections: &Selections) -> Vec<String> {
@@ -171,6 +250,8 @@ impl Editable {
         for change in revision.changes.iter().rev() {
             let start = change.range.start.0;
             let end = start + change.inserted.chars().count();
+            self.record_lsp_change(start..end, &change.removed);
+            self.update_semantic_spans(start..end, change.removed.chars().count());
             self.text.remove(start..end);
             self.text.insert(start, &change.removed);
         }
@@ -179,7 +260,7 @@ impl Editable {
         if let Some(syntax) = &mut self.syntax {
             syntax.reparse(&self.text.to_string(), false);
         }
-        self.modified = true;
+        self.refresh_modified();
         true
     }
 
@@ -188,6 +269,11 @@ impl Editable {
             return false;
         };
         for change in &revision.changes {
+            self.record_lsp_change(change.range.start.0..change.range.end.0, &change.inserted);
+            self.update_semantic_spans(
+                change.range.start.0..change.range.end.0,
+                change.inserted.chars().count(),
+            );
             self.apply_change(change);
         }
         *selections = revision.selections_after.clone();
@@ -195,7 +281,7 @@ impl Editable {
         if let Some(syntax) = &mut self.syntax {
             syntax.reparse(&self.text.to_string(), false);
         }
-        self.modified = true;
+        self.refresh_modified();
         true
     }
 
@@ -205,9 +291,11 @@ impl Editable {
         targets: Vec<Selection>,
         replacements: Vec<String>,
         insert_at: Option<Instant>,
+        history_selections_before: Option<Selections>,
     ) {
         assert_eq!(targets.len(), replacements.len());
-        let before = selections.clone();
+        let working_selections = selections.clone();
+        let before = history_selections_before.unwrap_or_else(|| working_selections.clone());
         let primary = selections.primary_index();
         let mut edits: Vec<PendingEdit> = targets
             .into_iter()
@@ -231,7 +319,7 @@ impl Editable {
         }
         edits.sort_by_key(|edit| edit.range.start);
 
-        let mut after_ranges: Vec<_> = before.iter().copied().collect();
+        let mut after_ranges: Vec<_> = working_selections.iter().copied().collect();
         let mut offset = 0isize;
         for edit in &edits {
             let inserted_len = edit.inserted.chars().count();
@@ -257,6 +345,11 @@ impl Editable {
                     &change.inserted,
                 );
             }
+            self.record_lsp_change(change.range.start.0..change.range.end.0, &change.inserted);
+            self.update_semantic_spans(
+                change.range.start.0..change.range.end.0,
+                change.inserted.chars().count(),
+            );
             self.apply_change(change);
         }
         if let Some(syntax) = &mut self.syntax {
@@ -273,12 +366,79 @@ impl Editable {
             },
             insert_at,
         );
-        self.modified = true;
+        self.refresh_modified();
     }
 
     fn apply_change(&mut self, change: &Change) {
         self.text.remove(change.range.start.0..change.range.end.0);
         self.text.insert(change.range.start.0, &change.inserted);
+    }
+
+    fn update_semantic_spans(&mut self, replaced: std::ops::Range<usize>, inserted_len: usize) {
+        let removed_len = replaced.len();
+        self.semantic_spans.retain_mut(|span| {
+            if removed_len == 0 {
+                if span.end.0 <= replaced.start {
+                    return true;
+                }
+                if span.start.0 >= replaced.start {
+                    span.start.0 += inserted_len;
+                    span.end.0 += inserted_len;
+                } else {
+                    span.end.0 += inserted_len;
+                }
+                return true;
+            }
+            if span.end.0 <= replaced.start {
+                return true;
+            }
+            if span.start.0 >= replaced.end {
+                span.start.0 = shift_index(span.start.0, inserted_len, removed_len);
+                span.end.0 = shift_index(span.end.0, inserted_len, removed_len);
+                return true;
+            }
+            false
+        });
+    }
+
+    fn record_lsp_change(&mut self, replaced: std::ops::Range<usize>, inserted: &str) {
+        self.pending_lsp_changes
+            .push(lsp_types::TextDocumentContentChangeEvent {
+                range: Some(lsp_types::Range::new(
+                    crate::position::char_idx_to_lsp_position(&self.text, CharIdx(replaced.start)),
+                    crate::position::char_idx_to_lsp_position(&self.text, CharIdx(replaced.end)),
+                )),
+                range_length: None,
+                text: inserted.to_owned(),
+            });
+    }
+
+    fn refresh_modified(&mut self) {
+        self.modified = content_hash(&self.text.to_string()) != self.saved_hash;
+    }
+}
+
+fn continued_line_comment(prefix: &str, indentation: &str, marker: &str) -> Option<String> {
+    let content = prefix.strip_prefix(indentation)?;
+    if !content.starts_with(marker) {
+        return None;
+    }
+    if marker == "//" {
+        if content.starts_with("///") && !content.starts_with("////") {
+            return Some("///".to_owned());
+        }
+        if content.starts_with("//!") {
+            return Some("//!".to_owned());
+        }
+    }
+    Some(marker.to_owned())
+}
+
+fn shift_index(index: usize, inserted_len: usize, removed_len: usize) -> usize {
+    if inserted_len >= removed_len {
+        index + inserted_len - removed_len
+    } else {
+        index.saturating_sub(removed_len - inserted_len)
     }
 }
 
@@ -311,13 +471,84 @@ mod tests {
     }
 
     #[test]
+    fn undoing_to_the_saved_contents_clears_modified_state() {
+        let mut editable = Editable::new("saved");
+        let mut selections = Selections::single(Selection::caret(CharIdx(5)));
+
+        editable.insert(&mut selections, "!");
+        assert!(editable.modified);
+        assert!(editable.undo(&mut selections));
+
+        assert_eq!(editable.text().to_string(), "saved");
+        assert!(!editable.modified);
+    }
+
+    #[test]
     fn newline_copies_the_current_indentation() {
         let mut editable = Editable::new("    value");
         let mut selections = Selections::single(Selection::caret(CharIdx(9)));
 
-        editable.insert_newline(&mut selections);
+        editable.insert_newline(&mut selections, None);
 
         assert_eq!(editable.text().to_string(), "    value\n    ");
+        assert_eq!(selections.primary().head, CharIdx(14));
+        assert_eq!(
+            editable
+                .text()
+                .chars()
+                .filter(|character| *character == '\n')
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn newline_inside_indentation_does_not_duplicate_existing_indent() {
+        let mut editable = Editable::new("    value");
+        let mut selections = Selections::single(Selection::caret(CharIdx(2)));
+
+        editable.insert_newline(&mut selections, None);
+
+        assert_eq!(editable.text().to_string(), "  \n    value");
+        assert_eq!(selections.primary().head, CharIdx(5));
+    }
+
+    #[test]
+    fn newline_continues_line_and_doc_comments() {
+        let mut editable = Editable::new("    // note");
+        let mut selections = Selections::single(Selection::caret(CharIdx(11)));
+        editable.insert_newline(&mut selections, Some("//"));
+        assert_eq!(editable.text().to_string(), "    // note\n    // ");
+
+        let mut editable = Editable::new("/// docs");
+        let mut selections = Selections::single(Selection::caret(CharIdx(8)));
+        editable.insert_newline(&mut selections, Some("//"));
+        assert_eq!(editable.text().to_string(), "/// docs\n/// ");
+    }
+
+    #[test]
+    fn semantic_spans_shift_after_edits_without_clearing_unaffected_tokens() {
+        let mut editable = Editable::new("foo bar");
+        editable.semantic_spans = vec![
+            crate::lsp::SemanticSpan {
+                start: CharIdx(0),
+                end: CharIdx(3),
+                token_type: 0,
+            },
+            crate::lsp::SemanticSpan {
+                start: CharIdx(4),
+                end: CharIdx(7),
+                token_type: 1,
+            },
+        ];
+        let mut selections = Selections::single(Selection::caret(CharIdx(0)));
+
+        editable.insert(&mut selections, "x");
+
+        assert_eq!(editable.semantic_spans[0].start, CharIdx(1));
+        assert_eq!(editable.semantic_spans[0].end, CharIdx(4));
+        assert_eq!(editable.semantic_spans[1].start, CharIdx(5));
+        assert_eq!(editable.semantic_spans[1].end, CharIdx(8));
     }
 
     #[test]

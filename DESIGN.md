@@ -123,7 +123,6 @@ struct Editor {
     workspace_root: PathBuf,
     status: StatusMessage,         // ステータスバー1行
     notifications: Notifications,  // 右下トースト＋進捗（§4.10）
-    hint_guide: HintGuide,         // ヒントガイド表示トグル（§4.9。focusは奪わない）
     pending_keys: KeyChordState,   // chord進行中の状態（§7）
     dirty: bool,                   // 再描画要求
     quit: bool,
@@ -202,11 +201,13 @@ struct EditorPane {
 struct View {
     doc: DocumentId,
     selections: Selections,        // 非空を不変条件に保つ（§4.7）
-    scroll: Scroll,                // 表示上端行・左端表示列
+    scroll: Scroll,                // 表示上端の論理行・先頭行内の折り返し表示行
 }
 
-struct Scroll { top_line: usize, left_col: usize }
+struct Scroll { top_line: usize, wrapped_row_offset: usize }
 ```
+
+通常Documentの長い論理行はペイン幅でsoft wrapする。ガターと本文を別領域として描画し、継続行は行番号・診断・gitのガターを貫通させず本文領域内だけで折り返す。折り返し後の表示行をカーソル可視化・マウスhit-test・スクロールでも同じ規則で数える。
 
 ### 4.4 Layout（3 モード固定の enum）
 
@@ -251,39 +252,20 @@ struct Change {
 - 連続入力・同種編集・短時間内は `pending` に coalesce し、区切り（カーソルジャンプ・別種操作・タイムアウト・保存）で確定して `past` へ。
 - 新規編集で `future` はクリア（分岐は持たない）。
 
-### 4.5.1 undo 履歴の永続化（ファイルを閉じても保持）
+### 4.5.1 undo 履歴の寿命
 
-ファイルを閉じても undo/redo を失わないよう、履歴を `~/my_editor_undo_history/` 配下に保存し、再オープン時に復元する。
-
-```rust
-struct PersistedHistory {
-    path: PathBuf,             // 絶対パス（可読性・衝突検出用）
-    base_hash: u64,            // 保存時点のファイル内容ハッシュ（整合性確認）
-    line_ending: LineEnding,
-    past: Vec<Revision>,       // 確定済みのみ永続化
-    future: Vec<Revision>,
-}
-```
-
-- **保存場所とキー**: `~/my_editor_undo_history/<key>.json`。`<key>` は**絶対パスの安定ハッシュ**（FNV-1a を内蔵実装。std の `DefaultHasher` は Rust バージョン間で不安定なため使わない）。ファイル内にも実パスを持たせ、ハッシュ衝突を検出したら別名にフォールバック。
-- **永続化するもの**: `past` / `future`（＝確定済み `Revision`）のみ。`pending` は `Instant` によるグルーピング状態を含み直列化に向かないため保存しない（読込時 `pending=None`）。`Revision`/`Change` は `Range<CharIdx>` と文字列のみなので serde で直列化可能（`serde_json`）。
-- **整合性チェック（重要）**: 履歴は char-index ベースなので、外部でファイルが書き換わると不整合になる。再オープン時に読み込んだ内容のハッシュが `base_hash` と一致すれば復元、不一致なら履歴を破棄して新規開始し `notify(Warn, "undo履歴を破棄（ファイルが外部変更）")`（§4.10）。
-- **保存タイミング**: バッファを閉じる時、保存時、および一定間隔（変更があれば）で `Effect::SaveUndoHistory` を発行。`base_hash` はその時点のバッファ内容から計算。
-- **読込タイミング**: ファイルを開く時に `Effect::LoadUndoHistory` を発行 → `AppEvent::Io(UndoHistoryLoaded{..})` で復元。無ければ空履歴。
-- **ディレクトリ生成**: `~/my_editor_undo_history/` は起動時か初回書き込み時に作成。
-- **プライバシー（権限）**: 履歴には編集断片（＝ファイル内容の一部）が平文で入るため、ディレクトリは `0700`、各履歴ファイルは **`0600`** で作成する（他ユーザから読めないようにする）。
-- **保持ポリシー（将来）**: 肥大化に備え「最終更新から N 日」または総容量上限での GC を後続で足す余地を残す（v1 は無制限、要検討）。
+undo/redo履歴は各バッファのメモリ上だけに保持する。バッファを閉じた時、またはエディタを終了した時に破棄し、ディスクへの書き出しと再オープン時の復元は行わない。
 
 ### 4.6 Overlay（フローティング補助 UI、具体 enum）
 
-パネル／サイドバーを持たないため、補助 UI はエディタ上に浮かぶオーバーレイとして描画する。テキスト入力や選択を伴うもの（Picker/Search/Rename/Completion/Confirm）は開いている間 focus を奪う。**Hover は例外で focus を奪わない**（カーソル静止／マウスで自動表示するツールチップで、編集を妨げない。LSP hover 情報とその位置の診断本文を集約＝§9.6）。各 state 型はそれぞれのモジュールで独立に定義し、`From` で `Overlay` に接続する。
+パネル／サイドバーを持たないため、補助UIはエディタ上に浮かぶオーバーレイとして描画する。Picker/Search/Rename/Confirmは開いている間focusを奪う。Completionは専用focusを使い、上下・Enter・Ctrl+C・Esc・Ctrl+@だけを候補操作として扱い、それ以外は通常の編集操作としてバッファへ渡す。**Hoverはfocusを奪わない**（通常クリックで入力カーソルを移した位置に表示し、LSP hover情報とその位置の診断本文を集約＝§9.6）。MouseMovedや範囲選択中は表示しない。
 
 ```rust
 enum Overlay {
     Picker(PickerState),           // Ctrl+T ディレクトリ以下 / Ctrl+G 全バッファ / F6 比較対象（§13）
     Search(SearchState),           // Ctrl+F 検索 / Ctrl+H 置換。スコープ循環（§13）
-    Completion(CompletionState),   // Ctrl+Space トグル。矢印選択/Enter・Tab確定（§8.5）
-    Hover(HoverState),             // LSPホバー＋カーソル位置の診断本文（自動表示・focus奪わない。§9.6）
+    Completion(CompletionState),   // Ctrl+@（Ctrl+Space）トグル。矢印選択/Enter・Tab確定（§8.5）
+    Hover(HoverState),             // 通常クリック位置のLSPホバー＋診断本文（focusを奪わない。§9.6）
     Rename(RenameState),           // LSPリネーム入力
     Confirm(ConfirmState),         // 未保存終了などの確認
 }
@@ -320,75 +302,17 @@ enum Focus {
 enum Side { Left, Right }
 ```
 
-### 4.9 HintGuide（ヒントガイド、認知コスト低減）
+### 4.9 コマンド発見（認知コスト低減）
 
-キーを覚えていなくても操作できるよう、内蔵キーマップから生成したキー一覧を**フローティング表示**する。which-key 的な用途。
+独立したヒントガイドは持たない。`Ctrl+P`のコマンドパレット（§13）でコマンド名・説明・固定キーバインドを同時表示し、検索からそのまま実行できるようにする。操作のたびにキーを確認できるため、常設ガイドを増やさず利用しながら覚えられる。
 
-```rust
-struct HintGuide {
-    visible: bool,     // Alt+H でトグル
-}
-```
+### 4.10 Notifications（ステータスバーへ集約）
 
-- **フォーカスを奪わない**。他のオーバーレイ（`Overlay`, §4.6）と異なり `focus` を変えず、editor/overlay を操作しながら重ねて見られる（表示中も編集・検索が続けられる）。そのため `Overlay` enum ではなく `Editor` の独立フィールドに持つ。
-- **文脈依存**: 現在の `focus`（Editor / Shell / Overlay 種別）に応じて、その場面で有効なキーだけを内蔵キーマップ（§7）から引いて表示する。keymap が唯一の真実源で、ガイドは常にそこから生成する（表と実挙動が乖離しない）。
-- **自己言及**: ガイド末尾に必ず「`Alt+H` … このガイドの表示/非表示」を載せる。
-- トグルは `Command::ToggleHintGuide`（§5.3）。描画は最前面（`Overlay` より上でもよい）。
+右下トーストは本文・ステータスバーと重なるため描画しない。一過性の保存結果やエラーはステータスバーへ、LSPの継続状態は言語セグメントへ集約する。内部のToastは有効期限管理に利用してよいが、独立popupにはしない。
 
-### 4.10 Notifications（右下トースト＋進捗）
+### 4.11 LSP 進捗表示
 
-画面に常時は出ない事象（保存完了、LSP のライフサイクル、エラー等）を**右下**にまとめて出す。用途が 2 系統あるので型も 2 つに分ける。フォーカスは奪わない（`HintGuide` 同様、`Overlay` ではなく `Editor` フィールド）。
-
-```rust
-struct Notifications {
-    toasts: Vec<Toast>,        // 一過性。数秒で自動消滅
-    progress: Vec<Progress>,   // 継続的。完了まで残り、中身を更新
-}
-
-// --- トースト（保存・完了・エラーなど一過性の結果） ---
-struct Toast {
-    level: ToastLevel,         // 表示色
-    text: String,
-    created: Instant,
-    ttl: Duration,             // 既定 数秒。level に応じて可変（Error は長め）
-}
-enum ToastLevel { Info, Success, Warn, Error }
-
-// --- 進捗（LSP等の時間のかかる処理。key で同じ行を更新） ---
-struct Progress {
-    key: ProgressKey,          // 同一 key は同じ行を in-place 更新
-    title: String,             // 例 "rust-analyzer"
-    message: Option<String>,   // 例 "Indexing 1234/5000"
-    percent: Option<u8>,       // あればバー表示
-    done: bool,                // 完了で短時間残してから除去
-}
-```
-
-**関数化（何度も呼ぶ導線を 1 本に）**:
-
-```rust
-impl Editor {
-    // 一過性トースト。保存・整形完了・エラー等から呼ぶ
-    fn notify(&mut self, level: ToastLevel, text: impl Into<String>) {
-        self.notifications.toasts.push(Toast::new(level, text.into()));
-        self.dirty = true;
-    }
-
-    // 進捗の開始/更新/完了。同じ key を渡すと同じ行を更新
-    fn progress(&mut self, key: ProgressKey, update: ProgressUpdate) {
-        self.notifications.upsert(key, update);   // Begin/Report/End を吸収
-        self.dirty = true;
-    }
-}
-```
-
-- **呼び出し箇所**: 保存完了/失敗（`apply_io`）、LSP 起動・初期化・診断受信・エラー（`apply_lsp`）、Directory 検索の開始/完了（`apply_grep`）など。すべて上記 2 関数に集約する。
-- **描画**（`render/` に `draw_notifications` を用意）: 右下に、進捗を上・トーストを下（または新しい順）にスタック。`percent` があれば細いバー、無ければスピナー相当のドット。件数が多い時は最新 N 件＋「+k more」。
-- **自動消滅のタイミング取得**: 通知は wall-clock で期限切れするため、ランタイムは毎ループ後に `editor.notifications.next_deadline()`（最も近い ttl/spinner 更新時刻）を問い合わせ、`rx.recv()` に `tokio::time` のスリープを添えて起こす。起床時に期限切れトーストと `done` 済み進捗を掃除する（§3.2 の drain ループに小さな timeout 分岐を足すだけ。専用 Effect は不要）。
-
-### 4.11 LSP 進捗表示（不安低減）
-
-LSP は起動〜インデックス作成に時間がかかり「固まった？」という不安を生むため、**ある程度細かい進捗を右下に出し続ける**。ソースは 2 つ:
+LSP は起動〜インデックス作成に時間がかかるため、状態をステータスバーの言語セグメントへ表示する。ソースはライフサイクルイベントと`$/progress`:
 
 1. **自前ライフサイクル段階**（`SpawnLspServer` → プロセス起動 → `initialize` 送信 → `initialized` 受信 → Ready）。各段で `Editor::progress(key=Server(id), …)` を更新（"起動中" → "初期化中" → "準備完了"）。
 2. **LSP の `$/progress`（WorkDoneProgress）**: `window/workDoneProgress/create` ＋ `$/progress`(Begin/Report/End)。rust-analyzer 等が送る "Indexing" / "Loading" の title・message・percentage をそのまま `Progress` にマップ（`key=WorkDone(token)`）。
@@ -401,8 +325,8 @@ LSP は起動〜インデックス作成に時間がかかり「固まった？�
 起動時に**ファイル引数が無い／ディレクトリ引数のみ**の場合、開いているバッファが無いのでエディタ領域に**スタートページ**を出す（VSCode の welcome の極小版）。案内は最小限:
 
 - `Ctrl+T` … ファイルを開く
+- `Ctrl+P` … コマンドとキーバインドを検索
 - `F4` … 終了
-- （`Alt+H` … ヒントガイド、も併記してよい）
 
 バッファを 1 つでも開くと消える。フォーカスは editor。`main.rs` は引数がファイルならそれを開き、ディレクトリ／無指定ならスタートページを表示する（`workspace_root` は §11.3 で決定）。
 
@@ -425,7 +349,7 @@ enum AppEvent {
     Terminal(TerminalEvent),       // §12
     Grep(GrepEvent),               // §13
     FileScan(FileScanEvent),       // finder用の走査結果
-    Git(GitEvent),                 // ガター git 差分（§9.4）
+    Git(GitEvent),                 // ガター差分・branch・porcelain状態（§9.4）
     Io(IoEvent),                   // ファイル読み書き完了/失敗
     ConfigLoaded(Result<Config, ConfigError>),
 
@@ -485,9 +409,6 @@ enum Command {
     ToggleComment,
     // レイアウト（フォーカスは操作に追従。専用フォーカスコマンドは持たない）
     ToggleSplit, ToggleShell,
-    // UI
-    ToggleHintGuide,               // Alt+H。ヒントガイド表示（§4.9）
-
     // LSP（定義=Ctrl+クリック / ホバー=自動 は Command でなくイベント経由）
     Rename, ToggleCompletion,
     // 終了
@@ -504,10 +425,6 @@ enum Effect {
     // ファイルIO
     ReadFile { id: DocumentId, path: PathBuf },
     WriteFile { path: PathBuf, contents: String, doc: DocumentId },
-
-    // undo履歴の永続化（§4.5.1）
-    LoadUndoHistory { id: DocumentId, path: PathBuf },
-    SaveUndoHistory { path: PathBuf, data: PersistedHistory },
 
     // 走査・検索（token で古いクエリの結果を捨てる）
     StartFileScan { root: PathBuf, token: ScanToken },
@@ -539,7 +456,7 @@ enum Effect {
 
 VSCode ライクの操作感に必要な最小の編集補助:
 
-- **オートインデント**: `Enter` で直前行の先頭空白（インデント）を引き継ぐ。言語別の増減（`{` で +1 段等）は将来。
+- **オートインデント**: `Enter`でカーソル位置までの先頭空白を引き継ぐ。インデント途中で分割しても後半の既存空白を重複させない。現在行が言語設定の`line_comment`（`//`/`#`等）なら、同じインデント＋コメント記号＋空白を次行へ継続する。`///`/`//!`も維持する。
 - **単語境界の定義**: 識別子文字（英数字 ＋ `_`）を 1 単語とする定義を `view/movement.rs` に一元化し、`Ctrl+←/→`（単語移動）・`Ctrl+D`（次の同一語）・ダブルクリック（単語選択）で共有する。
 - **括弧の対応ハイライト**: カーソル隣接の `()[]{}` に対応する括弧を探して両方を強調表示。
 - **マウス**（§7.3 に対応）: ダブルクリック＝単語選択、トリプルクリック＝行選択。
@@ -605,7 +522,7 @@ struct KeyChordState { prefix: Option<KeyPress> }   // 例: Ctrl+K 押下後
 - ホイール: スクロール（キーボードのページ送りは持たない）。
 - Ctrl+クリック: 定義ジャンプ（LSP。専用キーは無い）。
 - Alt+クリック: カーソル追加（マルチカーソル）。
-- サイドボタン（戻る/進む）: undo / redo。復元した変更位置へ primary カーソルを移動（`Revision.selections_before/after` を利用。§4.5）。crossterm のサイドボタン対応は要検証（§7.4 の注記）。
+- サイドボタン（戻る/進む）: undo / redo。GNOME Terminalが送るSGRボタン番号8/9（Cb=128/129）を、プロジェクト内のcrossterm互換パッチでBack/Forwardへ変換する。
 
 ### 7.4 採用ショートカット（確定）
 
@@ -622,7 +539,7 @@ VSCode ライクでも全ショートカットは実装しない。**右手は�
 | Alt+クリック | カーソル追加（マルチカーソル） |
 | サイドボタン（戻る/進む） | undo / redo（復元した変更位置へ primary カーソルを移動） |
 
-> ⚠ 要検証: `crossterm` 0.28 の `MouseButton` は `Left`/`Right`/`Middle` のみで、サイドボタン（戻る=ボタン8 / 進む=ボタン9）は既定ではイベント化されない可能性がある。必要なら SGR マウスシーケンスを自前でパースして拾う（`terminal/` もしくは `runtime/input.rs` の翻訳前段）。実機・端末依存のため P10 の仕上げで確認する。
+> `crossterm` 0.28/0.29は追加ボタンをエラーとして消費するため、0.28.1を`vendor/crossterm`に固定し、`MouseButton::Back`/`Forward`とSGR 128/129の解析だけを追加する。
 
 #### キーボード（左手中心・確定）
 
@@ -640,7 +557,7 @@ VSCode ライクでも全ショートカットは実装しない。**右手は�
 | `Tab` / `Shift+Tab` | インデント / アンインデント | 選択行 |
 | `Ctrl+/` , `Ctrl+Q` | コメントトグル | **2 キー割当**。右手マウスで範囲選択中に左手でコメントできるよう `Ctrl+Q` を併設 |
 | `Ctrl+Z` / `Ctrl+Y` | undo / redo | |
-| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | コピー / カット / ペースト | 内部＋OSC52 |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | コピー / カット / ペースト | 内部＋OSC52。選択なしの`Ctrl+C`は現在行をlinewiseコピー |
 | `Ctrl+S` | 保存 | |
 | `Ctrl+W` | バッファを閉じる | 未保存なら `Confirm`（§4.6） |
 | `Ctrl+T` | ファイルピッカー（カレントディレクトリ以下） | `ignore`走査。`Ctrl+P`はコマンドパレットに使用 |
@@ -649,21 +566,20 @@ VSCode ライクでも全ショートカットは実装しない。**右手は�
 | `F6` | 比較対象バッファピッカー | 現在のバッファを左、選択した開いているバッファを右に置き、行を対応させた diff 表示 |
 | `Ctrl+F` / `Ctrl+H` | 検索 / 置換（オーバーレイを開く。**開いた状態で再押下するとスコープを循環**。include/exclude glob と ignore 設定あり＝§13） | カレントバッファ→全バッファ→カレントディレクトリ以下 |
 | `Ctrl+Shift+F` | 検索をディレクトリスコープで直接開く | 循環の 3 段目へ一発 |
-| `Ctrl+Space` | 補完ポップアップ トグル | LSP。矢印で選択 / `Enter`・`Tab` で確定 / `Esc` で閉じる（§8.5） |
+| `Ctrl+@` / `Ctrl+Space` | 補完ポップアップ トグル | 同じNUL入力を同一操作として扱う。上下で選択 / `Enter`で確定。表示中も他のキーは通常編集 |
 | `F2` | リネーム | LSP |
-| `Ctrl+\` | 左右エディタ分割トグル | フォーカス追従（モード 1↔3） |
-| `Ctrl+@` | シェル表示トグル | フォーカス追従（モード 1↔2） |
-| `Alt+H` | ヒントガイド表示トグル | フォーカスを奪わず重ねて表示（§4.9）。ガイド内にも明記 |
+| `Ctrl+]` | 左右エディタ分割トグル | フォーカス追従（モード1↔3） |
+| `Ctrl+O` | シェル表示トグル | フォーカス追従（モード1↔2） |
 | `F4` | エディタ終了 | Alt+F4 のイメージ。未保存があれば `Confirm`。あまり押さない前提の隔離キー |
 | `Esc` | オーバーレイを閉じる / 選択を単一化 | |
 
 #### 不採用・自動化（明示）
 
 - `PageUp` / `PageDown`: **不採用**（マウスホイールで代替）。
-- 専用フォーカス移動キー（`Ctrl+1/2` 等）: **不採用**。フォーカスはマウス / `Ctrl+\` / `Ctrl+@` / `Ctrl+T` / `Ctrl+G` に追従。
+- 専用フォーカス移動キー（`Ctrl+1/2`等）: **不採用**。フォーカスはマウス / `Ctrl+]` / `Ctrl+O` / `Ctrl+T` / `Ctrl+G`に追従。
 - `Ctrl+Shift+P`: 不採用。コマンドパレットは左手で押しやすい`Ctrl+P`に固定する。
 - 定義ジャンプ: **Ctrl+クリックのみ**（`F12` は持たない）。
-- ホバー: **キー無し。カーソル静止／マウスホバーで自動表示**。
+- ホバー: **キー無し。通常クリックで入力カーソルを移した位置に表示**。MouseMovedでは表示しない。
 - 整形: **MVP は導線なし**（機能は後続 P8。パレット導入時に割当）。
 
 コメントトグルは言語ごとの行コメント記号を要するため、`[[language]]` 設定に `line_comment` を持たせる（§11.2 の拡張余地）。バンドル言語には既定値を内蔵。
@@ -700,14 +616,14 @@ struct LspHandle { to_server: mpsc::Sender<LspOutbound> }   // メイン→ア�
 MVP の起動導線（§7.4 確定）:
 
 - 定義ジャンプ: **Ctrl+クリック**（キー無し）。
-- ホバー: **自動**（カーソル静止／マウスホバーで `Overlay::Hover` を表示）。
-- リネーム: **F2**。補完: **Ctrl+Space**（トグル。§8.5）。
+- ホバー: **通常クリック時**（移動後が単一caretの時だけ`Overlay::Hover`を表示）。ドラッグ・ダブル/トリプルクリック・Shift移動等で範囲選択になったら既存Hoverも閉じる。
+- リネーム: **F2**。補完: **Ctrl+@**（`Ctrl+Space`と同一、トグル。§8.5）。
 - **整形は MVP では導線なし**（機能実装は P8、パレット導入時に割当）。
 - **マルチカーソル時のスコープ**: 補完・定義ジャンプ・ホバー・リネームなど位置依存の LSP 操作は、MVP では **primary カーソルのみ**に適用する（実装量を絞る）。全カーソルへの一括適用は後続。
 - **診断のズレ（stale diagnostics）**: 編集するとサーバ再送までの間、`diagnostics` の位置が実際とズレる。厳密追従はしないが、**編集の行デルタ分だけ暫定シフト**し、**編集された行の診断は stale として淡色化**する。次の publishDiagnostics で丸ごと置換。列レベルの厳密再マップはしない（best-effort、費用対効果で割り切り）。
 - **リネームの複数ファイル適用**: `rename` の `WorkspaceEdit` を適用する際、**開いているバッファへの編集は通常編集として undo に載せる**。**未オープンのファイルは開いて編集し保存**するが、**カレントバッファ外の変更は undo 対象に含めない**（複数ファイルの巻き戻しは複雑でバグの温床のため、意図的に対象外）。適用前に対象ファイル数を `notify`／`Confirm` で提示。
 - **didChange デバウンス**: 連続入力は約 150ms デバウンスしてから `didChange` を送る（過剰送信と診断のチラつきを抑制）。
-- **サーバ異常終了時の再起動**: プロセスが落ちたら**指数バックオフで自動再起動（最大 N 回）**。超過したら `notify(Error)` して当該言語の LSP 機能を停止（エディタ自体は継続）。
+- **サーバ異常終了時の再起動**: LSP stdoutのEOFまたはプロトコル読取エラーで、500ms→1s→2sの指数バックオフにより最大3回再起動する。超過したら当該言語のLSP機能を停止し、エディタ自体は継続する。
 
 ### 8.4 LspEvent
 
@@ -722,7 +638,7 @@ enum LspEvent {
 }
 ```
 
-`apply_lsp` はこれらを受けて `Editor::progress(...)` / `notify(...)`（§4.10–4.11）を呼び、右下の進捗・トーストへ反映する。`Progress` は `WorkDoneProgressBegin/Report/End` を `Progress` 行の開始/更新/完了に対応させる。
+`apply_lsp` はこれらを文書単位の`starting`/`initializing`/`opening`/`coloring`/`ready`/`updating`/`not found`/`error`へ変換する。`WorkDoneProgressBegin/Report`のtitle・message・percentageを`updating: ...`へ整形し、Endで消す。
 
 ### 8.5 補完ポップアップの操作（`Overlay::Completion`）
 
@@ -735,9 +651,12 @@ struct CompletionState {
 }
 ```
 
-- **表示トグル**: `Ctrl+Space`（`Command::ToggleCompletion`）で開閉。開いていなければ補完要求→表示、開いていれば閉じる。
-- **選択**: 矢印キー ↑/↓。**確定**: `Enter` または `Tab`（選択中の候補を挿入。`textEdit` があればそれを、無ければ `insertText` を適用）。**閉じる**: `Esc`。
-- 入力を続けると `query` で絞り込み（`fuzzy-matcher`）。確定後カーソルは挿入テキスト末尾へ。
+- **表示トグル**: `Ctrl+@` / `Ctrl+Space`（`Command::ToggleCompletion`）で開閉。開いていなければ補完要求→表示、開いていれば閉じる。
+- **自動表示と絞り込み**: 文字入力後に自動要求し、入力prefixでローカルfuzzy絞り込みする。prefixと完全一致する候補自身は除外する。
+- **入力透過**: 候補操作として消費するのは上下・`Enter`・`Ctrl+C`・`Esc`・`Ctrl+@`だけ。他の文字、削除、移動、編集コマンドは通常どおり実行し、候補を再要求する。
+- **配置**: 入力中の単語先頭をアンカーにし、同じ単語を入力している間は横位置を固定する。入力カーソルの画面行には重ねず、下に収まれば次行、収まらなければ上側へ出し、選択候補は高コントラスト背景＋太字にする。
+- **選択**: 矢印キー ↑/↓。**確定**: `Enter`（選択中の候補を挿入）。**閉じる**: `Esc`。
+- 入力を続けると `query` で絞り込み（`fuzzy-matcher`）。Function/Method候補は未指定なら`()`まで挿入し、カーソルを括弧内へ置く。既に括弧を含む候補には重複追加しない。
 - マルチカーソル時は **primary カーソルのみ**に適用（MVP、実装量を絞る）。
 
 ## 9. シンタックスハイライト
@@ -761,6 +680,8 @@ enum Highlighter {
 3. どちらも無ければ **None**（無着色）。
 
 → Rust/Python のような LSP 言語は semantic tokens、TOML/Markdown/JSON のような非 LSP 言語は tree-sitter。言語判定（§11.2）が両者の選択根拠になる。
+
+編集直後も影響範囲外のsemantic tokensを保持し、編集位置より後ろのspanを文字数差分だけ移動する。重なったspanだけを捨て、増分更新済みtree-sitter色へfallbackする。`didChange`後にsemantic tokensを再要求し、request時のDocument versionと現在versionが異なる古い応答は適用しない。画面全体を一瞬白くせず、入力中の色と座標を安定させる。
 
 - 例外: `DocumentKind::Large`（§4.2.1）は言語に関わらず**常に無着色**（`Highlighter` を持たず、tree-sitter も semantic tokens も走らせない）。フリーズ回避のため。
 
@@ -793,17 +714,18 @@ const RED:       Rgb = 0xe27878;  // error/削除（置換プレビューの旧�
 const STATUSBG:  Rgb = 0x0f1117;  // ステータスバー背景
 // 領域を背景色で分けるための面（§9.3 の枠線なし原則）
 const PANE_INACTIVE: Rgb = 0x12141c;  // 非アクティブペインの背景（やや沈める）
-const POPUP_BG:      Rgb = 0x1e2132;  // オーバーレイ/ポップアップ/トーストの浮き面
+const POPUP_BG:      Rgb = 0x1e2132;  // オーバーレイ/ポップアップの浮き面
 ```
 
 - **枠線を使わない（重要な描画原則）**: box-drawing の罫線でペインやポップアップを囲わない。**領域は背景色の差**で表現する（囲み線に上下左右 2 マスを費やす無駄を省き、狭い SSH 端末で表示領域を最大化する）。
   - **ペイン分割（§4.4）**: 分割の境界に区切り線を引かず、**アクティブ側＝`BG` / 非アクティブ側＝`PANE_INACTIVE`** の背景差で分ける。必要なら境界に 1 桁だけアクセント背景を置く程度に留める（2 桁の枠は作らない）。
   - **オーバーレイ/ポップアップ（§4.6, 補完 §8.5, ホバー）**: 枠で囲わず `POPUP_BG` の塗りブロックとして浮かせる（影の代わりに背景差でレイヤを示す）。
-  - **通知（§4.10）**: トースト/進捗も `POPUP_BG` の塗りブロック、枠なし。
+  - **通知（§4.10）**: 独立popupを出さず、ステータスバーへ集約する。
   - **ステータスバー（§9.5）**: `STATUSBG` の 1 行帯。
 
 - **トークン種別 → 色テーブル**: LSP semantic tokens 種別（`keyword`/`function`/`type`/`string`/`comment`/…）と tree-sitter キャプチャ名（`@keyword`/`@function`/`@type`/`@string`/`@comment`/…）の**双方**を、この共通パレットへマップする（`highlight/` からの出力を一元的に着色）。
-- **UI 色**: 選択=`SELECTION`、カーソル行=`CURSORLINE`、行番号=`LINENR`/`MUTED`、診断下線=`RED`/`ORANGE`、ステータスバー=`STATUSBG`＋`FG`。置換プレビュー（§13）の旧=`RED`/新=`GREEN`。トースト（§4.10）は Info=`BLUE` / Success=`GREEN` / Warn=`ORANGE` / Error=`RED`。
+- **UI 色**: 選択=`SELECTION`、カーソル行=`CURSORLINE`、行番号=`LINENR`/`MUTED`、診断下線=`RED`/`ORANGE`、ステータスバー=`STATUSBG`＋`FG`。置換プレビュー（§13）の旧=`RED`/新=`GREEN`。
+- **入力カーソル形状**: primaryは端末の`SteadyBar`（縦棒）、マルチカーソルのsecondaryは描画セル`▏`を使う。正常終了・panic時とも`DefaultUserShape`へ戻す。
 - 端末が truecolor 非対応の場合に備え、将来 256/16 色フォールバックを足す余地は残す（v1 は truecolor 前提）。
 
 ### 9.4 ガター（行番号列: 診断マーカー ＋ git 差分）
@@ -811,7 +733,7 @@ const POPUP_BG:      Rgb = 0x1e2132;  // オーバーレイ/ポップアップ/�
 行番号の隣に細い「ガター」列を設け、LSP の error/warning と git の変更状況を可視化する（VSCode の gutter 相当）。レイアウトは左→右で `[git][diag] 行番号 │ 本文`。
 
 - **diag 列（1 桁）**: その行の LSP 診断の最大 severity を色付きグリフで表示。error=`RED` `●`、warning=`ORANGE` `▲`、無ければ空白。`Editable.diagnostics` から行ごとに算出する純粋関数 `line_severity(diags, line) -> Option<Severity>`。
-- **git 列（1 桁）**: HEAD との差分で 追加=`GREEN`、変更=`BLUE`、削除=`RED`（削除は行間マーカー）。変更行のみ保持。
+- **git 列（1 桁）**: HEAD との差分で追加=`GREEN`、変更=`BLUE`の縦棒`▌`を表示する。削除はガターに表示しない。変更行のみ保持。
 
 ```rust
 enum GitLineStatus { Added, Modified, Deleted }   // Deleted = その行の直後に削除がある印
@@ -819,7 +741,7 @@ struct GitGutter { lines: HashMap<usize, GitLineStatus> }   // 変更行のみ
 ```
 
 - **git データ源**: `git` サブプロセスに委譲し、`git diff -U0 --no-color -- <path>` のハンク見出し（`@@ -a,b +c,d @@`）を解析して行範囲を `GitLineStatus` 化する。追加依存なし・SSH 開発サーバでは git 前提で、既存のプロセス起動基盤（LSP/PTY）と一貫。純 Rust にしたい場合は `gix` へ差し替え可能（要相談）。
-- **フロー**: `Effect::ComputeGitStatus { doc, path }` → git アクターが実行 → `AppEvent::Git(GitEvent::Status { doc, gutter })`。再計算は**ファイルオープン時・保存時**（MVP は保存基準。未保存中の逐次差分は後続）。git 管理外のファイルは git 列を空に。
+- **フロー**: `Effect::ComputeGitStatus { doc, path }` → git アクターが`git diff`、`git branch --show-current`、対象ファイルの`git status --porcelain`を実行 → `AppEvent::Git(GitEvent { doc, result: GitInfo })`。`GitInfo`はガター行、branch、対象ファイルのXY状態（`M`/`MM`/`??`等）を持つ。再計算は**ファイルオープン時・保存時**。git管理外のファイルはgit情報を空にする。
 - **大容量ファイル（§4.2.1）**: ガターの git/診断は付けない（読み取り専用・LSP なし）。行番号のみ。
 
 ### 9.5 画面外インジケータ（エッジ矢印＋件数）
@@ -827,9 +749,9 @@ struct GitGutter { lines: HashMap<usize, GitLineStatus> }   // 変更行のみ
 TUI ではミニマップや overview ruler を作らない。代わりに「ビューポート外に何があるか」を**上下エッジの矢印＋件数**と**ステータスバー要約**で示す。対象は 診断（error/warning）・git 変更・検索ヒットの 3 種。
 
 - **エッジ手掛かり**: ビューポートの上端より上／下端より下に対象があれば、上端行の右側に `↑ …`、下端行の右側に `↓ …` のバッジを出す。0 件の種別は出さない。色は §9.3 に従う（error=`RED`、warning=`ORANGE`、git=`BLUE`、検索=アクセント）。
-  - 例: 上に error2・warning1・git変更3・ヒット4 → `↑ ●2 ▲1 ~3 ⌕4`（グリフは端末安全のため ASCII フォールバックあり）。
-- **ステータスバー要約**: ファイル名 ＋ **未保存インジケータ**（`Editable.modified` が真なら名前の横に `●`）、診断総数 `E:5 W:2`、検索 `3/47`（現在/総数）、位置 `Ln 12/340 (12%)`、**カーソル行に診断があればその主メッセージを1行**（例 `⚠ unused variable \`a\``。§9.6）。=「数」と「現在位置」と「今いる行の問題」を常時提示。外部変更が未解決なら名前の横に別マーク（例 `⚠`）も出す（§14.1）。
-- **横方向（長い行）**: 行が右へはみ出していれば右端に `»`、左スクロール中なら左端に `«`。
+  - 例: 下に error2・warning1・git変更3・追加4 → `↓ E2 W1 M3 A4`。errorは赤、warningはオレンジ、modifiedは青、addedは緑。
+- **ステータスバー要約**: 色付きセグメントは「ワークスペース相対path＋未保存/外部変更」「言語とLSP状態（例 `<lsp> rust: updating`。非LSPは`<syntax> markdown`）」「Git状態（例 `<git> clean @main`）」「診断総数 `E:5 W:2`」に絞る。LSP状態は`starting`/`initializing`/`opening`/`coloring`/`ready`/`updating`/`not found`/`error`と進捗本文を区別する。行数・列数・割合は表示しない。
+- **長い行**: ペイン幅でsoft wrapするため、横方向の`»`/`«`は表示しない。
 - **算出**: `View.scroll` と表示高から、上/下それぞれの件数を集計する**純粋関数** `offscreen_cues(diagnostics, git_gutter, search_hits, scroll, height) -> OffscreenCues` にまとめてテストする。追加の `AppEvent`/`Effect` は不要（描画時に既存状態から計算）。
 
 ```rust
@@ -837,27 +759,29 @@ struct OffscreenCues { above: EdgeSummary, below: EdgeSummary }
 struct EdgeSummary { errors: usize, warnings: usize, git_changes: usize, search_hits: usize }
 ```
 
-- 検索ヒットのエッジ/要約は、検索が有効な間（`Overlay::Search` 表示中）に出す。診断・git は常時。大容量ファイルは行位置（`Ln x/N`）のみ。
+- 検索ヒットのエッジ/要約は、検索が有効な間（`Overlay::Search` 表示中）に出す。診断・git は常時。大容量ファイルは読み取り専用状態だけを表示する。
 
 ### 9.6 診断メッセージの表示（ホバー＋ステータスバー）
 
-診断の**場所**（ガター §9.4／波線下線 §9.3／件数・画面外バッジ §9.5）に加え、**メッセージ本文**（例 `unused variable \`a\``）は 2 箇所に出す。専用の診断一覧オーバーレイは持たない。
+診断の**場所**（ガター §9.4／件数・画面外バッジ §9.5）に加え、**メッセージ本文**（例 `unused variable \`a\``）は行末virtual text・ステータス・ホバーに出す。専用の診断一覧オーバーレイは持たない。
 
 - **ステータスバー**: カーソル行に診断があれば、最優先（error > warning）1 件のメッセージを 1 行で常時表示。ソースも添える（例 `⚠ unused variable \`a\` — rustc(unused_variables)`）。at-a-glance 用。
-- **ホバー tooltip（`Overlay::Hover`, §4.6）**: カーソルが診断範囲上で静止、またはマウスホバーで、**LSP hover 情報 ＋ その位置の全診断**を集約表示（focus を奪わない）。同一位置に複数あれば列挙。
+- **行末virtual text**: 各論理行で最優先の診断を`› message`としてseverity色＋italicで描画する。Rope/Selectionには入れず、クリックやカーソル移動の対象にしない。
+- **ホバーtooltip（`Overlay::Hover`, §4.6）**: 通常クリックで入力カーソルを単一caretへ移した時に、**LSP hover情報＋その位置の全診断**を集約表示する（focusを奪わない）。左右エディタ分割中は操作中ペインと反対側（右操作中は左）へ表示してコードを隠さない。Markdownをtree-sitterで、Rustのコードフェンス・シグネチャ・例をRust文法で再着色する。MouseMovedや範囲選択中は要求せず、選択開始時は既存Hoverを閉じる。
 - 波線下線の色は severity に対応（error=`RED` / warning=`ORANGE`, §9.3）。`Editable.diagnostics` が唯一の source（gutter・下線・ステータス・ホバーはすべてここから描画時に導出）。
 
 ## 10. クリップボード
 
 - **内部レジスタ** `Register` を常に保持（マルチカーソル対応のため行/複数片も保持可能）。
 - yank/copy 時、内部レジスタ更新に加えて `Effect::ClipboardOsc52(text)` を発行し、OSC52 エスケープで **手元端末（SSH クライアント側）のシステムクリップボード**へ転送する。
+- 選択が全て空の`Ctrl+C`は、各カーソルの論理行を改行付きのlinewiseレジスタとしてコピーする。linewise pasteはカーソル行の行頭へ挿入し、行の途中へ内容を割り込ませない。選択があれば従来どおり選択範囲を文字単位でコピーする。
 - paste は内部レジスタから（端末→アプリ方向の OSC52 read は端末対応が不安定なため使わない）。ブラケットペーストは端末の貼り付けとして受け、複数行を 1 編集として扱う。
 
 ## 11. 設定
 
 ### 11.1 ファイル
 
-- 位置: ホーム直下の TOML（例 `~/.my_editor.toml`。最終名は実装時確定）。
+- 位置: `~/.my_editor_rc.toml`。
 - 読み込みは起動時の `Effect::LoadConfig` → `AppEvent::ConfigLoaded`。パース失敗は致命的にせず既定値へフォールバックし、ステータスに警告。
 
 ### 11.2 スキーマ（言語判定と LSP コマンド）
@@ -935,17 +859,18 @@ struct TerminalSession { parser: vt100::Parser, size: (u16, u16) }
 enum TerminalEvent { Output(Vec<u8>), Exited(ExitReason) }
 ```
 
-- **シェル終了時**: 子シェルが exit（`TerminalEvent::Exited`）したら**シェルペインを閉じる**（レイアウトはモード 1＝エディタ全画面へ戻し、フォーカスを editor へ）。再度 `Ctrl+@` で新しいシェルを起こせる。
+- **`Ctrl+O`**: シェル未起動なら起動してペインを表示する。起動済みならプロセスを終了せず、ペインの表示/非表示だけを切り替える。
+- **シェル終了時**: 子シェルが`exit`または`Ctrl+D`で終了し、PTYから`TerminalEvent::Exited`を受けた時だけセッションを破棄してシェルペインを閉じる。終了した旨の通知は出さない。再度`Ctrl+O`で新しいシェルを起こせる。
 
 ## 13. 検索・走査
 
-- **ピッカー（`Ctrl+T` / `Ctrl+G` / `F6` / `Ctrl+P`）**: `Overlay::Picker` に統合し、候補ソースだけが異なる。すべて`fuzzy-matcher`でランキングする。ファイルソースは**入力をパスとして解釈する直接オープンのフォールバック**も持つ。
+- **ピッカー（`Ctrl+T` / `Ctrl+G` / `F6` / `Ctrl+P`）**: `Overlay::Picker` に統合し、候補ソースだけが異なる。すべて`fuzzy-matcher`でランキングする。表示は選択位置周辺の最大5件に仮想化し、前後に候補があれば`…`と総件数を表示する。一致文字は黄色＋boldにする。入力prefixごとのランキングを小さなcacheへ保持し、Backspace時は直前prefixの結果を再計算せず復元する。空queryへのファイル走査batch追加は全件再sortせずindexだけを追記する。Pickerを開く時は既存Hoverを消し、重なって表示しない。ファイルソースは**入力をパスとして解釈する直接オープンのフォールバック**も持つ。
 
   ```rust
   enum PickerSource {
       Directory,     // Ctrl+T: workspace_root 以下（ignore walk, 非同期）
       OpenBuffers,   // Ctrl+G: 開いている全 Document（同期）
-      DiffTarget { base: DocumentId }, // F6: base 以外の開いている Document（同期）
+      DiffTarget { base: DocumentId }, // F6: baseと同じDocument/同じpathを除く（同期）
       Commands,      // Ctrl+P: コマンド名・説明・キーバインド（同期）
   }
 
@@ -966,7 +891,7 @@ enum TerminalEvent { Output(Vec<u8>), Exited(ExitReason) }
   }
   ```
 
-- **バッファ比較（`F6`）**: `PickerSource::DiffTarget` で現在のバッファ以外から比較対象を選ぶ。確定後は `Layout::EditorAndEditor` に切り替え、現在のバッファを左、比較対象を右に固定する。行単位 diff で対応する行を上下に揃え、追加=`GREEN`、削除=`RED`、変更=`ORANGE` で表示する。片側に対応行がない箇所は空の diff 行を挿入して位置を揃える。diff 表示中も各ペインの原文は通常どおり編集可能で、編集後は差分を再計算する。
+- **バッファ比較（`F6`）**: `PickerSource::DiffTarget` で現在のDocumentおよび同じファイルpathを持つDocumentを除外して比較対象を選ぶ。確定後は `Layout::EditorAndEditor` に切り替え、現在のバッファを左、比較対象を右に固定する。行単位 diff で対応する行を上下に揃え、追加=`GREEN`、削除=`RED`、変更=`ORANGE` で表示する。片側に対応行がない箇所は空の diff 行を挿入して位置を揃える。diff 表示中も各ペインの原文は通常どおり編集可能で、編集後は差分を再計算する。
 - **コマンドパレット（`Ctrl+P`）**: `PickerSource::Commands`で、実行可能なコマンドを「キーバインド / コマンド名 / 短い説明」の1行候補として表示する。名前・説明・キーのすべてをfuzzy検索対象にし、`↑`/`↓`で選択、`Enter`でPickerを閉じて実行する。固定キーがないコマンドは`—`と表示する。操作時にキーバインドを反復表示し、利用しながら覚えられることを目的とする。
 
   - **Directory ソース**: `ignore`（ripgrep 由来・高信頼）の `WalkBuilder` で `.gitignore` を尊重しつつ列挙。結果を `AppEvent::FileScan` でバッチ供給し、`ScanToken` で古い走査を破棄。ランキングはクエリ変更で再計算。
@@ -1060,7 +985,7 @@ enum FileScanEvent { Batch { token: ScanToken, paths: Vec<PathBuf> }, Done(ScanT
 - Effect 実行の失敗は panic させず `AppEvent::Error(String)`（またはより具体的なイベント）としてループに戻し、ステータス行／確認オーバーレイで通知。
 - 起動・端末 raw mode 取得など初期化の失敗のみ致命的として終了。
 - **パニック時の端末復帰（必須）**: raw mode ＋代替スクリーン中にパニックすると SSH セッションが壊れたまま残る。これを防ぐため:
-  - 端末セットアップを **RAII ガード**（`Drop` で raw mode 解除・alt screen 退出・カーソル表示・マウス無効化）にして、正常終了でもパニックでも必ず復元する。
+- 端末セットアップを **RAII ガード**（`Drop` で raw mode 解除・alt screen 退出・カーソル表示・カーソル形状の既定値復元・マウス無効化）にして、正常終了でもパニックでも必ず復元する。
   - 起動時に **panic hook** を差し込み、端末を復元してから元の hook を呼びバックトレースを出す（画面破壊を防ぎつつ情報は残す）。
   - 統合ターミナルの PTY 子プロセスも終了時に確実に kill/クローズする。
 
@@ -1095,7 +1020,7 @@ src/
     editable.rs           # Editable（Rope・編集ロジック）
     large_file.rs         # LargeFile, LineIndex（mmap ページング, 読み取り専用。§4.2.1）
     history.rs            # History, Revision, Change（undo/redo）
-    persist.rs            # undo履歴の永続化（~/my_editor_undo_history, FNV-1a, 整合性）
+    hash.rs               # 保存時点との内容比較に使う安定ハッシュ
     edit.rs               # Change適用, ropeラッパ
   view/
     mod.rs                # View, Scroll
@@ -1112,8 +1037,7 @@ src/
     terminal_view.rs      # vt100 screen → cells
     overlay.rs            # 各オーバーレイの描画
     notifications.rs      # 右下トースト＋進捗（§4.10-4.11）
-    hint_guide.rs         # ヒントガイド（§4.9, focus非依存の最前面）
-    statusline.rs         # 診断総数・検索 i/N・Ln x/N（画面外要約, §9.5）
+    statusline.rs         # ファイル・Git branch/状態・診断総数（§9.5）
     offscreen.rs          # エッジ矢印＋件数（offscreen_cues, §9.5）
     theme.rs              # 内蔵テーマ, token→color
   overlay/
@@ -1188,8 +1112,8 @@ src/
 
 ## 19. 決定ログ / 次タスク
 
-- **採用ショートカットの整理（完了 → §7.4 に確定反映）**: 右手マウス中心・左手キーボード最小の方針で取捨選択。主な確定: スクロールはホイールのみ（`PageUp/Down`不採用）、ファイルピッカーは`Ctrl+T`、コマンドパレットは`Ctrl+P`、左右分割`Ctrl+\`・シェル`Ctrl+@`（フォーカス追従、専用フォーカスキー無し）、定義=Ctrl+クリック・ホバー=自動、コメントトグルは`Ctrl+/`と`Ctrl+Q`の2キー。`Command`（§5.3）と`Overlay`（§4.6）に反映済み。
-- 解決済み: 補完ポップアップ UX（§8.5, `Ctrl+Space` トグル/矢印選択/Enter・Tab確定）。ディレクトリ検索結果一覧（＝旧「grep結果」, §13 `SearchResults::OnDisk`）。無名バッファの保存フローは**持たない**（保存対象外, §13）。
+- **採用ショートカットの整理（完了 → §7.4 に確定反映）**: 右手マウス中心・左手キーボード最小の方針で取捨選択。主な確定: スクロールはホイールのみ（`PageUp/Down`不採用）、ファイルピッカーは`Ctrl+T`、コマンドパレットは`Ctrl+P`、左右分割`Ctrl+]`・シェル`Ctrl+O`（フォーカス追従、専用フォーカスキー無し）、定義=Ctrl+クリック・ホバー=自動、コメントトグルは`Ctrl+/`と`Ctrl+Q`の2キー。`Command`（§5.3）と`Overlay`（§4.6）に反映済み。
+- 解決済み: 補完ポップアップUX（§8.5, `Ctrl+@`/`Ctrl+Space`トグル、矢印選択、Enter・Tab確定）。ディレクトリ検索結果一覧（＝旧「grep結果」, §13 `SearchResults::OnDisk`）。無名バッファの保存フローは**持たない**（保存対象外, §13）。
 - 懸念の決着（前回提示分）:
   - パニック時の端末復帰 → **実装**（§14: RAII ガード＋panic hook）。
   - undo 永続化のプライバシー → **0700/0600**（§4.5.1）。

@@ -37,7 +37,6 @@ pub enum Command {
     Format,
     ToggleShell,
     ToggleSplit,
-    ToggleHintGuide,
     CloseBuffer,
     Indent,
     Outdent,

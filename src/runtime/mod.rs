@@ -3,7 +3,7 @@ mod input;
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     os::unix::{io::AsRawFd, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -13,13 +13,16 @@ use lsp_server::{Message, Notification, Request, RequestId};
 use nix::pty::{Winsize, openpty};
 use tokio::sync::mpsc;
 
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
+
 use crate::{
     Result,
     config::Config,
-    document::{DiskState, LargeFile, PersistedHistory, history_key},
+    document::{DiskState, LargeFile},
     editor::{
-        AppEvent, Editor, Effect, FileScanEvent, GitEvent, GitLine, GitLineKind, GrepEvent,
-        GrepHit, IoEvent, TerminalEvent,
+        AppEvent, Editor, Effect, FileScanEvent, GitEvent, GitInfo, GitLine, GitLineKind,
+        GrepEvent, GrepHit, IoEvent, TerminalEvent,
     },
     input::{KeyChordState, RawInput, translate},
     render,
@@ -104,8 +107,10 @@ impl Runtime {
     }
 
     async fn process_events(&mut self, first: AppEvent) -> Result<()> {
+        self.observe_runtime_event(&first);
         let mut effects = self.editor.update(first);
         while let Ok(event) = self.rx.try_recv() {
+            self.observe_runtime_event(&event);
             effects.extend(self.editor.update(event));
         }
 
@@ -184,20 +189,6 @@ impl Runtime {
                             result: Ok(state),
                         }));
                     }
-                });
-            }
-            Effect::LoadUndoHistory { id, path } => {
-                let tx = self.tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let result = load_undo_history(&path);
-                    let _ = tx.send(AppEvent::Io(IoEvent::UndoHistoryLoaded { id, result }));
-                });
-            }
-            Effect::SaveUndoHistory(history) => {
-                let tx = self.tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let result = save_undo_history(&history);
-                    let _ = tx.send(AppEvent::Io(IoEvent::UndoHistorySaved { result }));
                 });
             }
             Effect::StartFileScan { root, token } => {
@@ -348,12 +339,7 @@ impl Runtime {
             Effect::ComputeGitStatus { doc, path } => {
                 let tx = self.tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    let result = Command::new("git")
-                        .args(["diff", "--unified=0", "HEAD", "--"])
-                        .arg(&path)
-                        .output()
-                        .map_err(|error| format!("git diffを実行できません: {error}"))
-                        .map(|output| parse_git_diff(&String::from_utf8_lossy(&output.stdout)));
+                    let result = compute_git_info(&path);
                     let _ = tx.send(AppEvent::Git(GitEvent { doc, result }));
                 });
             }
@@ -391,6 +377,34 @@ impl Runtime {
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     let _ = tx.send(AppEvent::Lsp(crate::lsp::LspEvent::RestartDue { server }));
+                });
+            }
+            Effect::ScheduleSemanticRefresh {
+                doc,
+                version,
+                delay_ms,
+            } => {
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    let _ = tx.send(AppEvent::Lsp(crate::lsp::LspEvent::SemanticRefreshDue {
+                        doc,
+                        version,
+                    }));
+                });
+            }
+            Effect::ScheduleCompletionRefresh {
+                doc,
+                version,
+                delay_ms,
+            } => {
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    let _ = tx.send(AppEvent::Lsp(crate::lsp::LspEvent::CompletionRefreshDue {
+                        doc,
+                        version,
+                    }));
                 });
             }
             Effect::CheckDiskStates(files) => {
@@ -479,9 +493,14 @@ impl Runtime {
         {
             Ok(child) => child,
             Err(error) => {
+                let message = if error.kind() == std::io::ErrorKind::NotFound {
+                    "not found".to_owned()
+                } else {
+                    format!("{language} LSPを起動できません: {error}")
+                };
                 let _ = self.tx.send(AppEvent::Lsp(crate::lsp::LspEvent::Exited {
                     server,
-                    error: Some(format!("{language} LSPを起動できません: {error}")),
+                    error: Some(message),
                 }));
                 return;
             }
@@ -507,8 +526,25 @@ impl Runtime {
             loop {
                 match Message::read(&mut stdout) {
                     Ok(Some(Message::Response(response))) if response.id.to_string() == "0" => {
-                        let _ =
-                            tx.send(AppEvent::Lsp(crate::lsp::LspEvent::Initialized { server }));
+                        let incremental_sync = response
+                            .result
+                            .and_then(|result| {
+                                serde_json::from_value::<lsp_types::InitializeResult>(result).ok()
+                            })
+                            .and_then(|result| result.capabilities.text_document_sync)
+                            .is_some_and(|sync| match sync {
+                                lsp_types::TextDocumentSyncCapability::Kind(kind) => {
+                                    kind == lsp_types::TextDocumentSyncKind::INCREMENTAL
+                                }
+                                lsp_types::TextDocumentSyncCapability::Options(options) => {
+                                    options.change
+                                        == Some(lsp_types::TextDocumentSyncKind::INCREMENTAL)
+                                }
+                            });
+                        let _ = tx.send(AppEvent::Lsp(crate::lsp::LspEvent::Initialized {
+                            server,
+                            incremental_sync,
+                        }));
                     }
                     Ok(Some(Message::Response(response))) => {
                         if let Ok(id) = response.id.to_string().parse::<i64>() {
@@ -655,11 +691,17 @@ impl Runtime {
         });
     }
 
+    fn observe_runtime_event(&mut self, event: &AppEvent) {
+        if matches!(event, AppEvent::Terminal(TerminalEvent::Exited(_)))
+            && let Some(mut shell) = self.shell.take()
+        {
+            let _ = shell.child.wait();
+        }
+    }
+
     fn draw(&mut self) -> Result<()> {
         self.terminal
-            .terminal_mut()
-            .draw(|frame| render::draw(frame, &self.editor))?;
-        Ok(())
+            .draw(|frame| render::draw(frame, &self.editor))
     }
 }
 
@@ -724,9 +766,36 @@ fn handle_lsp_notification(
     } else if notification.method == "$/progress" {
         let _ = tx.send(AppEvent::Lsp(crate::lsp::LspEvent::Progress {
             server,
-            message: notification.params.to_string(),
+            message: lsp_progress_message(&notification.params),
         }));
     }
+}
+
+fn lsp_progress_message(params: &serde_json::Value) -> Option<String> {
+    let value = params.get("value")?;
+    if value.get("kind").and_then(serde_json::Value::as_str) == Some("end") {
+        return None;
+    }
+    let title = value
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let message = value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let percentage = value
+        .get("percentage")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| format!(" {value}%"))
+        .unwrap_or_default();
+    let text = match (title.is_empty(), message.is_empty()) {
+        (false, false) => format!("{title}: {message}{percentage}"),
+        (false, true) => format!("{title}{percentage}"),
+        (true, false) => format!("{message}{percentage}"),
+        (true, true) => "updating".to_owned(),
+    };
+    Some(text)
 }
 
 fn read_utf8_file(path: &std::path::Path) -> std::result::Result<String, String> {
@@ -813,13 +882,88 @@ fn find_workspace_root() -> PathBuf {
         .map_or(cwd.clone(), Path::to_path_buf)
 }
 
+fn compute_git_info(path: &Path) -> std::result::Result<GitInfo, String> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file = path
+        .file_name()
+        .ok_or_else(|| format!("git状態を取得できないパスです: {}", path.display()))?;
+
+    let status_output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["status", "--porcelain", "--"])
+        .arg(file)
+        .output()
+        .map_err(|error| format!("git statusを実行できません: {error}"))?;
+    if !status_output.status.success() {
+        return Err(String::from_utf8_lossy(&status_output.stderr)
+            .trim()
+            .to_owned());
+    }
+
+    let branch_output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["branch", "--show-current"])
+        .output()
+        .map_err(|error| format!("git branchを実行できません: {error}"))?;
+    let mut branch = nonempty_output(&branch_output.stdout);
+    if branch.is_none() {
+        let head_output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .map_err(|error| format!("git rev-parseを実行できません: {error}"))?;
+        branch = nonempty_output(&head_output.stdout).map(|head| format!("detached@{head}"));
+    }
+
+    let diff_output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["diff", "--unified=0", "HEAD", "--"])
+        .arg(file)
+        .output()
+        .map_err(|error| format!("git diffを実行できません: {error}"))?;
+    let lines = if diff_output.status.success() {
+        parse_git_diff(&String::from_utf8_lossy(&diff_output.stdout))
+    } else {
+        Vec::new()
+    };
+
+    Ok(GitInfo {
+        lines,
+        branch,
+        status: parse_git_file_status(&String::from_utf8_lossy(&status_output.stdout)),
+    })
+}
+
+fn nonempty_output(output: &[u8]) -> Option<String> {
+    let value = String::from_utf8_lossy(output).trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+fn parse_git_file_status(status: &str) -> Option<String> {
+    let code = status.lines().next()?.get(..2)?.trim();
+    (!code.is_empty()).then(|| code.to_owned())
+}
+
 fn parse_git_diff(diff: &str) -> Vec<GitLine> {
     let mut lines = Vec::new();
     for line in diff.lines() {
         let Some(hunk) = line.strip_prefix("@@ ") else {
             continue;
         };
-        let Some(plus) = hunk.split_whitespace().find(|part| part.starts_with('+')) else {
+        let mut ranges = hunk.split_whitespace();
+        let old_count = ranges
+            .find(|part| part.starts_with('-'))
+            .and_then(|range| range.split_once(',').map(|(_, count)| count))
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or(1);
+        let Some(plus) = ranges.find(|part| part.starts_with('+')) else {
             continue;
         };
         let mut parts = plus.trim_start_matches('+').split(',');
@@ -837,10 +981,15 @@ fn parse_git_diff(diff: &str) -> Vec<GitLine> {
                 kind: GitLineKind::Deleted,
             });
         } else {
+            let kind = if old_count == 0 {
+                GitLineKind::Added
+            } else {
+                GitLineKind::Modified
+            };
             for current in start..start + count {
                 lines.push(GitLine {
                     line: current.saturating_sub(1),
-                    kind: GitLineKind::Modified,
+                    kind,
                 });
             }
         }
@@ -852,13 +1001,15 @@ fn load_config() -> std::result::Result<Config, String> {
     let Some(home) = std::env::var_os("HOME") else {
         return Ok(Config::default());
     };
-    let path = PathBuf::from(home).join(".my_editor.toml");
+    let path = PathBuf::from(home).join(".my_editor_rc.toml");
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(error) => return Err(format!("設定を読めません {}: {error}", path.display())),
     };
-    toml::from_str(&contents).map_err(|error| format!("設定が不正です {}: {error}", path.display()))
+    toml::from_str::<Config>(&contents)
+        .map(Config::merged_with_defaults)
+        .map_err(|error| format!("設定が不正です {}: {error}", path.display()))
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> std::result::Result<(), String> {
@@ -910,47 +1061,45 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::result::Result<(), String>
     Ok(())
 }
 
-fn undo_directory() -> std::result::Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or_else(|| "HOME が設定されていません".to_owned())?;
-    Ok(PathBuf::from(home).join("my_editor_undo_history"))
-}
-
-fn undo_history_path(path: &Path) -> std::result::Result<PathBuf, String> {
-    Ok(undo_directory()?.join(format!("{}.json", history_key(path))))
-}
-
-fn load_undo_history(
-    document_path: &Path,
-) -> std::result::Result<Option<PersistedHistory>, String> {
-    let path = undo_history_path(document_path)?;
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("undo履歴を読めません {}: {error}", path.display())),
-    };
-    serde_json::from_str(&contents)
-        .map(Some)
-        .map_err(|error| format!("undo履歴が壊れています {}: {error}", path.display()))
-}
-
-fn save_undo_history(history: &PersistedHistory) -> std::result::Result<(), String> {
-    let directory = undo_directory()?;
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("undo履歴ディレクトリを作れません: {error}"))?;
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("undo履歴ディレクトリの権限を設定できません: {error}"))?;
-    let path = undo_history_path(&history.path)?;
-    let contents = serde_json::to_vec(history)
-        .map_err(|error| format!("undo履歴を変換できません: {error}"))?;
-    atomic_write(&path, &contents)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("undo履歴の権限を設定できません: {error}"))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_status_parser_keeps_the_two_column_porcelain_code() {
+        assert_eq!(parse_git_file_status(" M file.rs\n"), Some("M".to_owned()));
+        assert_eq!(parse_git_file_status("MM file.rs\n"), Some("MM".to_owned()));
+        assert_eq!(parse_git_file_status("?? file.rs\n"), Some("??".to_owned()));
+        assert_eq!(parse_git_file_status(""), None);
+    }
+
+    #[test]
+    fn git_diff_parser_distinguishes_added_and_modified_hunks() {
+        let lines = parse_git_diff("@@ -0,0 +1,2 @@\n+one\n+two\n@@ -4 +6 @@\n-old\n+new\n");
+
+        assert_eq!(lines[0].kind, GitLineKind::Added);
+        assert_eq!(lines[1].kind, GitLineKind::Added);
+        assert_eq!(lines[2].kind, GitLineKind::Modified);
+    }
+
+    #[test]
+    fn lsp_progress_parser_returns_readable_state_and_detects_end() {
+        assert_eq!(
+            lsp_progress_message(&serde_json::json!({
+                "value": {
+                    "kind": "report",
+                    "title": "Indexing",
+                    "message": "workspace",
+                    "percentage": 40
+                }
+            })),
+            Some("Indexing: workspace 40%".to_owned())
+        );
+        assert_eq!(
+            lsp_progress_message(&serde_json::json!({"value": {"kind": "end"}})),
+            None
+        );
+    }
 
     #[test]
     fn atomic_write_replaces_contents_and_preserves_permissions() {

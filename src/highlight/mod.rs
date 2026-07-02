@@ -148,6 +148,10 @@ fn grammar(name: &str) -> Option<(Language, &'static str)> {
             tree_sitter_md_025::LANGUAGE.into(),
             tree_sitter_md_025::HIGHLIGHT_QUERY_BLOCK,
         )),
+        "rust" => Some((
+            tree_sitter_rust::LANGUAGE.into(),
+            tree_sitter_rust::HIGHLIGHTS_QUERY,
+        )),
         _ => None,
     }
 }

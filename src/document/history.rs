@@ -1,18 +1,16 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
-
 use crate::{position::CharIdx, view::Selections};
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Change {
     pub range: Range<CharIdx>,
     pub removed: String,
     pub inserted: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Revision {
     pub changes: Vec<Change>,
     pub selections_before: Selections,
@@ -63,16 +61,6 @@ impl History {
     }
 
     pub fn break_group(&mut self) {
-        self.last_insert = None;
-    }
-
-    pub fn snapshot(&self) -> (Vec<Revision>, Vec<Revision>) {
-        (self.past.clone(), self.future.clone())
-    }
-
-    pub fn restore(&mut self, past: Vec<Revision>, future: Vec<Revision>) {
-        self.past = past;
-        self.future = future;
         self.last_insert = None;
     }
 }

@@ -145,8 +145,6 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 [[package]]
 name = "crossterm"
 version = "0.28.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
  "bitflags 2.11.0",
  "crossterm_winapi",
@@ -508,6 +506,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-json",
  "tree-sitter-md-025",
+ "tree-sitter-rust",
  "tree-sitter-toml-ng",
  "unicode-width 0.2.0",
  "vt100",
@@ -969,6 +968,16 @@ name = "tree-sitter-md-025"
 version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2d54d63bc7fdf0c1c38237611d966548fbccf8f0923a7de5d525b87c9957a96"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-rust"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
 dependencies = [
  "cc",
  "tree-sitter-language",

@@ -28,6 +28,31 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn merged_with_defaults(self) -> Self {
+        let Self {
+            language,
+            editor,
+            search,
+        } = self;
+        let mut merged = Self {
+            editor,
+            search,
+            ..Self::default()
+        };
+        for language in language {
+            if let Some(existing) = merged
+                .language
+                .iter_mut()
+                .find(|existing| existing.name == language.name)
+            {
+                *existing = language;
+            } else {
+                merged.language.push(language);
+            }
+        }
+        merged
+    }
+
     pub fn language_for_path(&self, path: &Path) -> Option<&LanguageConfig> {
         let extension = path.extension()?.to_str()?;
         self.language.iter().find(|language| {
@@ -138,5 +163,29 @@ mod tests {
 
         assert_eq!(config.editor.tab_size, 2);
         assert_eq!(config.editor.large_file_threshold_bytes(), 3 * 1024 * 1024);
+    }
+
+    #[test]
+    fn user_languages_extend_defaults_instead_of_removing_rust() {
+        let config: Config = toml::from_str(
+            r##"
+                [[language]]
+                name = "python"
+                extensions = ["py"]
+                lsp = ["pylsp"]
+                line_comment = "#"
+            "##,
+        )
+        .unwrap();
+        let config = config.merged_with_defaults();
+
+        assert_eq!(
+            config.language_for_path(Path::new("main.rs")).unwrap().name,
+            "rust"
+        );
+        assert_eq!(
+            config.language_for_path(Path::new("main.py")).unwrap().name,
+            "python"
+        );
     }
 }

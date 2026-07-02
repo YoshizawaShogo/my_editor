@@ -1,12 +1,12 @@
 mod editable;
+mod hash;
 mod history;
 mod large_file;
-mod persist;
 
 pub use editable::Editable;
+pub use hash::content_hash;
 pub use history::{Change, History, Revision};
 pub use large_file::LargeFile;
-pub use persist::{PersistedHistory, content_hash, history_key};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -20,6 +20,8 @@ pub struct Document {
     pub language: Option<String>,
     pub disk_state: Option<DiskState>,
     pub external_changed: bool,
+    pub git_branch: Option<String>,
+    pub git_status: Option<String>,
     pub kind: DocumentKind,
 }
 
@@ -30,6 +32,8 @@ impl Document {
             language: None,
             disk_state: None,
             external_changed: false,
+            git_branch: None,
+            git_status: None,
             kind: DocumentKind::Editable(Editable::default()),
         }
     }

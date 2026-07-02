@@ -54,6 +54,56 @@
 - 実PTYで`cargo run -- DESIGN.md README.md`を起動し、F6ピッカー、左右diff、F4終了、マウスモード/代替画面解除を確認した。
 - 追加仕様として`Ctrl+P`コマンドパレットを`DESIGN.md`へ反映し、コマンド名・説明・キーバインドを対象にしたfuzzy検索、候補行へのキー併記、Enter実行を実装した。パレットを開いた左右ペインのフォーカスも復元する。
 - コマンドパレット追加後は単体テスト53件、`clippy --all-targets -- -D warnings`、`git diff --check`が成功した。実PTYでも`Ctrl+P`→`diff`→EnterでF6比較ピッカーが開き、F4終了時に端末が復元されることを確認した。
+- issue 1: LSP初期化後に開いたDocumentにも`didOpen`とsemantic tokens要求を送るよう、Document単位のLSP open状態を追加した。LSP再起動・close時にも状態を同期し、回帰テストを追加した。
+- issue 2: terminal描画を平文`contents()`からvt100 Cell描画へ変更し、ANSIの前景色・背景色・bold・italic・underline・inverseとPTYカーソルを保持した。
+- issue 3: Pickerのfuzzy再計算から全候補cloneを除去し、表示用候補を選択位置周辺128件へ仮想化した。1万候補・末尾選択の回帰テストを追加した。
+- issue 4: Picker/Search/Completion/Rename/Hover/Confirm/通知を共通の線枠付きpopupへ統一し、枠の四隅をTestBackendで検証した。
+- issue 5: 補完=`Ctrl+@`/`Ctrl+Space`、terminal=`Ctrl+:`、分割=`Ctrl+]`へ変更し、設計・keymap・コマンドパレットを同期した。legacy端末で`Ctrl+]`が`Ctrl+5`として届く経路も同じコマンドへ正規化した。
+- issue 6: Overlay focus中の`Ctrl+C`をEscと同じCancelへ変更した。Shell focus中は従来どおりPTYへ`0x03`を送るテストを追加した。
+- issue 7: 分割時はクリックしたペインだけに描画カーソルを出し、ステータスもアクティブ側へ切り替えた。`Ctrl+G`確定は分割を維持してクリック側ペインだけを差し替える。
+- issue 8: HintGuideの状態・キー・描画・コマンドパレット候補を削除し、操作発見を`Ctrl+P`へ一本化した。
+- issue 9: gitガターを縦棒`▌`へ統一し、追加=緑、変更=青、削除=非表示に変更した。
+- issue 10: diffのクリック後編集が選択側Documentだけへ入ることを検証し、`Ctrl+T`でファイルを開くとdiffを終了して単一ペインへ戻すようにした。
+- issue 11: `Ctrl+G`の候補から現在のDocumentを除外した。分割中はアクティブ側以外だけが候補になる。
+- issue 12: MouseMovedによるLSP hover要求を廃止し、通常クリックで入力カーソルを移動した時だけその位置のhover＋診断を要求するようにした。
+- issue 13: ステータスをファイル・診断・git・行・列・診断本文の色付きセグメントへ分け、Powerline区切り``で連結した。
+- issue 14: Pickerの表示ウィンドウを選択位置周辺5件へ縮小した。fuzzyランキング対象は全候補のまま維持する。
+- issue 15: fuzzy matcherの一致文字indexをPickerViewへ保持し、該当文字を黄色＋boldで描画するようにした。
+- issue 16: `Ctrl+T`/`Ctrl+G`/`F6`/`Ctrl+P`の全Picker起動経路で既存Hoverを即時消去するようにした。
+- issue巡回完了時点で単体テスト68件、`cargo clippy --all-targets -- -D warnings`、`git diff --check`が成功した。
+- issue 17: 通常バッファをペイン幅でsoft wrapし、折り返し表示行をカーソル描画・マウスhit-test・可視範囲スクロールでも共通に数えるようにした。端末サイズ確定前にはスクロール位置を変えない回帰修正も加えた。
+- issue 18: PickerのBackspaceが遅い主因を「候補拡大時の全件fuzzy再評価＋sort」と「ファイル走査batchごとの全件再sort」と特定した。prefix別ランキングcacheでBackspaceを復元し、空queryのbatchはindex追記だけにした。表示は最大5件のまま、前後の`…`と総候補数を表示する。
+- issue 19: F6比較候補から現在のDocumentだけでなく、別Documentとして開かれた同一pathのファイルも除外した。
+- ステータス行から行数・列数・割合・git変更行数を削除し、ワークスペース相対path、`git <branch> <porcelain状態|clean>`、診断へ整理した。Git情報はファイルオープン時と保存時に再取得し、追加フォント依存のbranchグリフは使わない。
+- 上記対応後は単体テスト75件、`cargo clippy --all-targets -- -D warnings`、`git diff --check`が成功した。
+- 入力カーソルを端末の`SteadyBar`（縦棒）へ変更し、終了・panic復元時は`DefaultUserShape`へ戻すようにした。
+- 選択なしの`Ctrl+C`をlinewiseコピーにした。内部レジスタへ行単位属性を保持し、OSC52には末尾改行を含め、内部貼り付けはカーソル行の行頭へ挿入する。選択範囲コピーと選択なし`Ctrl+X`の既存動作は維持した。
+- soft wrapのガター貫通を、ガターと本文を別Rect・別Paragraphへ分離して修正した。折り返し行数、カーソル、マウスhit-test、スクロールも本文幅基準へ統一した。
+- 範囲選択が成立した時はHover要求を送らず、表示済みHoverも閉じるようにした。通常クリックで単一caretへ移動した場合だけHoverを要求する。
+- 編集直後に座標の古いLSP semantic spansを破棄し、tree-sitter色へ即時fallbackするようにした。`didChange`後にsemantic tokensを再要求し、Document versionが古い応答は破棄するため、入力中の色ずれを表示しない。
+- 今回のissue対応後は単体テスト80件、`cargo clippy --all-targets -- -D warnings`、`git diff --check`が成功した。
+- GNOME Terminalのサイドボタン8/9をSGR Cb=128/129からBack/Forwardへ変換するcrossterm 0.28.1互換パッチを`vendor/crossterm`へ追加し、undo/redoへ接続した。
+- linewise `Ctrl+X`のundo履歴では削除用の一時範囲ではなく切り取り前caretを保存し、`Ctrl+Z`後に範囲選択が残らないよう修正した。
+- マルチカーソルの副カーソルを反転セルから縦棒`▏`へ変更した。
+- 補完に専用focusを追加し、上下・Enter・Ctrl+C・Esc・Ctrl+@以外を通常編集へ通した。popupはカーソル行を避け、選択行を高コントラスト化し、入力prefixと完全一致する候補を除外した。
+- LSP状態を`<lsp> rust: starting|initializing|opening|coloring|ready|updating|not found|error`形式へ細分化し、WorkDoneProgressを可読文字列へ変換した。非LSP言語は`<syntax> markdown`、Gitは`<git> clean @main`形式にした。
+- HoverのMarkdownに加え、言語指定/修飾付きコードフェンスとRustシグネチャ・例をtree-sitter-rustで着色した。
+- 設定ファイル名を`~/.my_editor_rc.toml`へ確定し、ユーザ言語設定を既定Rust設定へマージするよう変更した。Markdown/Python/Cの最小設定を配置した。
+- 上記対応後は単体テスト97件、`cargo clippy --all-targets -- -D warnings`、`git diff --check`が成功した。Enterの瞬間的な二重改行表示は再現条件を確認中。
+- インデント付き改行の中間描画をGNOME Terminalへ見せないよう、各ratatui描画を端末のsynchronized updateで囲んだ。改行位置がインデント途中の場合も既存空白を重複しないよう修正した。
+- `line_comment`に基づき、`//`/`#`およびRustの`///`/`//!`を改行後へ自動継続するようにした。
+- LSPのFunction/Method補完は`()`まで挿入し、caretを括弧内へ置くようにした。
+- LSP終了理由と再起動上限の共通status出力を削除し、言語セグメントの`<lsp> ...`表示へ一本化した。再起動処理自体は変更していない。
+- git変更と診断が同じ行でも、既存の独立2列へ`▌●`を同時表示することを描画テストで確認した。
+- 左右エディタ分割中のHoverを操作中ペインの反対側へ配置した。
+- 上記対応後は単体テスト103件、`cargo clippy --all-targets -- -D warnings`、`git diff --check`が成功した。
+- 画面外バッジを診断`E`/`W`、git`M`/`A`へ分離した。行ガターはgit縦棒、error=`×`、warning=`▲`を維持した。
+- Shell focus中も描画用active bufferは左Editorを参照し、terminal起動時に左側が空になる問題を修正した。
+- 上記対応後は単体テスト105件、`cargo clippy --all-targets -- -D warnings`、`git diff --check`が成功した。
+- undo/redo履歴のディスク保存・復元を廃止し、バッファが開いている間だけメモリに保持する構成へ変更した。
+- 補完ポップアップの横位置を入力中の単語先頭へ固定し、1文字ごとの不要な横移動をなくした。
+- `Ctrl+O`は起動済みシェルを終了せず表示だけ切り替えるようにした。`exit`/`Ctrl+D`によるPTY終了時だけセッションを破棄してエディタへ戻し、通常終了メッセージは表示しない。
+- 上記対応後は単体テスト105件、`cargo clippy --all-targets -- -D warnings`、`git diff --check`が成功した。
 
 ## フェーズ
 
@@ -67,4 +117,4 @@
 - [x] P7 LSP 基盤
 - [x] P8 LSP 機能
 - [x] P9 統合ターミナル
-- [x] P10 仕上げ（サイドボタンのライブラリ制約は`issue.md`に記録）
+- [x] P10 仕上げ（サイドボタン8/9対応を含む）

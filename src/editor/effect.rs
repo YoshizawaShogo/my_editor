@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::document::{DiskState, DocumentId, PersistedHistory};
+use crate::document::{DiskState, DocumentId};
 
 use super::SearchFilters;
 
@@ -16,11 +16,6 @@ pub enum Effect {
         contents: String,
         expected: Option<DiskState>,
     },
-    LoadUndoHistory {
-        id: DocumentId,
-        path: PathBuf,
-    },
-    SaveUndoHistory(PersistedHistory),
     LoadConfig,
     StartFileScan {
         root: PathBuf,
@@ -63,6 +58,16 @@ pub enum Effect {
     },
     ScheduleLspRestart {
         server: u64,
+        delay_ms: u64,
+    },
+    ScheduleSemanticRefresh {
+        doc: DocumentId,
+        version: i32,
+        delay_ms: u64,
+    },
+    ScheduleCompletionRefresh {
+        doc: DocumentId,
+        version: i32,
         delay_ms: u64,
     },
     CheckDiskStates(Vec<(DocumentId, PathBuf)>),

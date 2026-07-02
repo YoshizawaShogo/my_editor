@@ -2,12 +2,15 @@ use std::io::{self, Stdout, Write};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::{
-    cursor::{Hide, Show},
+    cursor::{Hide, SetCursorStyle, Show},
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
+    },
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Frame, Terminal, backend::CrosstermBackend};
 
 use crate::Result;
 
@@ -21,7 +24,13 @@ impl TerminalSession {
     pub fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide) {
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            SetCursorStyle::SteadyBar,
+            Hide
+        ) {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -39,6 +48,15 @@ impl TerminalSession {
         &mut self.terminal
     }
 
+    pub fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> Result<()> {
+        execute!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        let draw_result = self.terminal.draw(render).map(|_| ());
+        let end_result = execute!(self.terminal.backend_mut(), EndSynchronizedUpdate);
+        draw_result?;
+        end_result?;
+        Ok(())
+    }
+
     pub fn copy_osc52(&mut self, text: &str) -> Result<()> {
         let encoded = STANDARD.encode(text.as_bytes());
         write!(self.terminal.backend_mut(), "\x1b]52;c;{encoded}\x07")?;
@@ -53,6 +71,7 @@ impl Drop for TerminalSession {
         let _ = execute!(
             self.terminal.backend_mut(),
             Show,
+            SetCursorStyle::DefaultUserShape,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
@@ -65,6 +84,7 @@ pub fn restore_terminal() {
     let _ = execute!(
         io::stderr(),
         Show,
+        SetCursorStyle::DefaultUserShape,
         DisableMouseCapture,
         LeaveAlternateScreen
     );

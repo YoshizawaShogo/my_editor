@@ -79,6 +79,17 @@ pub fn lsp_position_to_char_idx(text: &Rope, line: usize, utf16_col: usize) -> C
     CharIdx(start + chars)
 }
 
+pub fn char_idx_to_lsp_position(text: &Rope, index: CharIdx) -> lsp_types::Position {
+    let (line, char_col) = char_idx_to_line_col(text, index);
+    let character = text
+        .line(line)
+        .chars()
+        .take(char_col)
+        .map(char::len_utf16)
+        .sum::<usize>();
+    lsp_types::Position::new(line as u32, character as u32)
+}
+
 pub fn line_content_len(text: &Rope, line: usize) -> usize {
     let slice = text.line(line.min(text.len_lines().saturating_sub(1)));
     let mut len = slice.len_chars();
@@ -137,5 +148,9 @@ mod tests {
         let text = Rope::from_str("a😀b");
         assert_eq!(lsp_position_to_char_idx(&text, 0, 1), CharIdx(1));
         assert_eq!(lsp_position_to_char_idx(&text, 0, 3), CharIdx(2));
+        assert_eq!(
+            char_idx_to_lsp_position(&text, CharIdx(2)),
+            lsp_types::Position::new(0, 3)
+        );
     }
 }

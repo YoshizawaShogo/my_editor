@@ -26,5 +26,5 @@ impl View {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Scroll {
     pub top_line: usize,
-    pub left_col: usize,
+    pub wrapped_row_offset: usize,
 }

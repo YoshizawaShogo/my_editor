@@ -7,7 +7,7 @@ mod layout;
 pub use command::{Command, Direction, Unit, VerticalDirection};
 pub use effect::Effect;
 pub use event::{
-    AppEvent, FileScanEvent, GitEvent, GitLine, GitLineKind, GrepEvent, GrepHit, IoEvent,
+    AppEvent, FileScanEvent, GitEvent, GitInfo, GitLine, GitLineKind, GrepEvent, GrepHit, IoEvent,
     MouseInput, TerminalEvent,
 };
 pub use focus::{Focus, Side};
@@ -26,9 +26,9 @@ use ropey::Rope;
 use crate::{
     clipboard::Register,
     config::Config,
-    document::{Document, DocumentId, LargeFile, content_hash},
+    document::{Document, DocumentId, LargeFile},
     lsp::LspEvent,
-    position::{CharIdx, char_idx_to_display_pos, display_col_to_char_idx},
+    position::{CharIdx, char_idx_to_display_pos, display_col_after, display_col_to_char_idx},
     view::{Selection, View, is_word, move_head},
 };
 
@@ -48,19 +48,24 @@ pub struct Editor {
     search: Option<SearchState>,
     next_grep_token: u64,
     lsp_servers: HashMap<String, u64>,
+    lsp_spawned: HashSet<u64>,
     lsp_ready: HashSet<u64>,
+    lsp_incremental_sync: HashSet<u64>,
+    lsp_errors: HashMap<u64, String>,
+    lsp_opened_documents: HashSet<DocumentId>,
+    semantic_ready_versions: HashMap<DocumentId, i32>,
     lsp_restart_counts: HashMap<u64, u8>,
     next_server_id: u64,
     pending_lsp: HashMap<i64, PendingLsp>,
     next_lsp_request: i64,
     completion: Option<CompletionState>,
+    completion_suppressed: Option<(DocumentId, i32)>,
     rename_input: Option<String>,
     confirm: Option<ConfirmState>,
     hover: Option<String>,
     pending_lsp_sync: HashSet<DocumentId>,
     document_versions: HashMap<DocumentId, i32>,
     terminal: Option<vt100::Parser>,
-    hint_guide: bool,
     terminal_size: (u16, u16),
     status: Option<String>,
     notifications: Vec<Toast>,
@@ -89,19 +94,24 @@ impl Default for Editor {
             search: None,
             next_grep_token: 1,
             lsp_servers: HashMap::new(),
+            lsp_spawned: HashSet::new(),
             lsp_ready: HashSet::new(),
+            lsp_incremental_sync: HashSet::new(),
+            lsp_errors: HashMap::new(),
+            lsp_opened_documents: HashSet::new(),
+            semantic_ready_versions: HashMap::new(),
             lsp_restart_counts: HashMap::new(),
             next_server_id: 1,
             pending_lsp: HashMap::new(),
             next_lsp_request: 1,
             completion: None,
+            completion_suppressed: None,
             rename_input: None,
             confirm: None,
             hover: None,
             pending_lsp_sync: HashSet::new(),
             document_versions: HashMap::new(),
             terminal: None,
-            hint_guide: false,
             terminal_size: (0, 0),
             status: None,
             notifications: Vec::new(),
@@ -173,29 +183,43 @@ impl Editor {
                 let definition =
                     matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left))
                         && mouse.event.modifiers.contains(KeyModifiers::CONTROL);
-                let hover_index = matches!(mouse.event.kind, MouseEventKind::Moved)
-                    .then(|| self.mouse_position(mouse.event.column, mouse.event.row))
-                    .flatten();
+                let hover = matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left))
+                    && !definition;
                 self.apply_mouse(mouse);
                 if definition {
                     self.request_definition()
-                } else if let Some(index) = hover_index {
-                    self.request_hover_at(index)
+                } else if hover
+                    && self.layout.active_editor(self.focus).is_some_and(|pane| {
+                        pane.view
+                            .selections
+                            .iter()
+                            .all(|selection| selection.is_caret())
+                    })
+                {
+                    let index = self
+                        .layout
+                        .active_editor(self.focus)
+                        .map(|pane| pane.view.selections.primary().head);
+                    index.map_or_else(Vec::new, |index| self.request_hover_at(index))
                 } else {
                     Vec::new()
                 }
             }
             AppEvent::Io(event) => self.apply_io(event),
             AppEvent::ConfigLoaded(result) => {
-                match result {
+                let effects = match result {
                     Ok(config) => {
                         self.config = config;
                         self.refresh_languages();
+                        self.start_workspace_lsps()
                     }
-                    Err(error) => self.status = Some(error),
-                }
+                    Err(error) => {
+                        self.status = Some(error);
+                        Vec::new()
+                    }
+                };
                 self.dirty = true;
-                Vec::new()
+                effects
             }
             AppEvent::FileScan(event) => {
                 self.apply_file_scan(event);
@@ -212,11 +236,14 @@ impl Editor {
             }
             AppEvent::TerminalInput(bytes) => vec![Effect::TerminalInput(bytes)],
             AppEvent::Git(event) => {
-                if let Ok(lines) = event.result
+                if let Ok(info) = event.result
                     && let Some(document) = self.documents.get_mut(&event.doc)
-                    && let crate::document::DocumentKind::Editable(editable) = &mut document.kind
                 {
-                    editable.git_lines = lines;
+                    document.git_branch = info.branch;
+                    document.git_status = info.status;
+                    if let crate::document::DocumentKind::Editable(editable) = &mut document.kind {
+                        editable.git_lines = info.lines;
+                    }
                 }
                 self.dirty = true;
                 Vec::new()
@@ -239,6 +266,15 @@ impl Editor {
                 Vec::new()
             }
         };
+        let has_selection = self.layout.active_editor(self.focus).is_some_and(|pane| {
+            pane.view
+                .selections
+                .iter()
+                .any(|selection| !selection.is_caret())
+        });
+        if has_selection && self.hover.take().is_some() {
+            self.dirty = true;
+        }
         effects.extend(self.take_lsp_sync_effects());
         effects
     }
@@ -264,21 +300,29 @@ impl Editor {
     }
 
     pub fn active_buffer(&self) -> Option<ActiveBuffer<'_>> {
-        let pane = self.layout.active_editor(self.focus)?;
+        let focus = if self.focus == Focus::Shell {
+            Focus::Editor(Side::Left)
+        } else {
+            self.focus
+        };
+        let pane = self.layout.active_editor(focus)?;
         let document = self.documents.get(&pane.view.doc)?;
         let editable = document.editable_opt()?;
         Some(ActiveBuffer {
             name: document
                 .path
                 .as_ref()
-                .map_or_else(|| "Untitled".to_owned(), |path| path.display().to_string()),
+                .map_or_else(|| "Untitled".to_owned(), |path| self.display_path(path)),
             text: editable.text(),
             view: &pane.view,
             modified: editable.modified,
             external_changed: document.external_changed,
             language: document.language.as_deref(),
+            language_status: self.document_language_status(pane.view.doc, document),
             diagnostics: &editable.diagnostics,
             git_lines: &editable.git_lines,
+            git_branch: document.git_branch.as_deref(),
+            git_status: document.git_status.as_deref(),
             semantic_spans: &editable.semantic_spans,
             syntax_spans: editable
                 .syntax
@@ -298,7 +342,12 @@ impl Editor {
     }
 
     pub fn active_large_buffer(&self) -> Option<LargeBuffer<'_>> {
-        let pane = self.layout.active_editor(self.focus)?;
+        let focus = if self.focus == Focus::Shell {
+            Focus::Editor(Side::Left)
+        } else {
+            self.focus
+        };
+        let pane = self.layout.active_editor(focus)?;
         let document = self.documents.get(&pane.view.doc)?;
         Some(LargeBuffer {
             file: document.large()?,
@@ -322,7 +371,12 @@ impl Editor {
                 .language_for_path(&path)
                 .map(|language| language.name.clone());
             self.documents.insert(id, document);
-            if let Some(pane) = self.layout.active_editor_mut(self.focus) {
+            if matches!(self.layout, Layout::EditorAndEditor { diff: true, .. }) {
+                self.layout = Layout::EditorFull(EditorPane {
+                    view: View::new(id),
+                });
+                self.focus = Focus::Editor(Side::Left);
+            } else if let Some(pane) = self.layout.active_editor_mut(self.focus) {
                 pane.view = View::new(id);
             }
             effects.push(Effect::ReadFile { id, path });
@@ -345,14 +399,17 @@ impl Editor {
                 name: left_doc
                     .path
                     .as_ref()
-                    .map_or_else(|| "Untitled".to_owned(), |path| path.display().to_string()),
+                    .map_or_else(|| "Untitled".to_owned(), |path| self.display_path(path)),
                 text: left_document.text(),
                 view: &left.view,
                 modified: left_document.modified,
                 external_changed: left_doc.external_changed,
                 language: None,
+                language_status: self.document_language_status(left.view.doc, left_doc),
                 diagnostics: &left_document.diagnostics,
                 git_lines: &left_document.git_lines,
+                git_branch: left_doc.git_branch.as_deref(),
+                git_status: left_doc.git_status.as_deref(),
                 semantic_spans: &left_document.semantic_spans,
                 syntax_spans: left_document
                     .syntax
@@ -363,14 +420,17 @@ impl Editor {
                 name: right_doc
                     .path
                     .as_ref()
-                    .map_or_else(|| "Untitled".to_owned(), |path| path.display().to_string()),
+                    .map_or_else(|| "Untitled".to_owned(), |path| self.display_path(path)),
                 text: right_document.text(),
                 view: &right.view,
                 modified: right_document.modified,
                 external_changed: right_doc.external_changed,
                 language: None,
+                language_status: self.document_language_status(right.view.doc, right_doc),
                 diagnostics: &right_document.diagnostics,
                 git_lines: &right_document.git_lines,
+                git_branch: right_doc.git_branch.as_deref(),
+                git_status: right_doc.git_status.as_deref(),
                 semantic_spans: &right_document.semantic_spans,
                 syntax_spans: right_document
                     .syntax
@@ -383,11 +443,29 @@ impl Editor {
 
     pub fn picker_view(&self) -> Option<PickerView> {
         let picker = self.picker.as_ref()?;
+        const VIEW_WINDOW: usize = 5;
+        let start = picker
+            .selected
+            .saturating_sub(VIEW_WINDOW / 2)
+            .min(picker.filtered.len().saturating_sub(VIEW_WINDOW));
+        let matcher = SkimMatcherV2::default();
         let items = picker
             .filtered
             .iter()
+            .skip(start)
+            .take(VIEW_WINDOW)
             .filter_map(|index| picker.candidates.get(*index))
-            .map(|candidate| self.candidate_label(candidate))
+            .map(|candidate| {
+                let label = self.candidate_label(candidate);
+                let matched = if picker.query.is_empty() {
+                    Vec::new()
+                } else {
+                    matcher
+                        .fuzzy_indices(&label, &picker.query)
+                        .map_or_else(Vec::new, |(_, indices)| indices)
+                };
+                PickerViewItem { label, matched }
+            })
             .collect();
         Some(PickerView {
             title: match picker.mode {
@@ -398,7 +476,10 @@ impl Editor {
             },
             query: picker.query.clone(),
             items,
-            selected: picker.selected,
+            selected: picker.selected.saturating_sub(start),
+            has_before: start > 0,
+            has_after: start + VIEW_WINDOW < picker.filtered.len(),
+            total: picker.filtered.len(),
         })
     }
 
@@ -452,6 +533,7 @@ impl Editor {
                 .map(|item| item.label.clone())
                 .collect(),
             selected: completion.selected,
+            anchor: completion.anchor,
         })
     }
 
@@ -475,17 +557,21 @@ impl Editor {
             .map(|parser| parser.screen().contents())
     }
 
+    pub fn terminal_screen(&self) -> Option<&vt100::Screen> {
+        self.terminal.as_ref().map(vt100::Parser::screen)
+    }
+
+    pub fn shell_focused(&self) -> bool {
+        self.focus == Focus::Shell
+    }
+
     pub fn shell_visible(&self) -> bool {
         matches!(self.layout, Layout::EditorAndShell { .. })
     }
 
-    pub fn hint_guide_visible(&self) -> bool {
-        self.hint_guide
-    }
-
     pub fn focused_side(&self) -> Side {
         match self.focus {
-            Focus::Editor(side) => side,
+            Focus::Editor(side) | Focus::Completion(side) => side,
             Focus::Shell | Focus::Overlay => Side::Left,
         }
     }
@@ -548,35 +634,10 @@ impl Editor {
                         }
                         self.status = None;
                         if let Some(path) = document.path.clone() {
-                            effects.push(Effect::LoadUndoHistory { id, path });
-                            effects.push(Effect::ComputeGitStatus {
-                                doc: id,
-                                path: document.path.clone().expect("path exists"),
-                            });
+                            effects.push(Effect::ComputeGitStatus { doc: id, path });
                         }
                     }
-                    if let Some(language) = self
-                        .documents
-                        .get(&id)
-                        .and_then(|document| document.language.clone())
-                        && !self.lsp_servers.contains_key(&language)
-                        && let Some(command) = self
-                            .config
-                            .language
-                            .iter()
-                            .find(|config| config.name == language)
-                            .and_then(|config| config.lsp.clone())
-                    {
-                        let server = self.next_server_id;
-                        self.next_server_id += 1;
-                        self.lsp_servers.insert(language.clone(), server);
-                        effects.push(Effect::SpawnLsp {
-                            server,
-                            language,
-                            command,
-                            root: self.workspace_root.clone(),
-                        });
-                    }
+                    effects.extend(self.start_or_open_lsp(id));
                 }
                 Err(error) => self.status = Some(error),
             },
@@ -596,10 +657,10 @@ impl Editor {
                         document.editable_mut().mark_saved();
                         document.external_changed = false;
                         if let Some(path) = document.path.as_deref() {
-                            effects.push(Effect::SaveUndoHistory(
-                                document.editable().persisted_history(path),
-                            ));
-                            self.status = Some(format!("保存しました: {}", path.display()));
+                            effects.push(Effect::ComputeGitStatus {
+                                doc: id,
+                                path: path.to_path_buf(),
+                            });
                             if let Some(server) = document
                                 .language
                                 .as_ref()
@@ -661,27 +722,6 @@ impl Editor {
                     self.status = Some(error);
                 }
             },
-            IoEvent::UndoHistoryLoaded { id, result } => match result {
-                Ok(Some(history)) => {
-                    if let Some(document) = self.documents.get_mut(&id) {
-                        let current_hash = content_hash(&document.editable().text().to_string());
-                        if history.path == document.path.clone().unwrap_or_default()
-                            && history.base_hash == current_hash
-                        {
-                            document.editable_mut().restore_history(history);
-                        } else {
-                            self.status = Some("undo履歴を破棄（ファイルが外部変更）".to_owned());
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => self.status = Some(error),
-            },
-            IoEvent::UndoHistorySaved { result } => {
-                if let Err(error) = result {
-                    self.status = Some(error);
-                }
-            }
             IoEvent::DiskStateObserved { id, result } => match result {
                 Ok(state) => {
                     let Some(document) = self.documents.get_mut(&id) else {
@@ -732,6 +772,7 @@ impl Editor {
                         view: View::new(id),
                     });
                     self.status = Some(format!("新規ファイル: {}", path.display()));
+                    effects.extend(self.start_or_open_lsp(id));
                 } else if inside_root {
                     self.status = Some("ディレクトリが存在しません".to_owned());
                 } else {
@@ -748,13 +789,21 @@ impl Editor {
         let mut effects = Vec::new();
         match event {
             LspEvent::Spawned { server, language } => {
+                self.lsp_spawned.insert(server);
+                self.lsp_errors.remove(&server);
                 self.notify(ToastLevel::Info, format!("{language} LSPを起動しました"));
-                self.set_progress(format!("lsp:{server}"), format!("{language}: 初期化中"));
-                self.status = Some(format!("{language} LSP: 初期化中"));
             }
-            LspEvent::Initialized { server } => {
+            LspEvent::Initialized {
+                server,
+                incremental_sync,
+            } => {
+                self.lsp_spawned.insert(server);
                 self.finish_progress(&format!("lsp:{server}"));
                 self.lsp_ready.insert(server);
+                self.lsp_errors.remove(&server);
+                if incremental_sync {
+                    self.lsp_incremental_sync.insert(server);
+                }
                 self.lsp_restart_counts.remove(&server);
                 effects.push(Effect::LspSend {
                     server,
@@ -770,46 +819,16 @@ impl Editor {
                     .iter()
                     .find_map(|(language, id)| (*id == server).then(|| language.clone()));
                 if let Some(language) = language {
-                    for (doc_id, document) in &self.documents {
-                        if document.language.as_deref() != Some(&language) {
-                            continue;
-                        }
-                        let (Some(path), Some(editable)) =
-                            (document.path.as_ref(), document.editable_opt())
-                        else {
-                            continue;
-                        };
-                        effects.push(Effect::LspSend {
-                            server,
-                            message: serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "method": "textDocument/didOpen",
-                                "params": {
-                                    "textDocument": {
-                                        "uri": format!("file://{}", path.display()),
-                                        "languageId": language,
-                                        "version": 1,
-                                        "text": editable.text().to_string()
-                                    }
-                                }
-                            })
-                            .to_string(),
-                        });
-                        let id = self.next_lsp_request;
-                        self.next_lsp_request += 1;
-                        self.pending_lsp
-                            .insert(id, PendingLsp::SemanticTokens { doc: *doc_id });
-                        effects.push(Effect::LspRequest {
-                            server,
-                            id,
-                            method: "textDocument/semanticTokens/full".to_owned(),
-                            params: serde_json::json!({
-                                "textDocument": {"uri": format!("file://{}", path.display())}
-                            })
-                            .to_string(),
-                        });
+                    let documents: Vec<_> = self
+                        .documents
+                        .iter()
+                        .filter_map(|(id, document)| {
+                            (document.language.as_deref() == Some(&language)).then_some(*id)
+                        })
+                        .collect();
+                    for doc in documents {
+                        effects.extend(self.open_lsp_document(doc, server));
                     }
-                    self.status = Some(format!("{language} LSP: 準備完了"));
                 }
             }
             LspEvent::Diagnostics { uri, diagnostics } => {
@@ -827,33 +846,95 @@ impl Editor {
                 }
             }
             LspEvent::Progress { server, message } => {
-                self.set_progress(format!("lsp:{server}"), message.clone());
-                self.status = Some(message);
+                if let Some(message) = message {
+                    self.set_progress(format!("lsp:{server}"), message);
+                } else {
+                    self.finish_progress(&format!("lsp:{server}"));
+                }
             }
             LspEvent::Response { id, result } => match self.pending_lsp.remove(&id) {
-                Some(PendingLsp::Completion) => match result.and_then(|value| {
-                    serde_json::from_value::<lsp_types::CompletionResponse>(value)
-                        .map_err(|error| error.to_string())
-                }) {
-                    Ok(response) => {
-                        let items = match response {
-                            lsp_types::CompletionResponse::Array(items) => items,
-                            lsp_types::CompletionResponse::List(list) => list.items,
+                Some(PendingLsp::Completion {
+                    doc,
+                    version,
+                    prefix,
+                    side,
+                    anchor,
+                }) if self.document_versions.get(&doc) == Some(&version)
+                    && self
+                        .layout
+                        .active_editor(self.focus)
+                        .is_some_and(|pane| pane.view.doc == doc)
+                    && matches!(self.focus, Focus::Editor(_)) =>
+                {
+                    match result.and_then(|value| {
+                        serde_json::from_value::<lsp_types::CompletionResponse>(value)
+                            .map_err(|error| error.to_string())
+                    }) {
+                        Ok(response) => {
+                            let matcher = SkimMatcherV2::default();
+                            let mut items: Vec<_> = match response {
+                                lsp_types::CompletionResponse::Array(items) => items,
+                                lsp_types::CompletionResponse::List(list) => list.items,
+                            }
+                            .into_iter()
+                            .filter_map(|item| {
+                                let filter = item
+                                    .filter_text
+                                    .clone()
+                                    .unwrap_or_else(|| item.label.clone());
+                                if !prefix.is_empty()
+                                    && (filter.eq_ignore_ascii_case(&prefix)
+                                        || item.label.eq_ignore_ascii_case(&prefix))
+                                {
+                                    return None;
+                                }
+                                let score = if prefix.is_empty() {
+                                    0
+                                } else {
+                                    matcher.fuzzy_match(&filter, &prefix)?
+                                };
+                                Some((score, {
+                                    let mut insert = item
+                                        .insert_text
+                                        .clone()
+                                        .unwrap_or_else(|| item.label.clone());
+                                    let callable = matches!(
+                                        item.kind,
+                                        Some(
+                                            lsp_types::CompletionItemKind::FUNCTION
+                                                | lsp_types::CompletionItemKind::METHOD
+                                        )
+                                    );
+                                    if callable && !insert.contains('(') {
+                                        insert.push_str("()");
+                                    }
+                                    let cursor_back =
+                                        usize::from(callable && insert.trim_end().ends_with("()"));
+                                    CompletionCandidate {
+                                        insert,
+                                        cursor_back,
+                                        label: item.label,
+                                        prefix_len: prefix.chars().count(),
+                                    }
+                                }))
+                            })
+                            .collect();
+                            items.sort_by(|left, right| right.0.cmp(&left.0));
+                            let items = items.into_iter().map(|(_, item)| item).collect::<Vec<_>>();
+                            if !items.is_empty() {
+                                self.completion = Some(CompletionState {
+                                    items,
+                                    selected: 0,
+                                    return_side: side,
+                                    anchor,
+                                });
+                                self.focus = Focus::Completion(side);
+                            }
                         }
-                        .into_iter()
-                        .map(|item| CompletionCandidate {
-                            insert: item
-                                .insert_text
-                                .clone()
-                                .unwrap_or_else(|| item.label.clone()),
-                            label: item.label,
-                        })
-                        .collect();
-                        self.completion = Some(CompletionState { items, selected: 0 });
-                        self.focus = Focus::Overlay;
+                        Err(error) => self.status = Some(format!("補完に失敗: {error}")),
                     }
-                    Err(error) => self.status = Some(format!("補完に失敗: {error}")),
-                },
+                }
+                Some(PendingLsp::Completion { .. }) => {}
                 Some(PendingLsp::Definition) => match result.and_then(|value| {
                     serde_json::from_value::<lsp_types::GotoDefinitionResponse>(value)
                         .map_err(|error| error.to_string())
@@ -944,12 +1025,13 @@ impl Editor {
                     }
                     Err(error) => self.status = Some(format!("hoverに失敗: {error}")),
                 },
-                Some(PendingLsp::SemanticTokens { doc }) => {
-                    if let Ok(value) = result
+                Some(PendingLsp::SemanticTokens { doc, version }) => {
+                    if self.document_versions.get(&doc) == Some(&version)
+                        && let Ok(value) = result
                         && let Ok(Some(tokens)) =
                             serde_json::from_value::<Option<lsp_types::SemanticTokensResult>>(value)
                     {
-                        self.apply_semantic_tokens(doc, tokens);
+                        self.apply_semantic_tokens(doc, version, tokens);
                     }
                 }
                 None => {}
@@ -957,19 +1039,37 @@ impl Editor {
             LspEvent::Exited { server, error } => {
                 self.finish_progress(&format!("lsp:{server}"));
                 let message = error.unwrap_or_else(|| "LSPが終了しました".to_owned());
+                self.lsp_errors.insert(server, message.clone());
                 self.notify(ToastLevel::Error, message.clone());
-                self.status = Some(message);
                 self.lsp_ready.remove(&server);
+                self.lsp_spawned.remove(&server);
+                self.lsp_incremental_sync.remove(&server);
+                if let Some(language) = self
+                    .lsp_servers
+                    .iter()
+                    .find_map(|(language, id)| (*id == server).then(|| language.clone()))
+                {
+                    self.lsp_opened_documents.retain(|doc| {
+                        self.documents
+                            .get(doc)
+                            .is_none_or(|document| document.language.as_deref() != Some(&language))
+                    });
+                    self.semantic_ready_versions.retain(|doc, _| {
+                        self.documents
+                            .get(doc)
+                            .is_none_or(|document| document.language.as_deref() != Some(&language))
+                    });
+                }
                 let attempts = self.lsp_restart_counts.entry(server).or_insert(0);
                 if *attempts < 3 {
                     let delay_ms = 500u64 * (1u64 << *attempts);
                     *attempts += 1;
                     effects.push(Effect::ScheduleLspRestart { server, delay_ms });
-                } else {
-                    self.status = Some("LSP再起動上限に達しました".to_owned());
                 }
             }
             LspEvent::RestartDue { server } => {
+                self.lsp_spawned.remove(&server);
+                self.lsp_errors.remove(&server);
                 if let Some(language) = self
                     .lsp_servers
                     .iter()
@@ -989,25 +1089,78 @@ impl Editor {
                     });
                 }
             }
+            LspEvent::SemanticRefreshDue { doc, version } => {
+                if self.document_versions.get(&doc) == Some(&version) {
+                    effects.extend(self.request_semantic_tokens(doc, version));
+                }
+            }
+            LspEvent::CompletionRefreshDue { doc, version } => {
+                let active_doc = self
+                    .layout
+                    .active_editor(self.focus)
+                    .map(|pane| pane.view.doc);
+                if self.document_versions.get(&doc) == Some(&version)
+                    && active_doc == Some(doc)
+                    && self.completion_suppressed != Some((doc, version))
+                    && matches!(self.focus, Focus::Editor(_))
+                {
+                    effects.extend(self.request_completion(false));
+                }
+            }
         }
         self.dirty = true;
         effects
     }
 
     fn toggle_completion(&mut self) -> Vec<Effect> {
-        if self.completion.take().is_some() {
-            self.focus = Focus::Editor(Side::Left);
+        if let Some(completion) = self.completion.take() {
+            if let Some(doc) = self
+                .layout
+                .active_editor(self.focus)
+                .map(|pane| pane.view.doc)
+                && let Some(version) = self.document_versions.get(&doc)
+            {
+                self.completion_suppressed = Some((doc, *version));
+            }
+            self.focus = Focus::Editor(completion.return_side);
             self.dirty = true;
             return Vec::new();
         }
+        self.request_completion(true)
+    }
+
+    fn request_completion(&mut self, manual: bool) -> Vec<Effect> {
+        let side = match self.focus {
+            Focus::Editor(side) | Focus::Completion(side) => side,
+            Focus::Shell | Focus::Overlay => Side::Left,
+        };
         let Some((server, path, line, character)) = self.active_lsp_context() else {
-            self.status = Some("このバッファではLSP補完を利用できません".to_owned());
-            self.dirty = true;
+            if manual {
+                self.status = Some("このバッファではLSP補完を利用できません".to_owned());
+                self.dirty = true;
+            }
             return Vec::new();
         };
+        let Some((doc, version, prefix, anchor)) = self.completion_context() else {
+            return Vec::new();
+        };
+        if !manual && prefix.is_empty() {
+            return Vec::new();
+        }
         let id = self.next_lsp_request;
         self.next_lsp_request += 1;
-        self.pending_lsp.insert(id, PendingLsp::Completion);
+        self.pending_lsp
+            .retain(|_, pending| !matches!(pending, PendingLsp::Completion { .. }));
+        self.pending_lsp.insert(
+            id,
+            PendingLsp::Completion {
+                doc,
+                version,
+                prefix,
+                side,
+                anchor,
+            },
+        );
         vec![Effect::LspRequest {
             server,
             id,
@@ -1018,6 +1171,29 @@ impl Editor {
             })
             .to_string(),
         }]
+    }
+
+    fn completion_context(&self) -> Option<(DocumentId, i32, String, CharIdx)> {
+        let pane = self.layout.active_editor(self.focus)?;
+        let document = self.documents.get(&pane.view.doc)?;
+        let editable = document.editable_opt()?;
+        let head = pane
+            .view
+            .selections
+            .primary()
+            .head
+            .0
+            .min(editable.text().len_chars());
+        let mut start = head;
+        while start > 0 && is_word(editable.text().char(start - 1)) {
+            start -= 1;
+        }
+        Some((
+            pane.view.doc,
+            *self.document_versions.get(&pane.view.doc).unwrap_or(&1),
+            editable.text().slice(start..head).to_string(),
+            CharIdx(start),
+        ))
     }
 
     fn request_definition(&mut self) -> Vec<Effect> {
@@ -1040,13 +1216,9 @@ impl Editor {
     }
 
     fn request_hover_at(&mut self, index: CharIdx) -> Vec<Effect> {
-        if self
-            .pending_lsp
-            .values()
-            .any(|pending| matches!(pending, PendingLsp::Hover { .. }))
-        {
-            return Vec::new();
-        }
+        self.pending_lsp
+            .retain(|_, pending| !matches!(pending, PendingLsp::Hover { .. }));
+        self.hover = None;
         let Some((server, path, line, character)) = self.active_lsp_context_at(index) else {
             return Vec::new();
         };
@@ -1120,6 +1292,154 @@ impl Editor {
             .map(char::len_utf16)
             .sum();
         Some((server, path, line, utf16))
+    }
+
+    fn start_or_open_lsp(&mut self, doc: DocumentId) -> Vec<Effect> {
+        let Some(language) = self
+            .documents
+            .get(&doc)
+            .and_then(|document| document.language.clone())
+        else {
+            return Vec::new();
+        };
+        if let Some(server) = self.lsp_servers.get(&language).copied() {
+            return self.open_lsp_document(doc, server);
+        }
+        let Some(command) = self
+            .config
+            .language
+            .iter()
+            .find(|config| config.name == language)
+            .and_then(|config| config.lsp.clone())
+        else {
+            return Vec::new();
+        };
+        let server = self.next_server_id;
+        self.next_server_id += 1;
+        self.lsp_servers.insert(language.clone(), server);
+        vec![Effect::SpawnLsp {
+            server,
+            language,
+            command,
+            root: self.workspace_root.clone(),
+        }]
+    }
+
+    fn start_workspace_lsps(&mut self) -> Vec<Effect> {
+        let servers: Vec<_> = self
+            .config
+            .language
+            .iter()
+            .filter_map(|language| {
+                language
+                    .lsp
+                    .clone()
+                    .map(|command| (language.name.clone(), command))
+            })
+            .collect();
+        let mut effects = Vec::new();
+        for (language, command) in servers {
+            if self.lsp_servers.contains_key(&language) {
+                continue;
+            }
+            let server = self.next_server_id;
+            self.next_server_id += 1;
+            self.lsp_servers.insert(language.clone(), server);
+            effects.push(Effect::SpawnLsp {
+                server,
+                language,
+                command,
+                root: self.workspace_root.clone(),
+            });
+        }
+        effects
+    }
+
+    fn open_lsp_document(&mut self, doc: DocumentId, server: u64) -> Vec<Effect> {
+        if !self.lsp_ready.contains(&server) || self.lsp_opened_documents.contains(&doc) {
+            return Vec::new();
+        }
+        let Some((language, path, text)) = self.documents.get(&doc).and_then(|document| {
+            Some((
+                document.language.clone()?,
+                document.path.clone()?,
+                document.editable_opt()?.text().to_string(),
+            ))
+        }) else {
+            return Vec::new();
+        };
+        if self.lsp_servers.get(&language) != Some(&server) {
+            return Vec::new();
+        }
+        self.lsp_opened_documents.insert(doc);
+        self.document_versions.insert(doc, 1);
+        let request = self.next_lsp_request;
+        self.next_lsp_request += 1;
+        self.pending_lsp
+            .insert(request, PendingLsp::SemanticTokens { doc, version: 1 });
+        vec![
+            Effect::LspSend {
+                server,
+                message: serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {
+                        "textDocument": {
+                            "uri": format!("file://{}", path.display()),
+                            "languageId": language,
+                            "version": 1,
+                            "text": text
+                        }
+                    }
+                })
+                .to_string(),
+            },
+            Effect::LspRequest {
+                server,
+                id: request,
+                method: "textDocument/semanticTokens/full".to_owned(),
+                params: serde_json::json!({
+                    "textDocument": {"uri": format!("file://{}", path.display())}
+                })
+                .to_string(),
+            },
+        ]
+    }
+
+    fn request_semantic_tokens(&mut self, doc: DocumentId, version: i32) -> Vec<Effect> {
+        if self.pending_lsp.values().any(|pending| {
+            matches!(
+                pending,
+                PendingLsp::SemanticTokens {
+                    doc: pending_doc,
+                    version: pending_version,
+                } if *pending_doc == doc && *pending_version == version
+            )
+        }) {
+            return Vec::new();
+        }
+        let Some((server, path)) = self.documents.get(&doc).and_then(|document| {
+            let language = document.language.as_ref()?;
+            Some((*self.lsp_servers.get(language)?, document.path.clone()?))
+        }) else {
+            return Vec::new();
+        };
+        if !self.lsp_ready.contains(&server) || !self.lsp_opened_documents.contains(&doc) {
+            return Vec::new();
+        }
+        let request = self.next_lsp_request;
+        self.next_lsp_request += 1;
+        self.pending_lsp
+            .insert(request, PendingLsp::SemanticTokens { doc, version });
+        vec![Effect::LspRequest {
+            server,
+            id: request,
+            method: "textDocument/semanticTokens/full".to_owned(),
+            params: serde_json::json!({
+                "textDocument": {"uri": format!("file://{}", path.display())}
+            })
+            .to_string(),
+        }]
     }
 
     fn apply_workspace_edit(
@@ -1223,7 +1543,12 @@ impl Editor {
             .find_map(|(id, document)| (document.path.as_ref() == Some(&path)).then_some(*id))
     }
 
-    fn apply_semantic_tokens(&mut self, doc: DocumentId, result: lsp_types::SemanticTokensResult) {
+    fn apply_semantic_tokens(
+        &mut self,
+        doc: DocumentId,
+        version: i32,
+        result: lsp_types::SemanticTokensResult,
+    ) {
         let tokens = match result {
             lsp_types::SemanticTokensResult::Tokens(tokens) => tokens.data,
             lsp_types::SemanticTokensResult::Partial(partial) => partial.data,
@@ -1261,6 +1586,7 @@ impl Editor {
             });
         }
         document.editable_mut().semantic_spans = spans;
+        self.semantic_ready_versions.insert(doc, version);
     }
 
     fn refresh_languages(&mut self) {
@@ -1279,10 +1605,39 @@ impl Editor {
     }
 
     fn apply_command(&mut self, command: Command) -> Vec<Effect> {
+        if let Focus::Completion(side) = self.focus
+            && !matches!(
+                command,
+                Command::PickerUp
+                    | Command::PickerDown
+                    | Command::PickerConfirm
+                    | Command::PickerCancel
+                    | Command::ToggleCompletion
+            )
+        {
+            self.completion = None;
+            self.focus = Focus::Editor(side);
+        }
         match command {
-            Command::InsertNewline => self.edit_active(|document, view| {
-                document.editable_mut().insert_newline(&mut view.selections);
-            }),
+            Command::InsertNewline => {
+                let line_comment = self
+                    .layout
+                    .active_editor(self.focus)
+                    .and_then(|pane| self.documents.get(&pane.view.doc))
+                    .and_then(|document| document.language.as_deref())
+                    .and_then(|language| {
+                        self.config
+                            .language
+                            .iter()
+                            .find(|config| config.name == language)
+                    })
+                    .and_then(|config| config.line_comment.clone());
+                self.edit_active(|document, view| {
+                    document
+                        .editable_mut()
+                        .insert_newline(&mut view.selections, line_comment.as_deref());
+                });
+            }
             Command::DeleteBackward => self.edit_active(|document, view| {
                 document
                     .editable_mut()
@@ -1300,25 +1655,37 @@ impl Editor {
             Command::CollapseSelections => self.collapse_selections(),
             Command::AddCursor { direction } => self.add_cursor(direction),
             Command::SelectNextOccurrence => self.select_next_occurrence(),
-            Command::Copy => return self.copy_active(),
+            Command::Copy => return self.copy_active(true),
             Command::Cut => {
-                let effects = self.copy_active();
+                let effects = self.copy_active(true);
                 if !effects.is_empty() {
+                    let linewise = self.clipboard.is_linewise();
                     self.edit_active(|document, view| {
-                        document
-                            .editable_mut()
-                            .delete_backward(&mut view.selections);
+                        if linewise {
+                            document.editable_mut().delete_lines(&mut view.selections);
+                        } else {
+                            document
+                                .editable_mut()
+                                .delete_backward(&mut view.selections);
+                        }
                     });
                 }
                 return effects;
             }
             Command::Paste => {
                 let fragments = self.clipboard.fragments().to_vec();
+                let linewise = self.clipboard.is_linewise();
                 if !fragments.is_empty() {
                     self.edit_active(|document, view| {
-                        document
-                            .editable_mut()
-                            .insert_fragments(&mut view.selections, &fragments);
+                        if linewise {
+                            document
+                                .editable_mut()
+                                .insert_linewise_fragments(&mut view.selections, &fragments);
+                        } else {
+                            document
+                                .editable_mut()
+                                .insert_fragments(&mut view.selections, &fragments);
+                        }
                     });
                 }
             }
@@ -1433,10 +1800,6 @@ impl Editor {
             Command::Format => return self.request_formatting(),
             Command::ToggleShell => return self.toggle_shell(),
             Command::ToggleSplit => self.toggle_split(),
-            Command::ToggleHintGuide => {
-                self.hint_guide = !self.hint_guide;
-                self.dirty = true;
-            }
             Command::CloseBuffer => return self.close_active_buffer(),
             Command::Indent => self.indent_selected_lines(false),
             Command::Outdent => self.indent_selected_lines(true),
@@ -1489,13 +1852,16 @@ impl Editor {
                 self.layout = Layout::EditorAndShell {
                     editor: EditorPane { view },
                 };
+                self.focus = Focus::Shell;
+                self.dirty = true;
+                if self.terminal.is_some() {
+                    return Vec::new();
+                }
                 self.terminal = Some(vt100::Parser::new(
                     self.terminal_size.1.saturating_sub(1),
                     self.terminal_size.0 / 2,
                     0,
                 ));
-                self.focus = Focus::Shell;
-                self.dirty = true;
                 vec![Effect::SpawnShell {
                     cols: (self.terminal_size.0 / 2).max(1),
                     rows: self.terminal_size.1.saturating_sub(1).max(1),
@@ -1570,6 +1936,9 @@ impl Editor {
             })
         });
         self.documents.remove(&id);
+        self.lsp_opened_documents.remove(&id);
+        self.semantic_ready_versions.remove(&id);
+        self.document_versions.remove(&id);
         if let Some(next) = self.documents.keys().next().copied() {
             self.layout = Layout::EditorFull(EditorPane {
                 view: View::new(next),
@@ -1704,7 +2073,7 @@ impl Editor {
                 }
                 self.focus = Focus::Editor(Side::Left);
                 self.terminal = None;
-                self.status = Some(error.unwrap_or_else(|| "シェルが終了しました".to_owned()));
+                self.status = error;
             }
         }
         self.dirty = true;
@@ -1869,7 +2238,7 @@ impl Editor {
         }
     }
 
-    fn copy_active(&mut self) -> Vec<Effect> {
+    fn copy_active(&mut self, copy_caret_lines: bool) -> Vec<Effect> {
         let focus = self.focus;
         let Some(pane) = self.layout.active_editor(focus) else {
             return Vec::new();
@@ -1891,11 +2260,39 @@ impl Editor {
         let Some(editable) = document.editable_opt() else {
             return Vec::new();
         };
-        let fragments = editable.selected_texts(&pane.view.selections);
-        if fragments.iter().all(String::is_empty) {
+        let linewise = copy_caret_lines
+            && pane
+                .view
+                .selections
+                .iter()
+                .all(|selection| selection.is_caret());
+        let fragments = if linewise {
+            pane.view
+                .selections
+                .iter()
+                .map(|selection| {
+                    let line = editable
+                        .text()
+                        .char_to_line(selection.head.0.min(editable.text().len_chars()));
+                    editable
+                        .text()
+                        .line(line)
+                        .chars()
+                        .take_while(|character| !matches!(character, '\r' | '\n'))
+                        .collect()
+                })
+                .collect()
+        } else {
+            editable.selected_texts(&pane.view.selections)
+        };
+        if fragments.iter().all(String::is_empty) && !linewise {
             return Vec::new();
         }
-        self.clipboard.store(fragments);
+        if linewise {
+            self.clipboard.store_linewise(fragments);
+        } else {
+            self.clipboard.store(fragments);
+        }
         vec![Effect::ClipboardOsc52(self.clipboard.osc52_text())]
     }
 
@@ -1904,6 +2301,16 @@ impl Editor {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_active(-3),
             MouseEventKind::ScrollDown => self.scroll_active(3),
+            MouseEventKind::Down(MouseButton::Back) => {
+                self.edit_active(|document, view| {
+                    document.editable_mut().undo(&mut view.selections);
+                });
+            }
+            MouseEventKind::Down(MouseButton::Forward) => {
+                self.edit_active(|document, view| {
+                    document.editable_mut().redo(&mut view.selections);
+                });
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let right_half = mouse.column >= self.terminal_size.0 / 2;
                 match &self.layout {
@@ -1985,6 +2392,7 @@ impl Editor {
     }
 
     fn open_picker(&mut self, mode: PickerMode) {
+        self.hover = None;
         let Some(base) = self
             .layout
             .active_editor(self.focus)
@@ -1992,15 +2400,28 @@ impl Editor {
         else {
             return;
         };
+        let base_path = self
+            .documents
+            .get(&base)
+            .and_then(|document| document.path.as_ref());
         let candidates: Vec<_> = self
             .documents
-            .keys()
-            .copied()
-            .filter(|id| mode == PickerMode::Buffer || *id != base)
+            .iter()
+            .filter(|(id, document)| {
+                **id != base
+                    && (mode != PickerMode::Diff
+                        || base_path.is_none()
+                        || document.path.as_ref() != base_path)
+            })
+            .map(|(id, _)| *id)
             .map(PickerCandidate::Document)
             .collect();
         if candidates.is_empty() {
-            self.status = Some("比較できる別のバッファがありません".to_owned());
+            self.status = Some(match mode {
+                PickerMode::Buffer => "他に開いているバッファがありません".to_owned(),
+                PickerMode::Diff => "比較できる別のバッファがありません".to_owned(),
+                PickerMode::Directory | PickerMode::Command => unreachable!(),
+            });
             self.dirty = true;
             return;
         }
@@ -2008,19 +2429,21 @@ impl Editor {
             mode,
             base,
             return_side: match self.focus {
-                Focus::Editor(side) => side,
+                Focus::Editor(side) | Focus::Completion(side) => side,
                 Focus::Shell | Focus::Overlay => Side::Left,
             },
             filtered: (0..candidates.len()).collect(),
             candidates,
             query: String::new(),
             selected: 0,
+            ranking_cache: Vec::new(),
         });
         self.focus = Focus::Overlay;
         self.dirty = true;
     }
 
     fn open_command_palette(&mut self) {
+        self.hover = None;
         let base = self
             .layout
             .active_editor(self.focus)
@@ -2033,19 +2456,21 @@ impl Editor {
             mode: PickerMode::Command,
             base,
             return_side: match self.focus {
-                Focus::Editor(side) => side,
+                Focus::Editor(side) | Focus::Completion(side) => side,
                 Focus::Shell | Focus::Overlay => Side::Left,
             },
             filtered: (0..candidates.len()).collect(),
             candidates,
             query: String::new(),
             selected: 0,
+            ranking_cache: Vec::new(),
         });
         self.focus = Focus::Overlay;
         self.dirty = true;
     }
 
     fn open_directory_picker(&mut self) -> Vec<Effect> {
+        self.hover = None;
         let base = self
             .layout
             .active_editor(self.focus)
@@ -2057,13 +2482,14 @@ impl Editor {
             mode: PickerMode::Directory,
             base,
             return_side: match self.focus {
-                Focus::Editor(side) => side,
+                Focus::Editor(side) | Focus::Completion(side) => side,
                 Focus::Shell | Focus::Overlay => Side::Left,
             },
             query: String::new(),
             candidates: Vec::new(),
             filtered: Vec::new(),
             selected: 0,
+            ranking_cache: Vec::new(),
         });
         self.focus = Focus::Overlay;
         self.status = Some("ファイルを走査中…".to_owned());
@@ -2081,10 +2507,16 @@ impl Editor {
                 if let Some(picker) = &mut self.picker
                     && picker.mode == PickerMode::Directory
                 {
+                    let start = picker.candidates.len();
                     picker
                         .candidates
                         .extend(paths.into_iter().map(PickerCandidate::Path));
-                    self.refresh_picker();
+                    picker.ranking_cache.clear();
+                    if picker.query.is_empty() {
+                        picker.filtered.extend(start..picker.candidates.len());
+                    } else {
+                        self.refresh_picker();
+                    }
                 }
             }
             FileScanEvent::Done { .. } => {
@@ -2390,25 +2822,47 @@ impl Editor {
             return;
         };
         let query = picker.query.clone();
-        let candidates = picker.candidates.clone();
+        if let Some(cached) = picker
+            .ranking_cache
+            .iter()
+            .find_map(|(cached_query, ranking)| (cached_query == &query).then(|| ranking.clone()))
+        {
+            let picker = self.picker.as_mut().expect("picker exists");
+            picker.filtered = cached;
+            picker.selected = picker.selected.min(picker.filtered.len().saturating_sub(1));
+            self.dirty = true;
+            return;
+        }
+        if query.is_empty() {
+            let ranking: Vec<_> = (0..picker.candidates.len()).collect();
+            let picker = self.picker.as_mut().expect("picker exists");
+            picker.filtered = ranking;
+            picker.selected = picker.selected.min(picker.filtered.len().saturating_sub(1));
+            self.dirty = true;
+            return;
+        }
         let matcher = SkimMatcherV2::default();
-        let mut scored: Vec<_> = candidates
+        let mut scored: Vec<_> = picker
+            .candidates
             .iter()
             .enumerate()
             .filter_map(|(index, candidate)| {
                 let label = self.candidate_label(candidate);
-                if query.is_empty() {
-                    Some((index, 0))
-                } else {
-                    matcher
-                        .fuzzy_match(&label, &query)
-                        .map(|score| (index, score))
-                }
+                matcher
+                    .fuzzy_match(&label, &query)
+                    .map(|score| (index, score))
             })
             .collect();
         scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
         let picker = self.picker.as_mut().expect("picker exists");
         picker.filtered = scored.into_iter().map(|(index, _)| index).collect();
+        picker
+            .ranking_cache
+            .retain(|(cached_query, _)| cached_query != &query);
+        picker.ranking_cache.push((query, picker.filtered.clone()));
+        if picker.ranking_cache.len() > 12 {
+            picker.ranking_cache.remove(0);
+        }
         picker.selected = picker.selected.min(picker.filtered.len().saturating_sub(1));
     }
 
@@ -2514,11 +2968,23 @@ impl Editor {
         if let Some(completion) = self.completion.take() {
             if let Some(candidate) = completion.items.get(completion.selected) {
                 let insert = candidate.insert.clone();
-                self.focus = Focus::Editor(Side::Left);
+                let prefix_len = candidate.prefix_len;
+                let cursor_back = candidate.cursor_back;
+                self.focus = Focus::Editor(completion.return_side);
                 self.edit_active(|document, view| {
+                    let head = view.selections.primary().head.0;
+                    view.selections.set_single(Selection {
+                        anchor: CharIdx(head.saturating_sub(prefix_len)),
+                        head: CharIdx(head),
+                    });
                     document
                         .editable_mut()
                         .insert(&mut view.selections, &insert);
+                    if cursor_back > 0 {
+                        let head = view.selections.primary().head.0;
+                        view.selections
+                            .set_single(Selection::caret(CharIdx(head - cursor_back)));
+                    }
                 });
             }
             return Vec::new();
@@ -2531,7 +2997,7 @@ impl Editor {
         };
         let Some(candidate_index) = picker.filtered.get(picker.selected) else {
             if picker.mode == PickerMode::Directory && !picker.query.is_empty() {
-                self.focus = Focus::Editor(Side::Left);
+                self.focus = Focus::Editor(picker.return_side);
                 return vec![Effect::ResolveDirectPath {
                     input: picker.query,
                     root: self.workspace_root.clone(),
@@ -2542,14 +3008,22 @@ impl Editor {
         };
         let candidate = picker.candidates[*candidate_index].clone();
         let mut effects = Vec::new();
+        let mut final_side = picker.return_side;
         match (picker.mode, candidate) {
             (PickerMode::Directory, PickerCandidate::Path(path)) => {
+                self.focus = Focus::Editor(picker.return_side);
                 effects.extend(self.open_paths([path]));
             }
             (PickerMode::Buffer, PickerCandidate::Document(target)) => {
-                self.layout = Layout::EditorFull(EditorPane {
-                    view: View::new(target),
-                });
+                self.focus = Focus::Editor(picker.return_side);
+                if let Some(pane) = self.layout.active_editor_mut(self.focus) {
+                    pane.view = View::new(target);
+                } else {
+                    self.layout = Layout::EditorFull(EditorPane {
+                        view: View::new(target),
+                    });
+                    final_side = Side::Left;
+                }
             }
             (PickerMode::Diff, PickerCandidate::Document(target)) => {
                 self.layout = Layout::EditorAndEditor {
@@ -2561,6 +3035,7 @@ impl Editor {
                     },
                     diff: true,
                 };
+                final_side = Side::Left;
             }
             (PickerMode::Command, PickerCandidate::Command(index)) => {
                 self.focus = Focus::Editor(picker.return_side);
@@ -2569,18 +3044,24 @@ impl Editor {
             }
             _ => {}
         }
-        self.focus = Focus::Editor(Side::Left);
+        self.focus = Focus::Editor(final_side);
         self.dirty = true;
         effects
     }
 
     fn close_picker(&mut self) {
+        let return_side = self
+            .completion
+            .as_ref()
+            .map(|completion| completion.return_side)
+            .or_else(|| self.picker.as_ref().map(|picker| picker.return_side))
+            .unwrap_or(Side::Left);
         self.picker = None;
         self.search = None;
         self.completion = None;
         self.rename_input = None;
         self.confirm = None;
-        self.focus = Focus::Editor(Side::Left);
+        self.focus = Focus::Editor(return_side);
         self.dirty = true;
     }
 
@@ -2592,6 +3073,63 @@ impl Editor {
                 || format!("Untitled {}", id.0),
                 |path| path.display().to_string(),
             )
+    }
+
+    fn display_path(&self, path: &std::path::Path) -> String {
+        path.strip_prefix(&self.workspace_root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    }
+
+    fn document_language_status(&self, doc: DocumentId, document: &Document) -> String {
+        let Some(language) = document.language.as_deref() else {
+            return "<syntax> text: plain".to_owned();
+        };
+        let has_lsp = self
+            .config
+            .language
+            .iter()
+            .find(|config| config.name == language)
+            .is_some_and(|config| config.lsp.is_some());
+        if !has_lsp {
+            return format!("<syntax> {language}");
+        }
+        let Some(server) = self.lsp_servers.get(language) else {
+            return format!("<lsp> {language}: starting");
+        };
+        if let Some(error) = self.lsp_errors.get(server) {
+            let state = if error.to_ascii_lowercase().contains("not found") {
+                "not found"
+            } else {
+                "error"
+            };
+            return format!("<lsp> {language}: {state}");
+        }
+        if !self.lsp_spawned.contains(server) {
+            return format!("<lsp> {language}: starting");
+        }
+        let progress = self.progress.get(&format!("lsp:{server}"));
+        if !self.lsp_ready.contains(server) {
+            return progress.map_or_else(
+                || format!("<lsp> {language}: initializing"),
+                |message| format!("<lsp> {language}: initializing ({message})"),
+            );
+        }
+        if let Some(message) = progress {
+            return format!("<lsp> {language}: updating ({message})");
+        }
+        if !self.lsp_opened_documents.contains(&doc) {
+            return format!("<lsp> {language}: opening");
+        }
+        let current_version = self.document_versions.get(&doc).copied().unwrap_or(1);
+        match self.semantic_ready_versions.get(&doc).copied() {
+            None => format!("<lsp> {language}: coloring"),
+            Some(version) if version < current_version => {
+                format!("<lsp> {language}: updating")
+            }
+            Some(_) => format!("<lsp> {language}: ready"),
+        }
     }
 
     fn candidate_label(&self, candidate: &PickerCandidate) -> String {
@@ -2613,18 +3151,39 @@ impl Editor {
         let pane = self.layout.active_editor(self.focus)?;
         let document = self.documents.get(&pane.view.doc)?;
         let text = document.editable_opt()?.text();
-        let line =
-            (pane.view.scroll.top_line + usize::from(row)).min(text.len_lines().saturating_sub(1));
         let gutter_width = text.len_lines().max(1).to_string().len().max(2) + 3;
+        let pane_width = match self.layout {
+            Layout::EditorFull(_) => self.terminal_size.0,
+            Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. } => {
+                self.terminal_size.0 / 2
+            }
+        }
+        .max(1);
+        let text_width = pane_width.saturating_sub(gutter_width as u16).max(1);
         let local_column = if matches!(self.focus, Focus::Editor(Side::Right)) {
             column.saturating_sub(self.terminal_size.0 / 2)
         } else {
             column
         };
-        let display_col = usize::from(local_column)
-            .saturating_sub(gutter_width)
-            .saturating_add(pane.view.scroll.left_col);
-        Some(display_col_to_char_idx(text, line, display_col, TAB_SIZE))
+        if matches!(self.layout, Layout::EditorAndEditor { diff: true, .. }) {
+            let line = (pane.view.scroll.top_line + usize::from(row))
+                .min(text.len_lines().saturating_sub(1));
+            let display_col = usize::from(local_column).saturating_sub(6);
+            return Some(display_col_to_char_idx(text, line, display_col, TAB_SIZE));
+        }
+        let mut visual_row = usize::from(row) + pane.view.scroll.wrapped_row_offset;
+        let mut line = pane.view.scroll.top_line;
+        while line < text.len_lines() {
+            let line_rows = editor_wrapped_line_rows(text, line, usize::from(text_width));
+            if visual_row < line_rows {
+                let text_column = local_column.saturating_sub(gutter_width as u16);
+                let display_col = visual_row * usize::from(text_width) + usize::from(text_column);
+                return Some(display_col_to_char_idx(text, line, display_col, TAB_SIZE));
+            }
+            visual_row -= line_rows;
+            line += 1;
+        }
+        Some(CharIdx(text.len_chars()))
     }
 
     fn scroll_active(&mut self, amount: isize) {
@@ -2647,10 +3206,15 @@ impl Editor {
         } else {
             (pane.view.scroll.top_line + amount as usize).min(max_top)
         };
+        pane.view.scroll.wrapped_row_offset = 0;
         self.dirty = true;
     }
 
     fn edit_active(&mut self, edit: impl FnOnce(&mut Document, &mut View)) {
+        if let Focus::Completion(side) = self.focus {
+            self.completion = None;
+            self.focus = Focus::Editor(side);
+        }
         let focus = self.focus;
         let (documents, layout) = (&mut self.documents, &mut self.layout);
         let Some(pane) = layout.active_editor_mut(focus) else {
@@ -2665,6 +3229,7 @@ impl Editor {
             return;
         }
         edit(document, &mut pane.view);
+        self.completion_suppressed = None;
         self.pending_lsp_sync.insert(pane.view.doc);
         self.ensure_cursor_visible();
         self.dirty = true;
@@ -2674,21 +3239,37 @@ impl Editor {
         let pending: Vec<_> = self.pending_lsp_sync.drain().collect();
         let mut effects = Vec::new();
         for id in pending {
-            let Some(document) = self.documents.get(&id) else {
+            let Some(document) = self.documents.get_mut(&id) else {
                 continue;
             };
-            let (Some(language), Some(path), Some(editable)) = (
-                document.language.as_ref(),
-                document.path.as_ref(),
-                document.editable_opt(),
-            ) else {
+            let language = document.language.clone();
+            let path = document.path.clone();
+            let (changes, text) = match &mut document.kind {
+                crate::document::DocumentKind::Editable(editable) => {
+                    (editable.take_lsp_changes(), editable.text().to_string())
+                }
+                crate::document::DocumentKind::Large(_) => continue,
+            };
+            let (Some(language), Some(path)) = (language, path) else {
                 continue;
             };
-            let Some(server) = self.lsp_servers.get(language).copied() else {
+            if changes.is_empty() {
                 continue;
+            }
+            let Some(server) = self.lsp_servers.get(&language).copied() else {
+                continue;
+            };
+            if !self.lsp_ready.contains(&server) || !self.lsp_opened_documents.contains(&id) {
+                continue;
+            }
+            let content_changes = if self.lsp_incremental_sync.contains(&server) {
+                serde_json::to_value(changes).unwrap_or_else(|_| serde_json::json!([]))
+            } else {
+                serde_json::json!([{"text": text}])
             };
             let version = self.document_versions.entry(id).or_insert(1);
             *version += 1;
+            let version = *version;
             effects.push(Effect::LspSend {
                 server,
                 message: serde_json::json!({
@@ -2697,12 +3278,22 @@ impl Editor {
                     "params": {
                         "textDocument": {
                             "uri": format!("file://{}", path.display()),
-                            "version": *version
+                            "version": version
                         },
-                        "contentChanges": [{"text": editable.text().to_string()}]
+                        "contentChanges": content_changes
                     }
                 })
                 .to_string(),
+            });
+            effects.push(Effect::ScheduleSemanticRefresh {
+                doc: id,
+                version,
+                delay_ms: 150,
+            });
+            effects.push(Effect::ScheduleCompletionRefresh {
+                doc: id,
+                version,
+                delay_ms: 100,
             });
         }
         effects
@@ -2765,8 +3356,17 @@ impl Editor {
     }
 
     fn ensure_cursor_visible(&mut self) {
+        if self.terminal_size.0 == 0 || self.terminal_size.1 == 0 {
+            return;
+        }
         let rows = usize::from(self.terminal_size.1.saturating_sub(1)).max(1);
-        let cols = usize::from(self.terminal_size.0);
+        let pane_cols = match self.layout {
+            Layout::EditorFull(_) => usize::from(self.terminal_size.0),
+            Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. } => {
+                usize::from(self.terminal_size.0 / 2)
+            }
+        }
+        .max(1);
         let focus = self.focus;
         let (documents, layout) = (&self.documents, &mut self.layout);
         let Some(pane) = layout.active_editor_mut(focus) else {
@@ -2784,28 +3384,24 @@ impl Editor {
             TAB_SIZE,
         );
         let gutter_width = editable.text().len_lines().max(1).to_string().len().max(2) + 3;
-        let visible_cols = cols.saturating_sub(gutter_width).max(1);
+        let text_cols = pane_cols.saturating_sub(gutter_width).max(1);
+        let previous_top = pane.view.scroll.top_line;
         if position.line < pane.view.scroll.top_line {
             pane.view.scroll.top_line = position.line;
         } else if position.line >= pane.view.scroll.top_line + rows {
             pane.view.scroll.top_line = position.line + 1 - rows;
-        } else {
-            pane.view.scroll.top_line = pane
-                .view
-                .scroll
-                .top_line
-                .min((position.line + 1).saturating_sub(rows));
         }
-        if position.col < pane.view.scroll.left_col {
-            pane.view.scroll.left_col = position.col;
-        } else if position.col >= pane.view.scroll.left_col + visible_cols {
-            pane.view.scroll.left_col = position.col + 1 - visible_cols;
-        } else {
-            pane.view.scroll.left_col = pane
-                .view
-                .scroll
-                .left_col
-                .min((position.col + 1).saturating_sub(visible_cols));
+        if pane.view.scroll.top_line != previous_top {
+            pane.view.scroll.wrapped_row_offset = 0;
+        }
+        let visual_row = (pane.view.scroll.top_line..position.line)
+            .map(|line| editor_wrapped_line_rows(editable.text(), line, text_cols))
+            .sum::<usize>()
+            + position.col / text_cols;
+        if visual_row < pane.view.scroll.wrapped_row_offset {
+            pane.view.scroll.wrapped_row_offset = visual_row;
+        } else if visual_row >= pane.view.scroll.wrapped_row_offset + rows {
+            pane.view.scroll.wrapped_row_offset = visual_row + 1 - rows;
         }
     }
 }
@@ -2836,6 +3432,17 @@ fn selected_lines(text: &Rope, selections: &crate::view::Selections) -> Vec<usiz
     lines.into_iter().collect()
 }
 
+fn editor_wrapped_line_rows(text: &Rope, line: usize, width: usize) -> usize {
+    let display_width = text
+        .line(line.min(text.len_lines().saturating_sub(1)))
+        .chars()
+        .take_while(|character| !matches!(character, '\r' | '\n'))
+        .fold(0, |column, character| {
+            display_col_after(column, character, TAB_SIZE)
+        });
+    display_width.max(1).div_ceil(width.max(1))
+}
+
 pub struct ActiveBuffer<'a> {
     pub name: String,
     pub text: &'a Rope,
@@ -2843,8 +3450,11 @@ pub struct ActiveBuffer<'a> {
     pub modified: bool,
     pub external_changed: bool,
     pub language: Option<&'a str>,
+    pub language_status: String,
     pub diagnostics: &'a [crate::lsp::Diagnostic],
     pub git_lines: &'a [GitLine],
+    pub git_branch: Option<&'a str>,
+    pub git_status: Option<&'a str>,
     pub semantic_spans: &'a [crate::lsp::SemanticSpan],
     pub syntax_spans: &'a [crate::highlight::HighlightSpan],
 }
@@ -2984,7 +3594,7 @@ const COMMAND_PALETTE: &[CommandPaletteEntry] = &[
         command: Command::ToggleComment,
     },
     CommandPaletteEntry {
-        key: "Ctrl+Space",
+        key: "Ctrl+@ · Ctrl+Space",
         name: "Completion / 補完",
         description: "LSP補完候補を表示",
         command: Command::ToggleCompletion,
@@ -3002,22 +3612,16 @@ const COMMAND_PALETTE: &[CommandPaletteEntry] = &[
         command: Command::Format,
     },
     CommandPaletteEntry {
-        key: "Ctrl+\\",
+        key: "Ctrl+]",
         name: "Split Editor / 左右分割",
         description: "エディタの左右分割を切り替える",
         command: Command::ToggleSplit,
     },
     CommandPaletteEntry {
-        key: "Ctrl+@",
+        key: "Ctrl+O",
         name: "Terminal / シェル",
         description: "統合ターミナルを切り替える",
         command: Command::ToggleShell,
-    },
-    CommandPaletteEntry {
-        key: "Alt+H",
-        name: "Shortcut Guide / キーガイド",
-        description: "操作ヒントの表示を切り替える",
-        command: Command::ToggleHintGuide,
     },
     CommandPaletteEntry {
         key: "F4",
@@ -3044,6 +3648,7 @@ struct PickerState {
     candidates: Vec<PickerCandidate>,
     filtered: Vec<usize>,
     selected: usize,
+    ranking_cache: Vec<(String, Vec<usize>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -3056,8 +3661,16 @@ enum PickerCandidate {
 pub struct PickerView {
     pub title: &'static str,
     pub query: String,
-    pub items: Vec<String>,
+    pub items: Vec<PickerViewItem>,
     pub selected: usize,
+    pub has_before: bool,
+    pub has_after: bool,
+    pub total: usize,
+}
+
+pub struct PickerViewItem {
+    pub label: String,
+    pub matched: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3196,12 +3809,28 @@ pub struct SearchView {
 
 #[derive(Debug)]
 enum PendingLsp {
-    Completion,
+    Completion {
+        doc: DocumentId,
+        version: i32,
+        prefix: String,
+        side: Side,
+        anchor: CharIdx,
+    },
     Definition,
-    Rename { doc: DocumentId },
-    Formatting { doc: DocumentId },
-    Hover { doc: DocumentId, line: usize },
-    SemanticTokens { doc: DocumentId },
+    Rename {
+        doc: DocumentId,
+    },
+    Formatting {
+        doc: DocumentId,
+    },
+    Hover {
+        doc: DocumentId,
+        line: usize,
+    },
+    SemanticTokens {
+        doc: DocumentId,
+        version: i32,
+    },
 }
 
 fn hover_text(contents: lsp_types::HoverContents) -> String {
@@ -3219,7 +3848,9 @@ fn hover_text(contents: lsp_types::HoverContents) -> String {
 fn marked_string(marked: lsp_types::MarkedString) -> String {
     match marked {
         lsp_types::MarkedString::String(value) => value,
-        lsp_types::MarkedString::LanguageString(value) => value.value,
+        lsp_types::MarkedString::LanguageString(value) => {
+            format!("```{}\n{}\n```", value.language, value.value)
+        }
     }
 }
 
@@ -3227,17 +3858,22 @@ fn marked_string(marked: lsp_types::MarkedString) -> String {
 struct CompletionState {
     items: Vec<CompletionCandidate>,
     selected: usize,
+    return_side: Side,
+    anchor: CharIdx,
 }
 
 #[derive(Debug)]
 struct CompletionCandidate {
     label: String,
     insert: String,
+    prefix_len: usize,
+    cursor_back: usize,
 }
 
 pub struct CompletionView {
     pub items: Vec<String>,
     pub selected: usize,
+    pub anchor: CharIdx,
 }
 
 #[cfg(test)]
@@ -3288,6 +3924,32 @@ mod tests {
     }
 
     #[test]
+    fn shell_focus_keeps_the_left_editor_available_for_rendering() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::TextPaste("visible".to_owned()));
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+
+        let effects = editor.update(Command::ToggleShell.into());
+
+        assert!(editor.shell_focused());
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "visible");
+        assert!(matches!(effects.as_slice(), [Effect::SpawnShell { .. }]));
+
+        assert!(editor.update(Command::ToggleShell.into()).is_empty());
+        assert!(!editor.shell_visible());
+        assert!(editor.terminal.is_some());
+
+        assert!(editor.update(Command::ToggleShell.into()).is_empty());
+        assert!(editor.shell_visible());
+        assert!(editor.shell_focused());
+
+        editor.update(AppEvent::Terminal(TerminalEvent::Exited(None)));
+        assert!(!editor.shell_visible());
+        assert!(editor.terminal.is_none());
+        assert_eq!(editor.status(), None);
+    }
+
+    #[test]
     fn event_sequence_edits_moves_and_undoes() {
         let mut editor = Editor::default();
 
@@ -3306,6 +3968,35 @@ mod tests {
 
         editor.update(AppEvent::Command(Command::Undo));
         assert_eq!(editor.active_buffer().unwrap().text.to_string(), "ab");
+    }
+
+    #[test]
+    fn mouse_side_buttons_undo_and_redo() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::TextInput('a'));
+        editor.update(AppEvent::Command(Command::Move {
+            direction: Direction::Right,
+            unit: Unit::Character,
+            extend: false,
+        }));
+
+        let side_button = |button| {
+            AppEvent::Mouse(MouseInput {
+                event: MouseEvent {
+                    kind: MouseEventKind::Down(button),
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                clicks: 1,
+            })
+        };
+
+        editor.update(side_button(MouseButton::Back));
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "");
+
+        editor.update(side_button(MouseButton::Forward));
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "a");
     }
 
     #[test]
@@ -3358,6 +4049,50 @@ mod tests {
     }
 
     #[test]
+    fn copy_without_a_selection_copies_and_pastes_the_current_line() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::TextPaste("one\ntwo".to_owned()));
+
+        let effects = editor.update(Command::Copy.into());
+
+        assert_eq!(effects, vec![Effect::ClipboardOsc52("two\n".to_owned())]);
+        editor.update(Command::Paste.into());
+        assert_eq!(
+            editor.active_buffer().unwrap().text.to_string(),
+            "one\ntwo\ntwo"
+        );
+    }
+
+    #[test]
+    fn cut_without_a_selection_cuts_and_restores_the_current_line() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::TextPaste("one\ntwo".to_owned()));
+        editor.update(
+            Command::Move {
+                direction: Direction::Left,
+                unit: Unit::Document,
+                extend: false,
+            }
+            .into(),
+        );
+
+        let effects = editor.update(Command::Cut.into());
+
+        assert_eq!(effects, vec![Effect::ClipboardOsc52("one\n".to_owned())]);
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "two");
+
+        editor.update(Command::Undo.into());
+        let buffer = editor.active_buffer().unwrap();
+        assert_eq!(buffer.text.to_string(), "one\ntwo");
+        assert!(buffer.view.selections.primary().is_caret());
+
+        editor.update(Command::Redo.into());
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "two");
+        editor.update(Command::Paste.into());
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "one\ntwo");
+    }
+
+    #[test]
     fn mouse_click_uses_text_coordinates_after_the_gutter() {
         let mut editor = Editor::default();
         editor.update(AppEvent::TextPaste("abc".to_owned()));
@@ -3383,6 +4118,181 @@ mod tests {
                 .head,
             CharIdx(1)
         );
+    }
+
+    #[test]
+    fn mouse_hit_testing_follows_soft_wrapped_rows() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 10, rows: 8 });
+        editor.update(AppEvent::TextPaste("abcdefghij".to_owned()));
+
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+
+        assert_eq!(
+            editor
+                .active_buffer()
+                .unwrap()
+                .view
+                .selections
+                .primary()
+                .head,
+            CharIdx(5)
+        );
+    }
+
+    #[test]
+    fn lsp_hover_is_requested_on_click_not_mouse_move() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::TextPaste("value".to_owned()));
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+        let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
+        document.path = Some(PathBuf::from("/tmp/hover.rs"));
+        document.language = Some("rust".to_owned());
+        editor.lsp_servers.insert("rust".to_owned(), 1);
+        editor.lsp_ready.insert(1);
+        let moved = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 6,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(
+            editor
+                .update(AppEvent::Mouse(MouseInput {
+                    event: moved,
+                    clicks: 0
+                }))
+                .is_empty()
+        );
+        assert!(
+            !editor
+                .pending_lsp
+                .values()
+                .any(|pending| matches!(pending, PendingLsp::Hover { .. }))
+        );
+
+        let effects = editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                ..moved
+            },
+            clicks: 1,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::LspRequest { method, .. }] if method == "textDocument/hover"
+        ));
+    }
+
+    #[test]
+    fn selecting_a_range_dismisses_hover_without_requesting_another() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::TextPaste("value".to_owned()));
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+        editor.hover = Some("old hover".to_owned());
+
+        let effects = editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 6,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 2,
+        }));
+
+        assert!(effects.is_empty());
+        assert!(editor.hover_view().is_none());
+        assert!(
+            !editor
+                .active_buffer()
+                .unwrap()
+                .view
+                .selections
+                .primary()
+                .is_caret()
+        );
+    }
+
+    #[test]
+    fn edits_preserve_shifted_semantic_colors_and_ignore_old_responses() {
+        let mut editor = Editor::default();
+        let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
+        document.path = Some(PathBuf::from("/tmp/colors.rs"));
+        document.language = Some("rust".to_owned());
+        document
+            .editable_mut()
+            .semantic_spans
+            .push(crate::lsp::SemanticSpan {
+                start: CharIdx(0),
+                end: CharIdx(1),
+                token_type: 0,
+            });
+        editor.lsp_servers.insert("rust".to_owned(), 1);
+        editor.lsp_ready.insert(1);
+        editor.lsp_incremental_sync.insert(1);
+        editor.lsp_opened_documents.insert(DocumentId(0));
+        editor.document_versions.insert(DocumentId(0), 1);
+
+        let effects = editor.update(AppEvent::TextInput('a'));
+        let sync_message = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::LspSend { message, .. } if message.contains("textDocument/didChange") => {
+                    Some(serde_json::from_str::<serde_json::Value>(message).unwrap())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            sync_message["params"]["contentChanges"][0]["range"]["start"],
+            serde_json::json!({"line": 0, "character": 0})
+        );
+        assert_eq!(sync_message["params"]["contentChanges"][0]["text"], "a");
+        let version = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ScheduleSemanticRefresh { version, .. } => Some(*version),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            editor.active_buffer().unwrap().semantic_spans[0].start,
+            CharIdx(1)
+        );
+        let due = editor.update(AppEvent::Lsp(LspEvent::SemanticRefreshDue {
+            doc: DocumentId(0),
+            version,
+        }));
+        let old_request = due
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::LspRequest { id, method, .. }
+                    if method == "textDocument/semanticTokens/full" =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .unwrap();
+
+        editor.update(AppEvent::TextInput('b'));
+        editor.update(AppEvent::Lsp(LspEvent::Response {
+            id: old_request,
+            result: Ok(serde_json::json!({"data": [0, 0, 1, 0, 0]})),
+        }));
+
+        let span = &editor.active_buffer().unwrap().semantic_spans[0];
+        assert_eq!((span.start, span.end), (CharIdx(2), CharIdx(3)));
     }
 
     #[test]
@@ -3446,6 +4356,146 @@ mod tests {
     }
 
     #[test]
+    fn mouse_click_switches_the_active_split_buffer() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+        editor.open_paths([PathBuf::from("left.txt"), PathBuf::from("right.txt")]);
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok("left".to_owned()),
+        }));
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(2),
+            result: Ok("right".to_owned()),
+        }));
+        editor.update(Command::OpenDiffPicker.into());
+        editor.update(Command::PickerConfirm.into());
+
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 60,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+        assert_eq!(editor.focus, Focus::Editor(Side::Right));
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "left");
+        editor.update(AppEvent::TextInput('X'));
+        let (left, right, _) = editor.split_buffers().unwrap();
+        assert_eq!(left.text.to_string(), "right");
+        assert_eq!(right.text.to_string(), "leftX");
+
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+        assert_eq!(editor.focus, Focus::Editor(Side::Left));
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "right");
+    }
+
+    #[test]
+    fn opening_a_file_from_picker_exits_diff_mode() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("left.txt"), PathBuf::from("right.txt")]);
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok("left".to_owned()),
+        }));
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(2),
+            result: Ok("right".to_owned()),
+        }));
+        editor.update(Command::OpenDiffPicker.into());
+        editor.update(Command::PickerConfirm.into());
+        assert!(editor.split_buffers().is_some_and(|(_, _, diff)| diff));
+
+        editor.update(Command::OpenDirectoryPicker.into());
+        editor.update(AppEvent::FileScan(FileScanEvent::Batch {
+            token: 1,
+            paths: vec![PathBuf::from("next.txt")],
+        }));
+        let effects = editor.update(Command::PickerConfirm.into());
+
+        assert!(editor.split_buffers().is_none());
+        assert!(
+            matches!(effects.as_slice(), [Effect::ReadFile { path, .. }] if path == &PathBuf::from("next.txt"))
+        );
+    }
+
+    #[test]
+    fn buffer_picker_replaces_the_mouse_focused_pane_without_closing_split() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+        editor.open_paths([PathBuf::from("left.txt"), PathBuf::from("right.txt")]);
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok("left".to_owned()),
+        }));
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(2),
+            result: Ok("right".to_owned()),
+        }));
+        editor.update(Command::ToggleSplit.into());
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+        editor.update(Command::OpenBufferPicker.into());
+        for character in "left.txt".chars() {
+            editor.update(AppEvent::TextInput(character));
+        }
+        editor.update(Command::PickerConfirm.into());
+
+        let (left, right, diff) = editor.split_buffers().unwrap();
+        assert!(!diff);
+        assert_eq!(left.text.to_string(), "left");
+        assert_eq!(right.text.to_string(), "right");
+        assert_eq!(editor.focus, Focus::Editor(Side::Left));
+    }
+
+    #[test]
+    fn buffer_picker_excludes_the_current_buffer() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("other.txt"), PathBuf::from("current.txt")]);
+
+        editor.update(Command::OpenBufferPicker.into());
+
+        let picker = editor.picker_view().unwrap();
+        assert_eq!(picker.items.len(), 1);
+        assert!(picker.items[0].label.contains("other.txt"));
+        assert!(!picker.items[0].label.contains("current.txt"));
+    }
+
+    #[test]
+    fn diff_picker_excludes_another_document_for_the_same_file() {
+        let mut editor = Editor::default();
+        editor.open_paths([
+            PathBuf::from("same.txt"),
+            PathBuf::from("other.txt"),
+            PathBuf::from("same.txt"),
+        ]);
+
+        editor.update(Command::OpenDiffPicker.into());
+
+        let picker = editor.picker_view().unwrap();
+        assert_eq!(picker.items.len(), 1);
+        assert!(picker.items[0].label.contains("other.txt"));
+        assert!(!picker.items[0].label.contains("same.txt"));
+    }
+
+    #[test]
     fn command_palette_searches_labels_and_executes_selected_command() {
         let mut editor = Editor::default();
         editor.update(Command::OpenCommandPalette.into());
@@ -3454,8 +4504,8 @@ mod tests {
         }
 
         let palette = editor.picker_view().unwrap();
-        assert!(palette.items[0].contains("Ctrl+T"));
-        assert!(palette.items[0].contains("Find File"));
+        assert!(palette.items[0].label.contains("Ctrl+T"));
+        assert!(palette.items[0].label.contains("Find File"));
 
         let effects = editor.update(Command::PickerConfirm.into());
         assert!(matches!(effects.as_slice(), [Effect::StartFileScan { .. }]));
@@ -3470,28 +4520,103 @@ mod tests {
         }
 
         let palette = editor.picker_view().unwrap();
-        assert!(palette.items[0].contains("F6"));
-        assert!(palette.items[0].contains("Diff"));
+        assert!(palette.items[0].label.contains("F6"));
+        assert!(palette.items[0].label.contains("Diff"));
+    }
+
+    #[test]
+    fn opening_any_picker_dismisses_hover() {
+        let mut editor = Editor::default();
+        for command in [
+            Command::OpenCommandPalette,
+            Command::OpenDirectoryPicker,
+            Command::OpenBufferPicker,
+            Command::OpenDiffPicker,
+        ] {
+            editor.hover = Some("hover text".to_owned());
+            editor.update(command.into());
+            assert!(editor.hover_view().is_none());
+            editor.update(Command::PickerCancel.into());
+        }
     }
 
     #[test]
     fn command_palette_restores_the_originating_pane_focus() {
         let mut editor = Editor::default();
+        editor.update(AppEvent::TextPaste("abc".to_owned()));
         editor.update(Command::ToggleSplit.into());
         assert_eq!(editor.focus, Focus::Editor(Side::Right));
         editor.update(Command::OpenCommandPalette.into());
-        for character in "shortcut guide".chars() {
+        for character in "select all".chars() {
             editor.update(AppEvent::TextInput(character));
         }
 
         editor.update(Command::PickerConfirm.into());
 
         assert_eq!(editor.focus, Focus::Editor(Side::Right));
-        assert!(editor.hint_guide_visible());
+        assert_eq!(
+            editor
+                .active_buffer()
+                .unwrap()
+                .view
+                .selections
+                .primary()
+                .range(),
+            0..3
+        );
     }
 
     #[test]
-    fn save_emits_write_effect_and_success_emits_history_effect() {
+    fn picker_view_virtualizes_large_candidate_lists() {
+        let mut editor = Editor::default();
+        editor.open_directory_picker();
+        let picker = editor.picker.as_mut().unwrap();
+        picker.candidates = (0..10_000)
+            .map(|index| PickerCandidate::Path(PathBuf::from(format!("file-{index}.txt"))))
+            .collect();
+        picker.filtered = (0..picker.candidates.len()).collect();
+        picker.selected = 9_000;
+
+        let view = editor.picker_view().unwrap();
+
+        assert_eq!(view.items.len(), 5);
+        assert!(view.selected < view.items.len());
+        assert!(view.items[view.selected].label.contains("file-9000.txt"));
+        assert!(view.has_before);
+        assert!(view.has_after);
+    }
+
+    #[test]
+    fn picker_backspace_restores_cached_prefix_ranking() {
+        let mut editor = Editor::default();
+        editor.open_directory_picker();
+        let picker = editor.picker.as_mut().unwrap();
+        picker.candidates = (0..10_000)
+            .map(|index| PickerCandidate::Path(PathBuf::from(format!("file-{index}.txt"))))
+            .collect();
+        picker.filtered = (0..picker.candidates.len()).collect();
+        for character in "file-9".chars() {
+            editor.update(AppEvent::TextInput(character));
+        }
+        let cache_before = editor.picker.as_ref().unwrap().ranking_cache.clone();
+
+        editor.update(Command::PickerBackspace.into());
+
+        let picker = editor.picker.as_ref().unwrap();
+        assert_eq!(picker.query, "file-");
+        assert_eq!(picker.ranking_cache, cache_before);
+        assert_eq!(
+            picker.filtered,
+            cache_before
+                .iter()
+                .find(|(query, _)| query == "file-")
+                .unwrap()
+                .1
+        );
+    }
+
+    #[test]
+    fn save_emits_write_effect_and_marks_the_document_saved() {
         let mut editor = Editor::default();
         let path = PathBuf::from("/tmp/save-test.txt");
         editor.open_paths([path.clone()]);
@@ -3516,7 +4641,13 @@ mod tests {
             id: DocumentId(1),
             result: Ok(()),
         }));
-        assert!(matches!(effects.as_slice(), [Effect::SaveUndoHistory(_)]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::ComputeGitStatus {
+                doc: DocumentId(1),
+                path: git_path,
+            }] if git_path == &path
+        ));
         assert!(!editor.active_buffer().unwrap().modified);
     }
 
@@ -3647,6 +4778,236 @@ mod tests {
             [Effect::LspRequest { server: 7, method, .. }]
                 if method == "textDocument/formatting"
         ));
+    }
+
+    #[test]
+    fn file_opened_after_lsp_initialization_gets_did_open_and_semantic_tokens() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("/tmp/first.rs")]);
+        let startup = editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok("fn first() {}".to_owned()),
+        }));
+        assert!(matches!(
+            startup.last(),
+            Some(Effect::SpawnLsp { server: 1, .. })
+        ));
+        editor.update(AppEvent::Lsp(LspEvent::Initialized {
+            server: 1,
+            incremental_sync: true,
+        }));
+
+        editor.open_paths([PathBuf::from("/tmp/second.rs")]);
+        let effects = editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(2),
+            result: Ok("fn second() {}".to_owned()),
+        }));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::LspSend { server: 1, message }
+                if message.contains("textDocument/didOpen") && message.contains("second.rs")
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::LspRequest { server: 1, method, params, .. }
+                if method == "textDocument/semanticTokens/full" && params.contains("second.rs")
+        )));
+    }
+
+    #[test]
+    fn loading_config_starts_workspace_lsp_before_a_language_file_is_opened() {
+        let mut editor = Editor::default();
+        editor.set_workspace_root(PathBuf::from("/workspace"));
+
+        let effects = editor.update(AppEvent::ConfigLoaded(Ok(Config::default())));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SpawnLsp {
+                language,
+                root,
+                ..
+            }] if language == "rust" && root == &PathBuf::from("/workspace")
+        ));
+    }
+
+    #[test]
+    fn status_reports_language_and_lsp_lifecycle() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("main.rs")]);
+        editor.update(AppEvent::ConfigLoaded(Ok(Config::default())));
+        assert_eq!(
+            editor.active_buffer().unwrap().language_status,
+            "<lsp> rust: starting"
+        );
+
+        editor.update(AppEvent::Lsp(LspEvent::Spawned {
+            server: 1,
+            language: "rust".to_owned(),
+        }));
+        assert_eq!(
+            editor.active_buffer().unwrap().language_status,
+            "<lsp> rust: initializing"
+        );
+
+        let effects = editor.update(AppEvent::Lsp(LspEvent::Initialized {
+            server: 1,
+            incremental_sync: true,
+        }));
+        assert_eq!(
+            editor.active_buffer().unwrap().language_status,
+            "<lsp> rust: coloring"
+        );
+
+        let semantic_request = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::LspRequest { id, method, .. }
+                    if method == "textDocument/semanticTokens/full" =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        editor.update(AppEvent::Lsp(LspEvent::Response {
+            id: semantic_request,
+            result: Ok(serde_json::json!({"data": [0, 0, 1, 0, 0]})),
+        }));
+        assert_eq!(
+            editor.active_buffer().unwrap().language_status,
+            "<lsp> rust: ready"
+        );
+
+        editor.update(AppEvent::TextInput('x'));
+        assert_eq!(
+            editor.active_buffer().unwrap().language_status,
+            "<lsp> rust: updating"
+        );
+
+        editor.update(AppEvent::Lsp(LspEvent::Exited {
+            server: 1,
+            error: Some("not found".to_owned()),
+        }));
+        assert_eq!(
+            editor.active_buffer().unwrap().language_status,
+            "<lsp> rust: not found"
+        );
+    }
+
+    #[test]
+    fn crashed_lsp_restarts_three_times_with_exponential_backoff() {
+        let mut editor = Editor::default();
+        for expected_delay in [500, 1_000, 2_000] {
+            assert_eq!(
+                editor.update(AppEvent::Lsp(LspEvent::Exited {
+                    server: 1,
+                    error: Some("crashed".to_owned()),
+                })),
+                vec![Effect::ScheduleLspRestart {
+                    server: 1,
+                    delay_ms: expected_delay,
+                }]
+            );
+        }
+
+        assert!(
+            editor
+                .update(AppEvent::Lsp(LspEvent::Exited {
+                    server: 1,
+                    error: Some("crashed".to_owned()),
+                }))
+                .is_empty()
+        );
+        assert_eq!(
+            editor.lsp_errors.get(&1).map(String::as_str),
+            Some("crashed")
+        );
+    }
+
+    #[test]
+    fn markdown_status_does_not_report_the_workspace_rust_lsp() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("README.md")]);
+        editor.update(AppEvent::ConfigLoaded(Ok(Config::default())));
+
+        assert_eq!(
+            editor.active_buffer().unwrap().language_status,
+            "<syntax> markdown"
+        );
+    }
+
+    #[test]
+    fn completion_excludes_the_candidate_identical_to_the_typed_prefix() {
+        let mut editor = Editor::default();
+        let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
+        document.path = Some(PathBuf::from("main.rs"));
+        document.language = Some("rust".to_owned());
+        editor.lsp_servers.insert("rust".to_owned(), 1);
+        editor.lsp_spawned.insert(1);
+        editor.lsp_ready.insert(1);
+        editor.lsp_opened_documents.insert(DocumentId(0));
+        editor.document_versions.insert(DocumentId(0), 1);
+
+        editor.update(AppEvent::TextPaste("let collections".to_owned()));
+        let effects = editor.request_completion(true);
+        let request = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::LspRequest { id, .. } => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        editor.update(AppEvent::Lsp(LspEvent::Response {
+            id: request,
+            result: Ok(serde_json::json!([
+                {"label": "collections"},
+                {"label": "collections_mut"}
+            ])),
+        }));
+
+        let completion = editor.completion_view().unwrap();
+        assert_eq!(completion.items, vec!["collections_mut"]);
+        assert_eq!(completion.anchor, CharIdx(4));
+    }
+
+    #[test]
+    fn function_completion_inserts_parentheses_and_places_caret_inside() {
+        let mut editor = Editor::default();
+        let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
+        document.path = Some(PathBuf::from("main.rs"));
+        document.language = Some("rust".to_owned());
+        editor.lsp_servers.insert("rust".to_owned(), 1);
+        editor.lsp_ready.insert(1);
+        editor.lsp_opened_documents.insert(DocumentId(0));
+        editor.document_versions.insert(DocumentId(0), 1);
+        editor.update(AppEvent::TextPaste("cur".to_owned()));
+
+        let request = editor
+            .request_completion(true)
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::LspRequest { id, .. } => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        editor.update(AppEvent::Lsp(LspEvent::Response {
+            id: request,
+            result: Ok(serde_json::json!([{
+                "label": "current_dir",
+                "insertText": "current_dir",
+                "kind": 3
+            }])),
+        }));
+        editor.update(Command::PickerConfirm.into());
+
+        let buffer = editor.active_buffer().unwrap();
+        assert_eq!(buffer.text.to_string(), "current_dir()");
+        assert_eq!(
+            buffer.text.char(buffer.view.selections.primary().head.0),
+            ')'
+        );
     }
 
     #[test]
