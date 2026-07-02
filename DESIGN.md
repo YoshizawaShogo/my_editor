@@ -280,7 +280,7 @@ struct PersistedHistory {
 
 ```rust
 enum Overlay {
-    Picker(PickerState),           // Ctrl+T ディレクトリ以下 / Ctrl+G 全バッファ（§13）
+    Picker(PickerState),           // Ctrl+T ディレクトリ以下 / Ctrl+G 全バッファ / F6 比較対象（§13）
     Search(SearchState),           // Ctrl+F 検索 / Ctrl+H 置換。スコープ循環（§13）
     Completion(CompletionState),   // Ctrl+Space トグル。矢印選択/Enter・Tab確定（§8.5）
     Hover(HoverState),             // LSPホバー＋カーソル位置の診断本文（自動表示・focus奪わない。§9.6）
@@ -463,7 +463,7 @@ impl Editor {
 
 ### 5.3 Command（高レベルコマンド）
 
-keymap（§7.4 で確定）が生成する単位。コマンドパレットは MVP 不採用のため、生成元は keymap とマウスのみ。以下は主なもの:
+keymap（§7.4 で確定）が生成する単位。生成元はkeymap、マウス、`Ctrl+P`のコマンドパレット。以下は主なもの:
 
 ```rust
 enum Command {
@@ -477,7 +477,8 @@ enum Command {
     // クリップボード
     Copy, Cut, Paste,
     // ファイル/バッファ（ピッカー。§13）
-    Save, CloseBuffer, OpenDirectoryPicker, OpenBufferPicker,
+    Save, CloseBuffer, OpenDirectoryPicker, OpenBufferPicker, OpenDiffPicker,
+    OpenCommandPalette,
     // 検索（スコープ循環。§13）
     OpenSearch, OpenReplace, OpenSearchInDirectory, CycleSearchScope,
     // 編集(言語補助)
@@ -642,8 +643,10 @@ VSCode ライクでも全ショートカットは実装しない。**右手は�
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | コピー / カット / ペースト | 内部＋OSC52 |
 | `Ctrl+S` | 保存 | |
 | `Ctrl+W` | バッファを閉じる | 未保存なら `Confirm`（§4.6） |
-| `Ctrl+T` | ファイルピッカー（カレントディレクトリ以下） | `ignore` 走査。旧 `Ctrl+P` から変更 |
+| `Ctrl+T` | ファイルピッカー（カレントディレクトリ以下） | `ignore`走査。`Ctrl+P`はコマンドパレットに使用 |
+| `Ctrl+P` | コマンドパレット | 名前・説明・キーをfuzzy検索。候補にキーバインドを併記し、`Enter`で実行 |
 | `Ctrl+G` | バッファピッカー（開いている全バッファ） | |
+| `F6` | 比較対象バッファピッカー | 現在のバッファを左、選択した開いているバッファを右に置き、行を対応させた diff 表示 |
 | `Ctrl+F` / `Ctrl+H` | 検索 / 置換（オーバーレイを開く。**開いた状態で再押下するとスコープを循環**。include/exclude glob と ignore 設定あり＝§13） | カレントバッファ→全バッファ→カレントディレクトリ以下 |
 | `Ctrl+Shift+F` | 検索をディレクトリスコープで直接開く | 循環の 3 段目へ一発 |
 | `Ctrl+Space` | 補完ポップアップ トグル | LSP。矢印で選択 / `Enter`・`Tab` で確定 / `Esc` で閉じる（§8.5） |
@@ -658,7 +661,7 @@ VSCode ライクでも全ショートカットは実装しない。**右手は�
 
 - `PageUp` / `PageDown`: **不採用**（マウスホイールで代替）。
 - 専用フォーカス移動キー（`Ctrl+1/2` 等）: **不採用**。フォーカスはマウス / `Ctrl+\` / `Ctrl+@` / `Ctrl+T` / `Ctrl+G` に追従。
-- コマンドパレット（`Ctrl+Shift+P`）: **MVP 不採用**。
+- `Ctrl+Shift+P`: 不採用。コマンドパレットは左手で押しやすい`Ctrl+P`に固定する。
 - 定義ジャンプ: **Ctrl+クリックのみ**（`F12` は持たない）。
 - ホバー: **キー無し。カーソル静止／マウスホバーで自動表示**。
 - 整形: **MVP は導線なし**（機能は後続 P8。パレット導入時に割当）。
@@ -936,12 +939,14 @@ enum TerminalEvent { Output(Vec<u8>), Exited(ExitReason) }
 
 ## 13. 検索・走査
 
-- **ピッカー（`Ctrl+T` / `Ctrl+G`）**: `Overlay::Picker` に統合し、候補ソースだけが異なる。どちらも `fuzzy-matcher` でランキングし、**入力をパスとして解釈する直接オープンのフォールバック**を持つ。
+- **ピッカー（`Ctrl+T` / `Ctrl+G` / `F6` / `Ctrl+P`）**: `Overlay::Picker` に統合し、候補ソースだけが異なる。すべて`fuzzy-matcher`でランキングする。ファイルソースは**入力をパスとして解釈する直接オープンのフォールバック**も持つ。
 
   ```rust
   enum PickerSource {
       Directory,     // Ctrl+T: workspace_root 以下（ignore walk, 非同期）
       OpenBuffers,   // Ctrl+G: 開いている全 Document（同期）
+      DiffTarget { base: DocumentId }, // F6: base 以外の開いている Document（同期）
+      Commands,      // Ctrl+P: コマンド名・説明・キーバインド（同期）
   }
 
   struct PickerState {
@@ -960,6 +965,9 @@ enum TerminalEvent { Output(Vec<u8>), Exited(ExitReason) }
       inside_root: bool, // resolved が workspace_root 配下か（カレント以下か）
   }
   ```
+
+- **バッファ比較（`F6`）**: `PickerSource::DiffTarget` で現在のバッファ以外から比較対象を選ぶ。確定後は `Layout::EditorAndEditor` に切り替え、現在のバッファを左、比較対象を右に固定する。行単位 diff で対応する行を上下に揃え、追加=`GREEN`、削除=`RED`、変更=`ORANGE` で表示する。片側に対応行がない箇所は空の diff 行を挿入して位置を揃える。diff 表示中も各ペインの原文は通常どおり編集可能で、編集後は差分を再計算する。
+- **コマンドパレット（`Ctrl+P`）**: `PickerSource::Commands`で、実行可能なコマンドを「キーバインド / コマンド名 / 短い説明」の1行候補として表示する。名前・説明・キーのすべてをfuzzy検索対象にし、`↑`/`↓`で選択、`Enter`でPickerを閉じて実行する。固定キーがないコマンドは`—`と表示する。操作時にキーバインドを反復表示し、利用しながら覚えられることを目的とする。
 
   - **Directory ソース**: `ignore`（ripgrep 由来・高信頼）の `WalkBuilder` で `.gitignore` を尊重しつつ列挙。結果を `AppEvent::FileScan` でバッチ供給し、`ScanToken` で古い走査を破棄。ランキングはクエリ変更で再計算。
   - **OpenBuffers ソース**: `Editor.documents` を候補にする同期リスト（走査不要）。
@@ -1170,7 +1178,7 @@ src/
 - **P1 エディタコア**: Document/Rope、単一カーソルの移動・挿入・削除、スクロール、行番号描画、undo。
 - **P2 マルチカーソル＋基本マウス**: `Selections`、選択拡張、`Ctrl+D`/カーソル追加、コピー・カット・ペースト（内部＋OSC52）、**基本マウス（クリック/ドラッグ選択/ホイールスクロール/ダブル・トリプルクリック）**。マウスが操作の主役のため早期に入れる。
 - **P3 ファイル入出力**: open/save、行末保持、config 読込、言語判定、**undo 履歴の永続化（§4.5.1）**、**大容量ファイルの mmap ページング（§4.2.1）**。
-- **P4 オーバーレイ基盤**: overlay 描画・focus、ピッカー（`Ctrl+T`/`Ctrl+G`, ignore 走査＋fuzzy＋パス直接オープン）、スタートページ（§4.12）。
+- **P4 オーバーレイ基盤**: overlay 描画・focus、ピッカー（`Ctrl+T`/`Ctrl+G`/`F6`/`Ctrl+P`, ignore走査＋fuzzy＋パス直接オープン＋コマンド検索）、F6の左右diff表示、スタートページ（§4.12）。
 - **P5 検索**: バッファ内検索・置換、プロジェクト grep（grep クレート）。
 - **P6 tree-sitter ハイライト**: TOML/Markdown/JSON、増分パース。
 - **P7 LSP 基盤**: アクター（lsp-server フレーミング）、initialize、ドキュメント同期、診断表示、**ガター（診断＋git 差分列, §9.4）**。
@@ -1180,7 +1188,7 @@ src/
 
 ## 19. 決定ログ / 次タスク
 
-- **採用ショートカットの整理（完了 → §7.4 に確定反映）**: 右手マウス中心・左手キーボード最小の方針で取捨選択。主な確定: スクロールはホイールのみ（`PageUp/Down` 不採用）、ファイルピッカーは `Ctrl+T`、左右分割 `Ctrl+\`・シェル `Ctrl+@`（フォーカス追従、専用フォーカスキー無し）、定義=Ctrl+クリック・ホバー=自動、コメントトグルは `Ctrl+/` と `Ctrl+Q` の 2 キー、コマンドパレットと整形導線は MVP 不採用。`Command`（§5.3）と `Overlay`（§4.6）に反映済み。
+- **採用ショートカットの整理（完了 → §7.4 に確定反映）**: 右手マウス中心・左手キーボード最小の方針で取捨選択。主な確定: スクロールはホイールのみ（`PageUp/Down`不採用）、ファイルピッカーは`Ctrl+T`、コマンドパレットは`Ctrl+P`、左右分割`Ctrl+\`・シェル`Ctrl+@`（フォーカス追従、専用フォーカスキー無し）、定義=Ctrl+クリック・ホバー=自動、コメントトグルは`Ctrl+/`と`Ctrl+Q`の2キー。`Command`（§5.3）と`Overlay`（§4.6）に反映済み。
 - 解決済み: 補完ポップアップ UX（§8.5, `Ctrl+Space` トグル/矢印選択/Enter・Tab確定）。ディレクトリ検索結果一覧（＝旧「grep結果」, §13 `SearchResults::OnDisk`）。無名バッファの保存フローは**持たない**（保存対象外, §13）。
 - 懸念の決着（前回提示分）:
   - パニック時の端末復帰 → **実装**（§14: RAII ガード＋panic hook）。
