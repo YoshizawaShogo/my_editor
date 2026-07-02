@@ -1,5 +1,5 @@
 #!/bin/bash
-# set -euo pipefail
+set -euo pipefail
 
-# cargo fmt --check
-# cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
