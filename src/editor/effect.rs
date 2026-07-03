@@ -70,6 +70,10 @@ pub enum Effect {
         version: i32,
         delay_ms: u64,
     },
+    ScheduleHoverProbe {
+        doc: DocumentId,
+        delay_ms: u64,
+    },
     CheckDiskStates(Vec<(DocumentId, PathBuf)>),
     ResolveDirectPath {
         input: String,

@@ -115,7 +115,13 @@ impl Editable {
         self.replace_ranges(selections, targets, replacements, None, None);
     }
 
-    pub fn insert_newline(&mut self, selections: &mut Selections, line_comment: Option<&str>) {
+    pub fn insert_newline(
+        &mut self,
+        selections: &mut Selections,
+        line_comment: Option<&str>,
+        tab_size: usize,
+        insert_spaces: bool,
+    ) {
         let targets: Vec<_> = selections.iter().copied().collect();
         let replacements = targets
             .iter()
@@ -127,17 +133,18 @@ impl Editable {
                     .chars()
                     .take_while(|character| matches!(character, ' ' | '\t'))
                     .collect();
-                let indentation = if column < full_indentation.chars().count() {
+                let raw_indentation: String = if column < full_indentation.chars().count() {
                     line_text.chars().take(column).collect()
                 } else {
                     full_indentation
                 };
+                let indentation = normalized_indentation(&raw_indentation, tab_size, insert_spaces);
                 let prefix: String = self
                     .text
                     .slice(self.text.line_to_char(line)..insertion)
                     .into();
                 let comment = line_comment
-                    .and_then(|marker| continued_line_comment(&prefix, &indentation, marker));
+                    .and_then(|marker| continued_line_comment(&prefix, &raw_indentation, marker));
                 comment.map_or_else(
                     || format!("\n{indentation}"),
                     |comment| format!("\n{indentation}{comment} "),
@@ -531,6 +538,16 @@ fn continued_line_comment(prefix: &str, indentation: &str, marker: &str) -> Opti
     Some(marker.to_owned())
 }
 
+fn normalized_indentation(indentation: &str, tab_size: usize, insert_spaces: bool) -> String {
+    if !insert_spaces {
+        return indentation.to_owned();
+    }
+    let width = indentation.chars().fold(0, |column, character| {
+        crate::position::display_col_after(column, character, tab_size)
+    });
+    " ".repeat(width)
+}
+
 fn remap_index(index: usize, edits: &[(std::ops::Range<usize>, String)]) -> usize {
     let mut offset = 0isize;
     for (range, inserted) in edits {
@@ -621,7 +638,7 @@ mod tests {
         let mut editable = Editable::new("    value");
         let mut selections = Selections::single(Selection::caret(CharIdx(9)));
 
-        editable.insert_newline(&mut selections, None);
+        editable.insert_newline(&mut selections, None, 4, true);
 
         assert_eq!(editable.text().to_string(), "    value\n    ");
         assert_eq!(selections.primary().head, CharIdx(14));
@@ -640,7 +657,7 @@ mod tests {
         let mut editable = Editable::new("    value");
         let mut selections = Selections::single(Selection::caret(CharIdx(2)));
 
-        editable.insert_newline(&mut selections, None);
+        editable.insert_newline(&mut selections, None, 4, true);
 
         assert_eq!(editable.text().to_string(), "  \n    value");
         assert_eq!(selections.primary().head, CharIdx(5));
@@ -650,12 +667,12 @@ mod tests {
     fn newline_continues_line_and_doc_comments() {
         let mut editable = Editable::new("    // note");
         let mut selections = Selections::single(Selection::caret(CharIdx(11)));
-        editable.insert_newline(&mut selections, Some("//"));
+        editable.insert_newline(&mut selections, Some("//"), 4, true);
         assert_eq!(editable.text().to_string(), "    // note\n    // ");
 
         let mut editable = Editable::new("/// docs");
         let mut selections = Selections::single(Selection::caret(CharIdx(8)));
-        editable.insert_newline(&mut selections, Some("//"));
+        editable.insert_newline(&mut selections, Some("//"), 4, true);
         assert_eq!(editable.text().to_string(), "/// docs\n/// ");
     }
 

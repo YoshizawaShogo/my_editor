@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_cancels_an_overlay_but_remains_shell_input() {
+    fn ctrl_c_cancels_an_overlay_and_uses_shell_copy_dispatch() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let mut pending = KeyChordState::default();
         assert_eq!(
@@ -397,7 +397,7 @@ mod tests {
         );
         assert_eq!(
             translate(raw_key(key), &Focus::Shell, &mut pending),
-            Some(AppEvent::TerminalInput(vec![3]))
+            Some(AppEvent::Command(Command::CopyShellSelection))
         );
     }
 

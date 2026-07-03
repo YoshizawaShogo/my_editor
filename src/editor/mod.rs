@@ -48,10 +48,14 @@ pub struct Editor {
     lsp_servers: HashMap<String, u64>,
     lsp_spawned: HashSet<u64>,
     lsp_ready: HashSet<u64>,
+    lsp_hover_capable: HashSet<u64>,
     lsp_incremental_sync: HashSet<u64>,
     lsp_errors: HashMap<u64, String>,
     lsp_opened_documents: HashSet<DocumentId>,
     semantic_ready_versions: HashMap<DocumentId, i32>,
+    hover_ready_documents: HashSet<DocumentId>,
+    hover_probe_successes: HashMap<DocumentId, usize>,
+    hover_probe_attempts: HashMap<DocumentId, usize>,
     lsp_restart_counts: HashMap<u64, u8>,
     next_server_id: u64,
     pending_lsp: HashMap<i64, PendingLsp>,
@@ -97,10 +101,14 @@ impl Default for Editor {
             lsp_servers: HashMap::new(),
             lsp_spawned: HashSet::new(),
             lsp_ready: HashSet::new(),
+            lsp_hover_capable: HashSet::new(),
             lsp_incremental_sync: HashSet::new(),
             lsp_errors: HashMap::new(),
             lsp_opened_documents: HashSet::new(),
             semantic_ready_versions: HashMap::new(),
+            hover_ready_documents: HashSet::new(),
+            hover_probe_successes: HashMap::new(),
+            hover_probe_attempts: HashMap::new(),
             lsp_restart_counts: HashMap::new(),
             next_server_id: 1,
             pending_lsp: HashMap::new(),
@@ -196,8 +204,12 @@ impl Editor {
                 let hover = matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left))
                     && !definition
                     && !on_split_divider;
+                let copy_shell_selection = self.focus == Focus::Shell
+                    && matches!(mouse.event.kind, MouseEventKind::Up(MouseButton::Left));
                 self.apply_mouse(mouse);
-                if definition {
+                if copy_shell_selection {
+                    self.copy_shell_selection(false)
+                } else if definition {
                     self.request_definition()
                 } else if hover
                     && self.layout.active_editor(self.focus).is_some_and(|pane| {
@@ -221,6 +233,7 @@ impl Editor {
                 let effects = match result {
                     Ok(config) => {
                         self.config = config;
+                        crate::highlight::warm_hover_highlighting();
                         self.refresh_languages();
                         self.start_workspace_lsps()
                     }
@@ -245,7 +258,11 @@ impl Editor {
                 self.apply_terminal(event);
                 Vec::new()
             }
-            AppEvent::TerminalInput(bytes) => vec![Effect::TerminalInput(bytes)],
+            AppEvent::TerminalInput(bytes) => {
+                self.terminal_selection = None;
+                self.dirty = true;
+                vec![Effect::TerminalInput(bytes)]
+            }
             AppEvent::Git(event) => {
                 if let Ok(info) = event.result
                     && let Some(document) = self.documents.get_mut(&event.doc)
@@ -283,10 +300,14 @@ impl Editor {
                 .iter()
                 .any(|selection| !selection.is_caret())
         });
-        if has_selection && self.hover.take().is_some() {
-            self.dirty = true;
+        if has_selection {
+            if self.hover.take().is_some() {
+                self.dirty = true;
+            }
+            self.deferred_hover = None;
         }
         effects.extend(self.take_lsp_sync_effects());
+        effects.extend(self.retry_deferred_hover());
         effects
     }
 
@@ -581,7 +602,18 @@ impl Editor {
     }
 
     pub fn terminal_screen(&self) -> Option<&vt100::Screen> {
-        self.terminal.as_ref().map(vt100::Parser::screen)
+        self.terminal_selection
+            .as_ref()
+            .map(|selection| &selection.snapshot)
+            .or_else(|| self.terminal.as_ref().map(vt100::Parser::screen))
+    }
+
+    pub fn terminal_selection_view(&self) -> Option<TerminalSelectionView> {
+        let selection = self.terminal_selection.as_ref()?;
+        (selection.anchor != selection.head).then(|| {
+            let (start, end) = ordered_terminal_points(selection.anchor, selection.head);
+            TerminalSelectionView { start, end }
+        })
     }
 
     pub fn shell_focused(&self) -> bool {
@@ -831,11 +863,18 @@ impl Editor {
             LspEvent::Initialized {
                 server,
                 incremental_sync,
+                hover_provider,
             } => {
                 self.lsp_spawned.insert(server);
                 self.finish_progress(&format!("lsp:{server}"));
                 self.lsp_ready.insert(server);
                 self.lsp_errors.remove(&server);
+                if hover_provider {
+                    self.lsp_hover_capable.insert(server);
+                } else {
+                    self.lsp_errors
+                        .insert(server, "hover is not supported".to_owned());
+                }
                 if incremental_sync {
                     self.lsp_incremental_sync.insert(server);
                 }
@@ -1043,6 +1082,9 @@ impl Editor {
                         .map_err(|error| error.to_string())
                 }) {
                     Ok(hover) => {
+                        if hover.is_some() {
+                            self.hover_ready_documents.insert(doc);
+                        }
                         let mut parts = hover
                             .map(|hover| hover_text(hover.contents))
                             .into_iter()
@@ -1065,6 +1107,26 @@ impl Editor {
                     }
                     Err(_) => self.hover = None,
                 },
+                Some(PendingLsp::HoverProbe { doc }) => {
+                    match result.and_then(|value| {
+                        serde_json::from_value::<Option<lsp_types::Hover>>(value)
+                            .map_err(|error| error.to_string())
+                    }) {
+                        Ok(Some(_)) => {
+                            let successes = self.hover_probe_successes.entry(doc).or_default();
+                            *successes += 1;
+                            let attempts = self.hover_probe_attempts.entry(doc).or_default();
+                            *attempts += 1;
+                            effects.push(Effect::ScheduleHoverProbe { doc, delay_ms: 50 });
+                        }
+                        Ok(None) => {
+                            let attempts = self.hover_probe_attempts.entry(doc).or_default();
+                            *attempts += 1;
+                            effects.push(Effect::ScheduleHoverProbe { doc, delay_ms: 50 });
+                        }
+                        Err(_) => effects.push(Effect::ScheduleHoverProbe { doc, delay_ms: 500 }),
+                    }
+                }
                 Some(PendingLsp::SemanticTokens { doc, version }) => {
                     if self.document_versions.get(&doc) == Some(&version)
                         && let Ok(value) = result
@@ -1087,6 +1149,7 @@ impl Editor {
                 self.lsp_ready.remove(&server);
                 self.lsp_spawned.remove(&server);
                 self.lsp_incremental_sync.remove(&server);
+                self.lsp_hover_capable.remove(&server);
                 if let Some(language) = self
                     .lsp_servers
                     .iter()
@@ -1098,6 +1161,21 @@ impl Editor {
                             .is_none_or(|document| document.language.as_deref() != Some(&language))
                     });
                     self.semantic_ready_versions.retain(|doc, _| {
+                        self.documents
+                            .get(doc)
+                            .is_none_or(|document| document.language.as_deref() != Some(&language))
+                    });
+                    self.hover_ready_documents.retain(|doc| {
+                        self.documents
+                            .get(doc)
+                            .is_none_or(|document| document.language.as_deref() != Some(&language))
+                    });
+                    self.hover_probe_successes.retain(|doc, _| {
+                        self.documents
+                            .get(doc)
+                            .is_none_or(|document| document.language.as_deref() != Some(&language))
+                    });
+                    self.hover_probe_attempts.retain(|doc, _| {
                         self.documents
                             .get(doc)
                             .is_none_or(|document| document.language.as_deref() != Some(&language))
@@ -1148,6 +1226,11 @@ impl Editor {
                     && matches!(self.focus, Focus::Editor(_))
                 {
                     effects.extend(self.request_completion(false));
+                }
+            }
+            LspEvent::HoverProbeDue { doc } => {
+                if !self.hover_ready_documents.contains(&doc) {
+                    effects.extend(self.request_hover_probe(doc));
                 }
             }
         }
@@ -1262,9 +1345,6 @@ impl Editor {
         self.pending_lsp
             .retain(|_, pending| !matches!(pending, PendingLsp::Hover { .. }));
         self.hover = None;
-        let Some((server, path, line, character)) = self.active_lsp_context_at(index) else {
-            return Vec::new();
-        };
         let Some(doc) = self
             .layout
             .active_editor(self.focus)
@@ -1272,6 +1352,24 @@ impl Editor {
         else {
             return Vec::new();
         };
+        let Some((server, path, line, character)) = self.active_lsp_context_at(index) else {
+            let has_lsp = self
+                .documents
+                .get(&doc)
+                .and_then(|document| document.language.as_deref())
+                .and_then(|language| {
+                    self.config
+                        .language
+                        .iter()
+                        .find(|config| config.name == language)
+                })
+                .is_some_and(|config| config.lsp.is_some());
+            if has_lsp {
+                self.deferred_hover = Some((doc, index));
+            }
+            return Vec::new();
+        };
+        self.deferred_hover = None;
         let id = self.next_lsp_request;
         self.next_lsp_request += 1;
         self.pending_lsp.insert(id, PendingLsp::Hover { doc, line });
@@ -1285,6 +1383,32 @@ impl Editor {
             })
             .to_string(),
         }]
+    }
+
+    fn retry_deferred_hover(&mut self) -> Vec<Effect> {
+        let Some((doc, index)) = self.deferred_hover else {
+            return Vec::new();
+        };
+        let active = self
+            .layout
+            .active_editor(self.focus)
+            .map(|pane| pane.view.doc);
+        if active != Some(doc) {
+            return Vec::new();
+        }
+        let ready = self
+            .documents
+            .get(&doc)
+            .and_then(|document| document.language.as_ref())
+            .and_then(|language| self.lsp_servers.get(language))
+            .is_some_and(|server| {
+                self.lsp_ready.contains(server) && self.lsp_opened_documents.contains(&doc)
+            });
+        if !ready {
+            return Vec::new();
+        }
+        self.deferred_hover = None;
+        self.request_hover_at(index)
     }
 
     fn request_formatting(&mut self) -> Vec<Effect> {
@@ -1424,7 +1548,7 @@ impl Editor {
         self.next_lsp_request += 1;
         self.pending_lsp
             .insert(request, PendingLsp::SemanticTokens { doc, version: 1 });
-        vec![
+        let mut effects = vec![
             Effect::LspSend {
                 server,
                 message: serde_json::json!({
@@ -1450,7 +1574,73 @@ impl Editor {
                 })
                 .to_string(),
             },
-        ]
+        ];
+        effects.extend(self.request_hover_probe(doc));
+        effects
+    }
+
+    fn request_hover_probe(&mut self, doc: DocumentId) -> Vec<Effect> {
+        if self.hover_ready_documents.contains(&doc)
+            || self.pending_lsp.values().any(
+                |pending| matches!(pending, PendingLsp::HoverProbe { doc: pending } if *pending == doc),
+            )
+        {
+            return Vec::new();
+        }
+        let Some((server, path, candidate)) = self.documents.get(&doc).and_then(|document| {
+            let language = document.language.as_ref()?;
+            let editable = document.editable_opt()?;
+            let attempt = self.hover_probe_attempts.get(&doc).copied().unwrap_or(0);
+            let candidate = sampled_hover_probe_indices(editable.text(), 12)
+                .get(attempt)
+                .copied()
+                .map(|index| {
+                    let (line, char_col) =
+                        crate::position::char_idx_to_line_col(editable.text(), index);
+                    let character = editable
+                        .text()
+                        .line(line)
+                        .chars()
+                        .take(char_col)
+                        .map(char::len_utf16)
+                        .sum::<usize>();
+                    (line, character)
+                });
+            Some((
+                *self.lsp_servers.get(language)?,
+                document.path.clone()?,
+                candidate,
+            ))
+        }) else {
+            return Vec::new();
+        };
+        if !self.lsp_ready.contains(&server)
+            || !self.lsp_hover_capable.contains(&server)
+            || !self.lsp_opened_documents.contains(&doc)
+        {
+            return Vec::new();
+        }
+        let Some((line, character)) = candidate else {
+            if self.hover_probe_successes.get(&doc).copied().unwrap_or(0) > 0 {
+                self.hover_ready_documents.insert(doc);
+                self.dirty = true;
+            }
+            return Vec::new();
+        };
+        let request = self.next_lsp_request;
+        self.next_lsp_request += 1;
+        self.pending_lsp
+            .insert(request, PendingLsp::HoverProbe { doc });
+        vec![Effect::LspRequest {
+            server,
+            id: request,
+            method: "textDocument/hover".to_owned(),
+            params: serde_json::json!({
+                "textDocument": {"uri": format!("file://{}", path.display())},
+                "position": {"line": line, "character": character}
+            })
+            .to_string(),
+        }]
     }
 
     fn request_semantic_tokens(&mut self, doc: DocumentId, version: i32) -> Vec<Effect> {
@@ -1667,6 +1857,7 @@ impl Editor {
         }
         match command {
             Command::InsertNewline => {
+                let (tab_size, insert_spaces) = self.active_indentation_settings();
                 let line_comment = self
                     .layout
                     .active_editor(self.focus)
@@ -1680,9 +1871,12 @@ impl Editor {
                     })
                     .and_then(|config| config.line_comment.clone());
                 self.edit_active(|document, view| {
-                    document
-                        .editable_mut()
-                        .insert_newline(&mut view.selections, line_comment.as_deref());
+                    document.editable_mut().insert_newline(
+                        &mut view.selections,
+                        line_comment.as_deref(),
+                        tab_size,
+                        insert_spaces,
+                    );
                 });
             }
             Command::DeleteBackward => self.edit_active(|document, view| {
@@ -1703,6 +1897,7 @@ impl Editor {
             Command::AddCursor { direction } => self.add_cursor(direction),
             Command::SelectNextOccurrence => self.select_next_occurrence(),
             Command::Copy => return self.copy_active(true),
+            Command::CopyShellSelection => return self.copy_shell_selection(true),
             Command::Cut => {
                 let effects = self.copy_active(true);
                 if !effects.is_empty() {
@@ -1885,6 +2080,7 @@ impl Editor {
                     view: editor.view.clone(),
                 });
                 self.focus = Focus::Editor(Side::Left);
+                self.terminal_selection = None;
                 self.dirty = true;
                 Vec::new()
             }
@@ -1900,6 +2096,10 @@ impl Editor {
                     editor: EditorPane { view },
                 };
                 self.focus = Focus::Shell;
+                self.hover = None;
+                self.deferred_hover = None;
+                self.pending_lsp
+                    .retain(|_, pending| !matches!(pending, PendingLsp::Hover { .. }));
                 self.dirty = true;
                 if self.terminal.is_some() {
                     return Vec::new();
@@ -1986,6 +2186,12 @@ impl Editor {
         self.documents.remove(&id);
         self.lsp_opened_documents.remove(&id);
         self.semantic_ready_versions.remove(&id);
+        self.hover_ready_documents.remove(&id);
+        self.hover_probe_successes.remove(&id);
+        self.hover_probe_attempts.remove(&id);
+        if self.deferred_hover.is_some_and(|(doc, _)| doc == id) {
+            self.deferred_hover = None;
+        }
         self.document_versions.remove(&id);
         self.pending_self_disk_updates.remove(&id);
         if let Some(next) = self.documents.keys().next().copied() {
@@ -2105,11 +2311,13 @@ impl Editor {
     }
 
     fn apply_terminal(&mut self, event: TerminalEvent) {
+        let mut dirty = true;
         match event {
             TerminalEvent::Output(bytes) => {
                 if let Some(parser) = &mut self.terminal {
                     parser.process(&bytes);
                 }
+                dirty = self.terminal_selection.is_none();
             }
             TerminalEvent::Exited(error) => {
                 if let Layout::EditorAndShell { editor } = &self.layout {
@@ -2119,10 +2327,11 @@ impl Editor {
                 }
                 self.focus = Focus::Editor(Side::Left);
                 self.terminal = None;
+                self.terminal_selection = None;
                 self.status = error;
             }
         }
-        self.dirty = true;
+        self.dirty |= dirty;
     }
 
     fn save_active(&mut self) -> Vec<Effect> {
@@ -2342,6 +2551,44 @@ impl Editor {
         vec![Effect::ClipboardOsc52(self.clipboard.osc52_text())]
     }
 
+    fn copy_shell_selection(&self, send_interrupt_if_empty: bool) -> Vec<Effect> {
+        let Some(selection) = &self.terminal_selection else {
+            return if self.focus == Focus::Shell && send_interrupt_if_empty {
+                vec![Effect::TerminalInput(vec![3])]
+            } else {
+                Vec::new()
+            };
+        };
+        if selection.anchor == selection.head {
+            return Vec::new();
+        }
+        let (start, end) = ordered_terminal_points(selection.anchor, selection.head);
+        let (_, cols) = selection.snapshot.size();
+        let text = selection.snapshot.contents_between(
+            start.0,
+            start.1,
+            end.0,
+            end.1.saturating_add(1).min(cols),
+        );
+        (!text.is_empty())
+            .then_some(Effect::ClipboardOsc52(text))
+            .into_iter()
+            .collect()
+    }
+
+    fn terminal_mouse_position(&self, column: u16, row: u16) -> Option<(u16, u16)> {
+        if !matches!(self.layout, Layout::EditorAndShell { .. }) {
+            return None;
+        }
+        let start = split_left_width(self.terminal_size.0).saturating_add(1);
+        let screen = self.terminal.as_ref()?.screen();
+        let (rows, cols) = screen.size();
+        if column < start || row >= rows || cols == 0 {
+            return None;
+        }
+        Some((row, column.saturating_sub(start).min(cols - 1)))
+    }
+
     fn apply_mouse(&mut self, input: MouseInput) {
         let mouse = input.event;
         match mouse.kind {
@@ -2374,10 +2621,26 @@ impl Editor {
                     }
                     Layout::EditorAndShell { .. } if right_half => {
                         self.focus = Focus::Shell;
+                        self.hover = None;
+                        self.deferred_hover = None;
+                        self.pending_lsp
+                            .retain(|_, pending| !matches!(pending, PendingLsp::Hover { .. }));
+                        if let Some(point) = self.terminal_mouse_position(mouse.column, mouse.row)
+                            && let Some(parser) = &self.terminal
+                        {
+                            self.terminal_selection = Some(TerminalSelection {
+                                anchor: point,
+                                head: point,
+                                snapshot: parser.screen().clone(),
+                            });
+                        }
                         self.dirty = true;
                         return;
                     }
-                    Layout::EditorAndShell { .. } => self.focus = Focus::Editor(Side::Left),
+                    Layout::EditorAndShell { .. } => {
+                        self.focus = Focus::Editor(Side::Left);
+                        self.terminal_selection = None;
+                    }
                     Layout::EditorFull(_) => {}
                 }
                 let Some(index) = self.mouse_position(mouse.column, mouse.row) else {
@@ -2427,6 +2690,15 @@ impl Editor {
                 self.dirty = true;
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if self.focus == Focus::Shell {
+                    if let Some(point) = self.terminal_mouse_position(mouse.column, mouse.row)
+                        && let Some(selection) = &mut self.terminal_selection
+                    {
+                        selection.head = point;
+                        self.dirty = true;
+                    }
+                    return;
+                }
                 let Some(anchor) = self.drag_anchor else {
                     return;
                 };
@@ -2440,7 +2712,18 @@ impl Editor {
                 self.ensure_cursor_visible();
                 self.dirty = true;
             }
-            MouseEventKind::Up(MouseButton::Left) => self.drag_anchor = None,
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.drag_anchor = None;
+                if self.focus == Focus::Shell
+                    && self
+                        .terminal_selection
+                        .as_ref()
+                        .is_some_and(|selection| selection.anchor == selection.head)
+                {
+                    self.terminal_selection = None;
+                    self.dirty = true;
+                }
+            }
             _ => {}
         }
     }
@@ -3182,12 +3465,16 @@ impl Editor {
         }
         let current_version = self.document_versions.get(&doc).copied().unwrap_or(1);
         match self.semantic_ready_versions.get(&doc).copied() {
-            None => format!("<lsp> {language}: coloring"),
+            None => return format!("<lsp> {language}: coloring"),
             Some(version) if version < current_version => {
-                format!("<lsp> {language}: updating")
+                return format!("<lsp> {language}: updating");
             }
-            Some(_) => format!("<lsp> {language}: ready"),
+            Some(_) => {}
         }
+        if !self.hover_ready_documents.contains(&doc) {
+            return format!("<lsp> {language}: checking hover");
+        }
+        format!("<lsp> {language}: ready")
     }
 
     fn candidate_label(&self, candidate: &PickerCandidate) -> String {
@@ -3910,6 +4197,9 @@ enum PendingLsp {
         doc: DocumentId,
         line: usize,
     },
+    HoverProbe {
+        doc: DocumentId,
+    },
     SemanticTokens {
         doc: DocumentId,
         version: i32,
@@ -3936,6 +4226,81 @@ fn split_right_width(total: u16) -> u16 {
     total
         .saturating_sub(split_left_width(total))
         .saturating_sub(1)
+}
+
+#[derive(Clone, Debug)]
+struct TerminalSelection {
+    anchor: (u16, u16),
+    head: (u16, u16),
+    snapshot: vt100::Screen,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalSelectionView {
+    pub start: (u16, u16),
+    pub end: (u16, u16),
+}
+
+fn ordered_terminal_points(first: (u16, u16), second: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+fn next_hover_probe_index(text: &Rope, from: usize) -> Option<(CharIdx, usize)> {
+    const KEYWORDS: &[&str] = &[
+        "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
+        "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
+        "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait",
+        "true", "type", "unsafe", "use", "where", "while",
+    ];
+    let len = text.len_chars();
+    let mut index = from.min(len);
+    if index > 0 && index < len && is_word(text.char(index - 1)) {
+        while index < len && is_word(text.char(index)) {
+            index += 1;
+        }
+    }
+    while index < len {
+        while index < len && !is_word(text.char(index)) {
+            index += 1;
+        }
+        let start = index;
+        while index < len && is_word(text.char(index)) {
+            index += 1;
+        }
+        if start == index {
+            break;
+        }
+        let word = text.slice(start..index).to_string();
+        if word
+            .chars()
+            .next()
+            .is_some_and(|character| character == '_' || character.is_alphabetic())
+            && !KEYWORDS.contains(&word.as_str())
+        {
+            return Some((CharIdx(start), index));
+        }
+    }
+    None
+}
+
+fn sampled_hover_probe_indices(text: &Rope, limit: usize) -> Vec<CharIdx> {
+    if limit == 0 || text.len_chars() == 0 {
+        return Vec::new();
+    }
+    let mut indices = Vec::with_capacity(limit);
+    for segment in 0..limit {
+        let from = text.len_chars().saturating_mul(segment) / limit;
+        if let Some((index, _)) = next_hover_probe_index(text, from)
+            && indices.last() != Some(&index)
+        {
+            indices.push(index);
+        }
+    }
+    indices
 }
 
 fn marked_string(marked: lsp_types::MarkedString) -> String {
@@ -4022,10 +4387,12 @@ mod tests {
         editor.config.editor.shell = Some("/configured/shell".to_owned());
         editor.update(AppEvent::TextPaste("visible".to_owned()));
         editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+        editor.hover = Some("old hover".to_owned());
 
         let effects = editor.update(Command::ToggleShell.into());
 
         assert!(editor.shell_focused());
+        assert!(editor.hover_view().is_none());
         assert_eq!(editor.active_buffer().unwrap().text.to_string(), "visible");
         assert!(matches!(
             effects.as_slice(),
@@ -4045,6 +4412,66 @@ mod tests {
         assert!(!editor.shell_visible());
         assert!(editor.terminal.is_none());
         assert_eq!(editor.status(), None);
+    }
+
+    #[test]
+    fn shell_drag_selection_copies_a_stable_snapshot_and_clears_hover() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 20, rows: 6 });
+        editor.update(Command::ToggleShell.into());
+        editor.update(AppEvent::Terminal(TerminalEvent::Output(b"hello".to_vec())));
+        editor.hover = Some("old hover".to_owned());
+
+        let mouse = |kind, column| {
+            AppEvent::Mouse(MouseInput {
+                event: MouseEvent {
+                    kind,
+                    column,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                clicks: 1,
+            })
+        };
+        editor.update(mouse(MouseEventKind::Down(MouseButton::Left), 11));
+        editor.update(mouse(MouseEventKind::Drag(MouseButton::Left), 15));
+        let effects = editor.update(mouse(MouseEventKind::Up(MouseButton::Left), 15));
+
+        assert_eq!(effects, vec![Effect::ClipboardOsc52("hello".to_owned())]);
+        assert_eq!(
+            editor.terminal_selection_view(),
+            Some(TerminalSelectionView {
+                start: (0, 0),
+                end: (0, 4),
+            })
+        );
+        assert!(editor.hover.is_none());
+
+        editor.update(AppEvent::Terminal(TerminalEvent::Output(
+            b"\rXXXXX".to_vec(),
+        )));
+        assert!(
+            editor
+                .terminal_screen()
+                .unwrap()
+                .contents()
+                .contains("hello")
+        );
+
+        editor.update(AppEvent::TerminalInput(b"x".to_vec()));
+        assert!(editor.terminal_selection.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_without_a_shell_selection_still_sends_interrupt() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 20, rows: 6 });
+        editor.update(Command::ToggleShell.into());
+
+        assert_eq!(
+            editor.update(Command::CopyShellSelection.into()),
+            vec![Effect::TerminalInput(vec![3])]
+        );
     }
 
     #[test]
@@ -4290,6 +4717,43 @@ mod tests {
             effects.as_slice(),
             [Effect::LspRequest { method, .. }] if method == "textDocument/hover"
         ));
+    }
+
+    #[test]
+    fn click_before_lsp_open_is_deferred_and_sent_when_hover_becomes_available() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::TextPaste("value".to_owned()));
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+        let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
+        document.path = Some(PathBuf::from("/tmp/deferred-hover.rs"));
+        document.language = Some("rust".to_owned());
+        editor.lsp_servers.insert("rust".to_owned(), 1);
+
+        let effects = editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 6,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(editor.deferred_hover, Some((DocumentId(0), CharIdx(1))));
+
+        let effects = editor.update(AppEvent::Lsp(LspEvent::Initialized {
+            server: 1,
+            incremental_sync: true,
+            hover_provider: true,
+        }));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::LspRequest { id, method, .. }
+                if method == "textDocument/hover"
+                    && matches!(editor.pending_lsp.get(id), Some(PendingLsp::Hover { .. }))
+        )));
+        assert!(editor.deferred_hover.is_none());
     }
 
     #[test]
@@ -4922,6 +5386,7 @@ mod tests {
         editor.update(AppEvent::Lsp(LspEvent::Initialized {
             server: 1,
             incremental_sync: true,
+            hover_provider: true,
         }));
 
         editor.open_paths([PathBuf::from("/tmp/second.rs")]);
@@ -4963,6 +5428,11 @@ mod tests {
     fn status_reports_language_and_lsp_lifecycle() {
         let mut editor = Editor::default();
         editor.open_paths([PathBuf::from("main.rs")]);
+        editor
+            .documents
+            .get_mut(&DocumentId(1))
+            .unwrap()
+            .load_text("fn main() { let alpha = beta; gamma(delta); epsilon(); }");
         editor.update(AppEvent::ConfigLoaded(Ok(Config::default())));
         assert_eq!(
             editor.active_buffer().unwrap().language_status,
@@ -4981,6 +5451,7 @@ mod tests {
         let effects = editor.update(AppEvent::Lsp(LspEvent::Initialized {
             server: 1,
             incremental_sync: true,
+            hover_provider: true,
         }));
         assert_eq!(
             editor.active_buffer().unwrap().language_status,
@@ -4998,10 +5469,62 @@ mod tests {
                 _ => None,
             })
             .unwrap();
+        let hover_probe = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::LspRequest { id, method, .. } if method == "textDocument/hover" => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .unwrap();
         editor.update(AppEvent::Lsp(LspEvent::Response {
             id: semantic_request,
             result: Ok(serde_json::json!({"data": [0, 0, 1, 0, 0]})),
         }));
+        assert_eq!(
+            editor.active_buffer().unwrap().language_status,
+            "<lsp> rust: checking hover"
+        );
+        let mut probe_effects = editor.update(AppEvent::Lsp(LspEvent::Response {
+            id: hover_probe,
+            result: Ok(serde_json::json!({
+                "contents": {"kind": "markdown", "value": "fn main()"}
+            })),
+        }));
+        assert_eq!(
+            editor.active_buffer().unwrap().language_status,
+            "<lsp> rust: checking hover"
+        );
+        for _ in 0..20 {
+            if editor.active_buffer().unwrap().language_status == "<lsp> rust: ready" {
+                break;
+            }
+            assert!(probe_effects.iter().any(|effect| matches!(
+                effect,
+                Effect::ScheduleHoverProbe {
+                    doc: DocumentId(1),
+                    ..
+                }
+            )));
+            let request_effects = editor.update(AppEvent::Lsp(LspEvent::HoverProbeDue {
+                doc: DocumentId(1),
+            }));
+            let Some(request) = request_effects.iter().find_map(|effect| match effect {
+                Effect::LspRequest { id, method, .. } if method == "textDocument/hover" => {
+                    Some(*id)
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            probe_effects = editor.update(AppEvent::Lsp(LspEvent::Response {
+                id: request,
+                result: Ok(serde_json::json!({
+                    "contents": {"kind": "markdown", "value": "hover"}
+                })),
+            }));
+        }
         assert_eq!(
             editor.active_buffer().unwrap().language_status,
             "<lsp> rust: ready"
@@ -5230,6 +5753,40 @@ mod tests {
         let buffer = editor.active_buffer().unwrap();
         assert_eq!(buffer.text.to_string(), "a   b");
         assert_eq!(buffer.view.selections.primary().head, CharIdx(4));
+    }
+
+    #[test]
+    fn tab_then_newline_has_exactly_one_newline_and_no_tab_in_space_mode() {
+        let mut editor = Editor::default();
+        editor.documents.get_mut(&DocumentId(0)).unwrap().language = Some("rust".to_owned());
+
+        editor.update(Command::Indent.into());
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "    ");
+        assert_eq!(
+            editor
+                .active_buffer()
+                .unwrap()
+                .view
+                .selections
+                .primary()
+                .head,
+            CharIdx(4)
+        );
+
+        editor.update(Command::InsertNewline.into());
+
+        let buffer = editor.active_buffer().unwrap();
+        assert_eq!(buffer.text.to_string(), "    \n    ");
+        assert_eq!(
+            buffer
+                .text
+                .chars()
+                .filter(|character| *character == '\n')
+                .count(),
+            1
+        );
+        assert!(!buffer.text.to_string().contains('\t'));
+        assert_eq!(buffer.view.selections.primary().head, CharIdx(9));
     }
 
     #[test]

@@ -10,11 +10,103 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode,
     },
 };
-use ratatui::{Frame, Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Frame, Terminal,
+    backend::{Backend, ClearType, CrosstermBackend, WindowSize},
+    buffer::Cell,
+    layout::{Position, Size},
+};
 
 use crate::Result;
 
-pub type Tui = Terminal<CrosstermBackend<Stdout>>;
+pub type Tui = Terminal<StableCrosstermBackend>;
+
+pub struct StableCrosstermBackend {
+    inner: CrosstermBackend<Stdout>,
+    bottom_up: bool,
+    show_cursor_on_flush: bool,
+}
+
+impl StableCrosstermBackend {
+    fn new(stdout: Stdout) -> Self {
+        Self {
+            inner: CrosstermBackend::new(stdout),
+            bottom_up: false,
+            show_cursor_on_flush: false,
+        }
+    }
+}
+
+impl Write for StableCrosstermBackend {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Write::flush(&mut self.inner)
+    }
+}
+
+impl Backend for StableCrosstermBackend {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        let mut updates = content.collect::<Vec<_>>();
+        if self.bottom_up {
+            updates.sort_by_key(|(x, y, _)| (std::cmp::Reverse(*y), *x));
+        }
+        self.inner.draw(updates.into_iter())
+    }
+
+    fn append_lines(&mut self, count: u16) -> io::Result<()> {
+        self.inner.append_lines(count)
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.show_cursor_on_flush = false;
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        // ratatui calls show_cursor before set_cursor_position. Deferring the show
+        // avoids exposing the cursor at the final diff cell for one terminal paint.
+        self.show_cursor_on_flush = true;
+        Ok(())
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.show_cursor_on_flush {
+            self.inner.show_cursor()?;
+            self.show_cursor_on_flush = false;
+        }
+        Backend::flush(&mut self.inner)
+    }
+}
 
 pub struct TerminalSession {
     terminal: Tui,
@@ -35,7 +127,7 @@ impl TerminalSession {
             return Err(error.into());
         }
 
-        match Terminal::new(CrosstermBackend::new(stdout)) {
+        match Terminal::new(StableCrosstermBackend::new(stdout)) {
             Ok(terminal) => Ok(Self { terminal }),
             Err(error) => {
                 restore_terminal();
@@ -48,7 +140,8 @@ impl TerminalSession {
         &mut self.terminal
     }
 
-    pub fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> Result<()> {
+    pub fn draw(&mut self, bottom_up: bool, render: impl FnOnce(&mut Frame<'_>)) -> Result<()> {
+        self.terminal.backend_mut().bottom_up = bottom_up;
         let draw_result = self
             .terminal
             .try_draw(|frame| {
@@ -68,7 +161,7 @@ impl TerminalSession {
     pub fn copy_osc52(&mut self, text: &str) -> Result<()> {
         let encoded = STANDARD.encode(text.as_bytes());
         write!(self.terminal.backend_mut(), "\x1b]52;c;{encoded}\x07")?;
-        self.terminal.backend_mut().flush()?;
+        Write::flush(self.terminal.backend_mut())?;
         Ok(())
     }
 }

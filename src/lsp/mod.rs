@@ -32,6 +32,7 @@ pub enum LspEvent {
     Initialized {
         server: u64,
         incremental_sync: bool,
+        hover_provider: bool,
     },
     InitializationFailed {
         server: u64,
@@ -64,5 +65,8 @@ pub enum LspEvent {
     CompletionRefreshDue {
         doc: crate::document::DocumentId,
         version: i32,
+    },
+    HoverProbeDue {
+        doc: crate::document::DocumentId,
     },
 }

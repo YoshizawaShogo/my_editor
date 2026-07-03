@@ -35,7 +35,13 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
             draw_status(frame, areas[1], editor, &buffer);
         }
         if let Some(screen) = editor.terminal_screen() {
-            draw_terminal(frame, right, screen, editor.shell_focused());
+            draw_terminal(
+                frame,
+                right,
+                screen,
+                editor.shell_focused(),
+                editor.terminal_selection_view(),
+            );
         }
         draw_split_divider(frame, divider);
     } else if editor.show_start_page() {
@@ -149,11 +155,17 @@ fn draw_split_divider(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn draw_terminal(frame: &mut Frame<'_>, area: Rect, screen: &vt100::Screen, focused: bool) {
+fn draw_terminal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    screen: &vt100::Screen,
+    focused: bool,
+    selection: Option<crate::editor::TerminalSelectionView>,
+) {
     let (screen_rows, screen_cols) = screen.size();
     let rows = area.height.min(screen_rows);
     let cols = area.width.min(screen_cols);
-    let lines = terminal_lines(screen, rows, cols);
+    let lines = terminal_lines(screen, rows, cols, selection);
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().fg(FG).bg(Color::Rgb(0x12, 0x14, 0x1c))),
         area,
@@ -166,7 +178,12 @@ fn draw_terminal(frame: &mut Frame<'_>, area: Rect, screen: &vt100::Screen, focu
     }
 }
 
-fn terminal_lines(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<Line<'static>> {
+fn terminal_lines(
+    screen: &vt100::Screen,
+    rows: u16,
+    cols: u16,
+    selection: Option<crate::editor::TerminalSelectionView>,
+) -> Vec<Line<'static>> {
     (0..rows)
         .map(|row| {
             let mut spans = Vec::new();
@@ -179,7 +196,12 @@ fn terminal_lines(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<Line<'sta
                 if cell.is_wide_continuation() {
                     continue;
                 }
-                let style = terminal_style(cell);
+                let mut style = terminal_style(cell);
+                if selection.is_some_and(|selection| {
+                    (row, col) >= selection.start && (row, col) <= selection.end
+                }) {
+                    style = style.bg(SELECTION).add_modifier(Modifier::REVERSED);
+                }
                 if run_style.is_some_and(|current| current != style) {
                     spans.push(Span::styled(std::mem::take(&mut run), run_style.unwrap()));
                 }
@@ -1455,13 +1477,40 @@ mod tests {
         let mut parser = vt100::Parser::new(2, 10, 0);
         parser.process(b"\x1b[31;44;1mR\x1b[0mN");
 
-        let lines = terminal_lines(parser.screen(), 1, 10);
+        let lines = terminal_lines(parser.screen(), 1, 10, None);
         let colored = &lines[0].spans[0];
 
         assert_eq!(colored.content.as_ref(), "R");
         assert_eq!(colored.style.fg, Some(Color::Indexed(1)));
         assert_eq!(colored.style.bg, Some(Color::Indexed(4)));
         assert!(colored.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn terminal_selection_is_rendered_without_changing_its_text() {
+        let mut parser = vt100::Parser::new(2, 10, 0);
+        parser.process(b"hello");
+        let lines = terminal_lines(
+            parser.screen(),
+            1,
+            10,
+            Some(crate::editor::TerminalSelectionView {
+                start: (0, 1),
+                end: (0, 3),
+            }),
+        );
+
+        assert_eq!(
+            lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "hello     "
+        );
+        assert!(lines[0].spans.iter().any(|span| {
+            span.style.add_modifier.contains(Modifier::REVERSED) && span.content.contains("ell")
+        }));
     }
 
     #[test]

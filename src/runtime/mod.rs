@@ -40,6 +40,7 @@ pub struct Runtime {
     terminal: TerminalSession,
     lsp: std::collections::HashMap<u64, LspHandle>,
     shell: Option<ShellHandle>,
+    rendered_line_count: usize,
 }
 
 impl Runtime {
@@ -61,6 +62,7 @@ impl Runtime {
             terminal,
             lsp: std::collections::HashMap::new(),
             shell: None,
+            rendered_line_count: 1,
         }
     }
 
@@ -407,6 +409,13 @@ impl Runtime {
                     }));
                 });
             }
+            Effect::ScheduleHoverProbe { doc, delay_ms } => {
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    let _ = tx.send(AppEvent::Lsp(crate::lsp::LspEvent::HoverProbeDue { doc }));
+                });
+            }
             Effect::CheckDiskStates(files) => {
                 let tx = self.tx.clone();
                 tokio::task::spawn_blocking(move || {
@@ -529,9 +538,10 @@ impl Runtime {
                 match Message::read(&mut stdout) {
                     Ok(Some(Message::Response(response))) if response.id.to_string() == "0" => {
                         let event = match parse_initialize_response(response) {
-                            Ok(incremental_sync) => crate::lsp::LspEvent::Initialized {
+                            Ok(capabilities) => crate::lsp::LspEvent::Initialized {
                                 server,
-                                incremental_sync,
+                                incremental_sync: capabilities.incremental_sync,
+                                hover_provider: capabilities.hover_provider,
                             },
                             Err(error) => crate::lsp::LspEvent::InitializationFailed {
                                 server,
@@ -727,8 +737,16 @@ impl Runtime {
     }
 
     fn draw(&mut self) -> Result<()> {
+        let line_count = self
+            .editor
+            .active_buffer()
+            .map(|buffer| buffer.text.len_lines())
+            .unwrap_or(1);
+        let bottom_up = line_count > self.rendered_line_count;
         self.terminal
-            .draw(|frame| render::draw(frame, &self.editor))
+            .draw(bottom_up, |frame| render::draw(frame, &self.editor))?;
+        self.rendered_line_count = line_count;
+        Ok(())
     }
 }
 
@@ -801,7 +819,15 @@ fn handle_lsp_notification(
     }
 }
 
-fn parse_initialize_response(response: Response) -> std::result::Result<bool, String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InitializeCapabilities {
+    incremental_sync: bool,
+    hover_provider: bool,
+}
+
+fn parse_initialize_response(
+    response: Response,
+) -> std::result::Result<InitializeCapabilities, String> {
     if let Some(error) = response.error {
         return Err(format!("LSP initialize failed: {}", error.message));
     }
@@ -810,7 +836,7 @@ fn parse_initialize_response(response: Response) -> std::result::Result<bool, St
         .ok_or_else(|| "LSP initialize returned no result".to_owned())?;
     let result = serde_json::from_value::<lsp_types::InitializeResult>(value)
         .map_err(|error| format!("Invalid LSP initialize result: {error}"))?;
-    Ok(result
+    let incremental_sync = result
         .capabilities
         .text_document_sync
         .is_some_and(|sync| match sync {
@@ -820,7 +846,16 @@ fn parse_initialize_response(response: Response) -> std::result::Result<bool, St
             lsp_types::TextDocumentSyncCapability::Options(options) => {
                 options.change == Some(lsp_types::TextDocumentSyncKind::INCREMENTAL)
             }
-        }))
+        });
+    let hover_provider = matches!(
+        result.capabilities.hover_provider,
+        Some(lsp_types::HoverProviderCapability::Simple(true))
+            | Some(lsp_types::HoverProviderCapability::Options(_))
+    );
+    Ok(InitializeCapabilities {
+        incremental_sync,
+        hover_provider,
+    })
 }
 
 fn lsp_client_response(request: Request, root: &Path) -> Response {
@@ -1226,6 +1261,28 @@ mod tests {
         assert_eq!(
             parse_initialize_response(response),
             Err("LSP initialize failed: not ready".to_owned())
+        );
+    }
+
+    #[test]
+    fn initialize_capabilities_include_hover_support() {
+        let response = Response {
+            id: RequestId::from(0),
+            result: Some(serde_json::json!({
+                "capabilities": {
+                    "hoverProvider": true,
+                    "textDocumentSync": 2
+                }
+            })),
+            error: None,
+        };
+
+        assert_eq!(
+            parse_initialize_response(response),
+            Ok(InitializeCapabilities {
+                incremental_sync: true,
+                hover_provider: true,
+            })
         );
     }
 

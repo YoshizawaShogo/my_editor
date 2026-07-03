@@ -1,4 +1,5 @@
 use ropey::Rope;
+use std::sync::OnceLock;
 use tree_sitter::{
     InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
 };
@@ -65,7 +66,7 @@ impl IncrementalHighlighter {
         }
         self.tree = parser.parse(source, incremental.then_some(self.tree.as_ref()).flatten());
         self.spans = self.tree.as_ref().map_or_else(Vec::new, |tree| {
-            query_spans(&language, query_source, tree, source)
+            query_spans(&self.language_name, &language, query_source, tree, source)
         });
     }
 
@@ -85,21 +86,27 @@ pub fn highlight(language_name: &str, source: &str) -> Vec<HighlightSpan> {
     let Some(tree) = parser.parse(source, None) else {
         return Vec::new();
     };
-    query_spans(&language, query_source, &tree, source)
+    query_spans(language_name, &language, query_source, &tree, source)
+}
+
+pub fn warm_hover_highlighting() {
+    let _ = highlight("markdown", "Hover warmup");
+    let _ = highlight("rust", "fn hover_warmup() {}");
 }
 
 fn query_spans(
+    language_name: &str,
     language: &Language,
     query_source: &str,
     tree: &Tree,
     source: &str,
 ) -> Vec<HighlightSpan> {
-    let Ok(query) = Query::new(language, query_source) else {
+    let Some(query) = cached_query(language_name, language, query_source) else {
         return Vec::new();
     };
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
     let mut spans = Vec::new();
     while let Some(matched) = matches.next() {
         for capture in matched.captures {
@@ -112,6 +119,26 @@ fn query_spans(
     }
     spans.sort_by_key(|span| (span.start_byte, span.end_byte));
     spans
+}
+
+fn cached_query(
+    language_name: &str,
+    language: &Language,
+    query_source: &str,
+) -> Option<&'static Query> {
+    static JSON: OnceLock<Option<Query>> = OnceLock::new();
+    static TOML: OnceLock<Option<Query>> = OnceLock::new();
+    static MARKDOWN: OnceLock<Option<Query>> = OnceLock::new();
+    static RUST: OnceLock<Option<Query>> = OnceLock::new();
+    let slot = match language_name {
+        "json" => &JSON,
+        "toml" => &TOML,
+        "markdown" => &MARKDOWN,
+        "rust" => &RUST,
+        _ => return None,
+    };
+    slot.get_or_init(|| Query::new(language, query_source).ok())
+        .as_ref()
 }
 
 fn point_for_char(text: &Rope, index: usize) -> Point {

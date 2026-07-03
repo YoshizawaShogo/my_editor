@@ -100,6 +100,11 @@
 - 画面外バッジを診断`E`/`W`、git`M`/`A`へ分離した。行ガターはgit縦棒、error=`×`、warning=`▲`を維持した。
 - Shell focus中も描画用active bufferは左Editorを参照し、terminal起動時に左側が空になる問題を修正した。
 - 上記対応後は単体テスト105件、`cargo clippy --all-targets -- -D warnings`、`git diff --check`が成功した。
+- Hoverウォームアップを最初の非null応答1件で終了せず、文書全体を最大12区間に分けた識別子を全件事前照会するよう強化した。冒頭のローカルシンボルだけに偏らず、後方の標準ライブラリ・メソッド等のrust-analyzer経路も`ready`前に通す。
+- Tab→Enterの論理編集結果を固定する回帰テストを追加し、spaceモードでは余分な改行・実タブがバッファへ入らないことを確認した。継続インデントは言語設定に従ってspaceへ正規化し、Makefileの実タブ設定は維持する。
+- GNOME Terminalで一時的な二重改行・タブに見える中間描画を抑えるため、行挿入フレームの差分を下から上へ出力し、ratatuiのカーソル出力を「移動→表示」の順へ安定化した。
+- shellを`Ctrl+O`で表示した時点で既存Hover・保留Hover・処理中Hoverを破棄し、terminal focus中はHoverを表示しないようにした。
+- 上記対応後は単体テスト120件と`cargo check`が成功した。GNOME Terminal実機での描画確認を残している。
 - initializeエラーを成功扱いしていたLSP状態遷移を修正した。サーバ発の進捗登録・設定要求へ応答し、進捗をtoken別に追跡して、処理中に`ready`へ戻らないようにした。未準備中はHover要求を送らず、Hover単体の失敗は通常statusへ出さない。
 - 左右分割の中央に専用1セルの縦罫線を追加し、描画幅・PTY幅・マウス座標を境界列込みで補正した。右ペイン操作時のHoverは左ペイン内の分割線側へ寄せた。
 - 同期更新の開始をCPU側レンダリング完了後へ移し、端末の同期タイムアウトにより改行後の行シフト途中が一瞬露出する問題を修正した。
@@ -110,6 +115,12 @@
 - `editor.shell`をPTY起動へ接続し、未指定時だけ`$SHELL`/`/bin/sh`へフォールバックするようにした。`/home/shogo/.my_editor_rc.toml`には幅4・space入力・Makefile実タブ・Rust設定と`my_shell_using_crates` release binaryを明示した。
 - マルチカーソルの副カーソルをセル置換ではなく結合縦線の重ね描画へ変更し、カーソル位置の文字と隣接セルが消えないようにした。
 - 上記対応後は単体テスト114件、`cargo clippy --all-targets -- -D warnings`、`git diff --check`が成功した。
+- シェルペインのマウスドラッグ選択を追加した。選択開始時のvt100画面をスナップショットとして保持・反転表示し、後続PTY出力に影響されない文字列をドラッグ完了時にOSC52で端末側クリップボードへ送る。キー入力で選択を解除し、未選択時の`Ctrl+C`はSIGINTを維持する。
+- シェルクリック時にエディタHoverと保留Hoverを消すようにした。
+- LSPの`ready`条件へHover capabilityとDocument単位のHover成功を追加した。起動前クリックは最新位置を保留してdidOpen後に送信し、Hoverプローブ失敗中は`checking hover`のまま再試行する。
+- 上記対応後は単体テスト119件、`cargo clippy --all-targets -- -D warnings`、`git diff --check`が成功した。
+- 初回Hoverが重い原因を、`0:0`へのnullプローブではrust-analyzerの識別子Hover計算を温められないことと、Hover初回描画時にtree-sitter queryをコンパイルしていたことに特定した。プローブをキーワード以外の識別子へ順番に送り、非null内容が返るまで`checking hover`を維持するよう変更した。
+- Markdown/Rust等のtree-sitter highlight queryを`OnceLock`で共有し、設定読込時にHover用Markdown/Rust parseをウォームアップするようにした。
 - undo/redo履歴のディスク保存・復元を廃止し、バッファが開いている間だけメモリに保持する構成へ変更した。
 - 補完ポップアップの横位置を入力中の単語先頭へ固定し、1文字ごとの不要な横移動をなくした。
 - `Ctrl+O`は起動済みシェルを終了せず表示だけ切り替えるようにした。`exit`/`Ctrl+D`によるPTY終了時だけセッションを破棄してエディタへ戻し、通常終了メッセージは表示しない。
