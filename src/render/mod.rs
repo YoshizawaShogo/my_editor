@@ -11,7 +11,6 @@ use crate::{
     position::{char_idx_to_display_pos, display_col_after},
 };
 
-const TAB_SIZE: usize = 4;
 const BG: Color = Color::Rgb(0x16, 0x18, 0x21);
 const FG: Color = Color::Rgb(0xc6, 0xc8, 0xd1);
 const MUTED: Color = Color::Rgb(0x6b, 0x70, 0x89);
@@ -30,33 +29,29 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
 
     frame.render_widget(Block::default().style(Style::default().bg(BG)), areas[0]);
     if editor.shell_visible() {
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(areas[0]);
+        let (left, divider, right) = split_panes(areas[0]);
         if let Some(buffer) = editor.active_buffer() {
-            draw_buffer(frame, panes[0], &buffer, !editor.shell_focused());
+            draw_buffer(frame, left, &buffer, !editor.shell_focused());
             draw_status(frame, areas[1], editor, &buffer);
         }
         if let Some(screen) = editor.terminal_screen() {
-            draw_terminal(frame, panes[1], screen, editor.shell_focused());
+            draw_terminal(frame, right, screen, editor.shell_focused());
         }
+        draw_split_divider(frame, divider);
     } else if editor.show_start_page() {
         draw_start_page(frame, areas[0]);
         draw_status_text(frame, areas[1], editor.status().unwrap_or("Ready"));
     } else if let Some((left, right, true)) = editor.split_buffers() {
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(areas[0]);
+        let (left_area, divider, right_area) = split_panes(areas[0]);
         draw_diff(
             frame,
-            panes[0],
-            panes[1],
+            left_area,
+            right_area,
             &left,
             &right,
             editor.focused_side(),
         );
+        draw_split_divider(frame, divider);
         draw_status(
             frame,
             areas[1],
@@ -68,18 +63,21 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
             },
         );
     } else if let Some((left, right, false)) = editor.split_buffers() {
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(areas[0]);
+        let (left_area, divider, right_area) = split_panes(areas[0]);
         let focused = editor.focused_side();
-        draw_buffer(frame, panes[0], &left, focused == crate::editor::Side::Left);
         draw_buffer(
             frame,
-            panes[1],
+            left_area,
+            &left,
+            focused == crate::editor::Side::Left,
+        );
+        draw_buffer(
+            frame,
+            right_area,
             &right,
             focused == crate::editor::Side::Right,
         );
+        draw_split_divider(frame, divider);
         draw_status(
             frame,
             areas[1],
@@ -125,6 +123,30 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
     if let Some(hover) = editor.hover_view() {
         draw_hover(frame, editor, hover);
     }
+}
+
+fn split_panes(area: Rect) -> (Rect, Rect, Rect) {
+    let left_width = area.width / 2;
+    let divider_width = u16::from(area.width > 0);
+    let right_width = area
+        .width
+        .saturating_sub(left_width.saturating_add(divider_width));
+    let left = Rect::new(area.x, area.y, left_width, area.height);
+    let divider = Rect::new(area.x + left_width, area.y, divider_width, area.height);
+    let right = Rect::new(divider.x + divider_width, area.y, right_width, area.height);
+    (left, divider, right)
+}
+
+fn draw_split_divider(frame: &mut Frame<'_>, area: Rect) {
+    if area.width == 0 {
+        return;
+    }
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(MUTED).bg(BG)),
+        area,
+    );
 }
 
 fn draw_terminal(frame: &mut Frame<'_>, area: Rect, screen: &vt100::Screen, focused: bool) {
@@ -261,14 +283,11 @@ fn hover_popup_area(
     focused: crate::editor::Side,
 ) -> Rect {
     let target = if split {
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(viewport);
+        let (left, _, right) = split_panes(viewport);
         if focused == crate::editor::Side::Right {
-            panes[0]
+            left
         } else {
-            panes[1]
+            right
         }
     } else {
         viewport
@@ -277,7 +296,11 @@ fn hover_popup_area(
     let height = (line_count + 2).min(target.height.saturating_sub(1).max(1));
     Rect {
         x: if split {
-            (target.x + 1).min(target.right().saturating_sub(width))
+            if focused == crate::editor::Side::Right {
+                target.right().saturating_sub(width + 1).max(target.x)
+            } else {
+                (target.x + 1).min(target.right().saturating_sub(width))
+            }
         } else {
             target.right().saturating_sub(width + 2)
         },
@@ -463,20 +486,22 @@ fn completion_anchor_position(
     let buffer = editor.active_buffer()?;
     let mut pane = viewport;
     if editor.shell_visible() || editor.split_buffers().is_some() {
-        pane.width /= 2;
-        if editor.focused_side() == crate::editor::Side::Right {
-            pane.x += pane.width;
-        }
+        let (left, _, right) = split_panes(viewport);
+        pane = if editor.focused_side() == crate::editor::Side::Right {
+            right
+        } else {
+            left
+        };
     }
     let gutter_width = (buffer.text.len_lines().max(1).to_string().len().max(2) + 3)
         .min(usize::from(pane.width.saturating_sub(1)));
     let text_width = usize::from(pane.width.saturating_sub(gutter_width as u16)).max(1);
-    let cursor = char_idx_to_display_pos(buffer.text, anchor, TAB_SIZE);
+    let cursor = char_idx_to_display_pos(buffer.text, anchor, buffer.tab_size);
     if cursor.line < buffer.view.scroll.top_line {
         return None;
     }
     let visual_row = (buffer.view.scroll.top_line..cursor.line)
-        .map(|line| wrapped_line_rows(buffer.text, line, text_width))
+        .map(|line| wrapped_line_rows(buffer.text, line, text_width, buffer.tab_size))
         .sum::<usize>()
         + cursor.col / text_width;
     if visual_row < buffer.view.scroll.wrapped_row_offset {
@@ -804,10 +829,20 @@ fn draw_diff(
     let height = usize::from(left_area.height.min(right_area.height));
     let focused_line = match focused {
         crate::editor::Side::Left => {
-            char_idx_to_display_pos(left.text, left.view.selections.primary().head, TAB_SIZE).line
+            char_idx_to_display_pos(
+                left.text,
+                left.view.selections.primary().head,
+                left.tab_size,
+            )
+            .line
         }
         crate::editor::Side::Right => {
-            char_idx_to_display_pos(right.text, right.view.selections.primary().head, TAB_SIZE).line
+            char_idx_to_display_pos(
+                right.text,
+                right.view.selections.primary().head,
+                right.tab_size,
+            )
+            .line
         }
     };
     let cursor_row = rows.iter().position(|row| match focused {
@@ -849,8 +884,11 @@ fn draw_diff(
             crate::editor::Side::Left => (left_area, left),
             crate::editor::Side::Right => (right_area, right),
         };
-        let position =
-            char_idx_to_display_pos(buffer.text, buffer.view.selections.primary().head, TAB_SIZE);
+        let position = char_idx_to_display_pos(
+            buffer.text,
+            buffer.view.selections.primary().head,
+            buffer.tab_size,
+        );
         let column = 6usize.saturating_add(position.col);
         if column < usize::from(area.width) {
             frame.set_cursor_position((area.x + column as u16, area.y + (row - start) as u16));
@@ -1036,7 +1074,7 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
             if matches!(character, '\r' | '\n') {
                 break;
             }
-            let next_col = display_col_after(display_col, character, TAB_SIZE);
+            let next_col = display_col_after(display_col, character, buffer.tab_size);
             let rendered = if character == '\t' {
                 " ".repeat(next_col - display_col)
             } else {
@@ -1133,12 +1171,12 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
         .enumerate()
         .filter(|(index, _)| *index != buffer.view.selections.primary_index())
     {
-        let caret = char_idx_to_display_pos(buffer.text, selection.head, TAB_SIZE);
+        let caret = char_idx_to_display_pos(buffer.text, selection.head, buffer.tab_size);
         if caret.line < start {
             continue;
         }
         let rows_before = (start..caret.line)
-            .map(|line| wrapped_line_rows(buffer.text, line, text_width))
+            .map(|line| wrapped_line_rows(buffer.text, line, text_width, buffer.tab_size))
             .sum::<usize>();
         let absolute_row = rows_before + caret.col / text_width;
         if absolute_row < scroll_offset {
@@ -1152,7 +1190,8 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
                 .buffer_mut()
                 .cell_mut((text_area.x + col as u16, text_area.y + row as u16))
         {
-            cell.set_symbol("▏").set_fg(FG);
+            let symbol = format!("{}\u{20d2}", cell.symbol());
+            cell.set_symbol(&symbol).set_fg(FG);
         }
     }
 
@@ -1227,10 +1266,13 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
         below_added,
     );
 
-    let cursor =
-        char_idx_to_display_pos(buffer.text, buffer.view.selections.primary().head, TAB_SIZE);
+    let cursor = char_idx_to_display_pos(
+        buffer.text,
+        buffer.view.selections.primary().head,
+        buffer.tab_size,
+    );
     let rows_before = (start..cursor.line)
-        .map(|line| wrapped_line_rows(buffer.text, line, text_width))
+        .map(|line| wrapped_line_rows(buffer.text, line, text_width, buffer.tab_size))
         .sum::<usize>();
     let cursor_row = rows_before + cursor.col / text_width;
     let cursor_row = cursor_row.saturating_sub(buffer.view.scroll.wrapped_row_offset);
@@ -1256,13 +1298,13 @@ fn truncate_virtual_diagnostic(message: &str, available: usize) -> String {
     text
 }
 
-fn wrapped_line_rows(text: &ropey::Rope, line: usize, width: usize) -> usize {
+fn wrapped_line_rows(text: &ropey::Rope, line: usize, width: usize, tab_size: usize) -> usize {
     let display_width = text
         .line(line.min(text.len_lines().saturating_sub(1)))
         .chars()
         .take_while(|character| !matches!(character, '\r' | '\n'))
         .fold(0, |column, character| {
-            display_col_after(column, character, TAB_SIZE)
+            display_col_after(column, character, tab_size)
         });
     display_width.max(1).div_ceil(width.max(1))
 }
@@ -1483,6 +1525,7 @@ mod tests {
             modified: false,
             external_changed: false,
             language: Some("rust"),
+            tab_size: 4,
             language_status: "<lsp> rust: ready".to_owned(),
             diagnostics: &diagnostics,
             git_lines: &git_lines,
@@ -1569,8 +1612,8 @@ mod tests {
     fn long_logical_lines_count_as_multiple_soft_wrapped_rows() {
         let text = ropey::Rope::from_str("abcdefghij");
 
-        assert_eq!(wrapped_line_rows(&text, 0, 5), 2);
-        assert_eq!(wrapped_line_rows(&text, 0, 20), 1);
+        assert_eq!(wrapped_line_rows(&text, 0, 5, 4), 2);
+        assert_eq!(wrapped_line_rows(&text, 0, 20, 4), 1);
     }
 
     #[test]
@@ -1594,7 +1637,15 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut editor = Editor::default();
         editor.update(crate::editor::AppEvent::Resize { cols: 20, rows: 5 });
-        editor.update(crate::editor::AppEvent::TextPaste("a\nb".to_owned()));
+        editor.update(crate::editor::AppEvent::TextPaste("ab\ncd".to_owned()));
+        editor.update(
+            crate::editor::Command::Move {
+                direction: crate::editor::Direction::Left,
+                unit: crate::editor::Unit::Character,
+                extend: false,
+            }
+            .into(),
+        );
         editor.update(
             crate::editor::Command::AddCursor {
                 direction: crate::editor::VerticalDirection::Up,
@@ -1604,7 +1655,10 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &editor)).unwrap();
 
-        assert_eq!(terminal.backend().buffer()[(6, 1)].symbol(), "▏");
+        let buffer = terminal.backend().buffer();
+        assert!(buffer[(6, 1)].symbol().contains('d'));
+        assert!(buffer[(6, 1)].symbol().contains('\u{20d2}'));
+        assert_eq!(buffer[(7, 1)].symbol(), " ");
     }
 
     #[test]
@@ -1618,14 +1672,30 @@ mod tests {
     }
 
     #[test]
+    fn split_layout_reserves_a_visible_divider_column() {
+        let backend = TestBackend::new(21, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 21, rows: 5 });
+        editor.update(crate::editor::AppEvent::TextInput('x'));
+        editor.update(crate::editor::Command::ToggleSplit.into());
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!((0..4).all(|row| buffer[(10, row)].symbol() == "│"));
+    }
+
+    #[test]
     fn split_hover_is_rendered_in_the_opposite_editor_pane() {
-        let viewport = Rect::new(0, 0, 100, 20);
+        let viewport = Rect::new(0, 0, 180, 20);
 
         let from_right = hover_popup_area(viewport, 5, true, crate::editor::Side::Right);
-        assert!(from_right.right() <= 50);
+        assert!(from_right.right() <= 90);
+        assert!(from_right.x > 1);
 
         let from_left = hover_popup_area(viewport, 5, true, crate::editor::Side::Left);
-        assert!(from_left.x >= 50);
+        assert!(from_left.x > 90);
     }
 
     #[test]

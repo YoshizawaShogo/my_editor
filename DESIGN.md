@@ -225,7 +225,7 @@ enum Layout {
 - モード 2: 左エディタ＋右シェル（統合ターミナル、単一セッション）。
 - モード 3: 左右ともエディタ。
 - これ以外のレイアウトは考慮しない。
-- 分割の区切りは**罫線を引かず背景色差**で表す（アクティブ=`BG`／非アクティブ=`PANE_INACTIVE`。§9.3 の枠線なし原則）。
+- 左右分割では中央の1セルを専用の境界列として確保し、縦罫線`│`を描画する。左右ペインの本文・PTY・マウス座標はこの1セルを除いた幅で計算する。
 
 ### 4.5 History（線形 undo ＋グルーピング）
 
@@ -251,6 +251,7 @@ struct Change {
 
 - 連続入力・同種編集・短時間内は `pending` に coalesce し、区切り（カーソルジャンプ・別種操作・タイムアウト・保存）で確定して `past` へ。
 - 新規編集で `future` はクリア（分岐は持たない）。
+- `Ctrl+S`は履歴を消さず、その時点の内容ハッシュを保存タグとして更新し、連続入力グループだけを区切る。undo/redo後の内容ハッシュが保存タグと一致する時だけ「保存不要」と判定する。
 
 ### 4.5.1 undo 履歴の寿命
 
@@ -457,6 +458,7 @@ enum Effect {
 VSCode ライクの操作感に必要な最小の編集補助:
 
 - **オートインデント**: `Enter`でカーソル位置までの先頭空白を引き継ぐ。インデント途中で分割しても後半の既存空白を重複させない。現在行が言語設定の`line_comment`（`//`/`#`等）なら、同じインデント＋コメント記号＋空白を次行へ継続する。`///`/`//!`も維持する。
+- **Tab/Shift+Tab**: 選択がない場合、Tabは各カーソル位置へ`tab_size`個のspace（`insert_spaces=false`なら実タブ1文字）を挿入し、カーソルを挿入後へ進める。範囲選択中は対象行をまとめて行頭インデントする。Shift+Tabは各行に実在する先頭spaceを最大`tab_size`個、または先頭タブ1文字だけ削除し、文字本文へ食い込まないようクランプする。
 - **単語境界の定義**: 識別子文字（英数字 ＋ `_`）を 1 単語とする定義を `view/movement.rs` に一元化し、`Ctrl+←/→`（単語移動）・`Ctrl+D`（次の同一語）・ダブルクリック（単語選択）で共有する。
 - **括弧の対応ハイライト**: カーソル隣接の `()[]{}` に対応する括弧を探して両方を強調表示。
 - **マウス**（§7.3 に対応）: ダブルクリック＝単語選択、トリプルクリック＝行選択。
@@ -631,6 +633,7 @@ MVP の起動導線（§7.4 確定）:
 enum LspEvent {
     Spawned { server: ServerId },                       // プロセス起動（進捗: 起動中→初期化中）
     Initialized { server: ServerId, caps: ServerCapabilities },
+    InitializationFailed { server: ServerId, error: String },
     Progress { server: ServerId, token: ProgressToken, work: WorkDoneProgress }, // $/progress
     Diagnostics { uri: Url, diags: Vec<Diagnostic> },
     Response { id: RequestId, result: Result<Value, ResponseError> },
@@ -638,7 +641,9 @@ enum LspEvent {
 }
 ```
 
-`apply_lsp` はこれらを文書単位の`starting`/`initializing`/`opening`/`coloring`/`ready`/`updating`/`not found`/`error`へ変換する。`WorkDoneProgressBegin/Report`のtitle・message・percentageを`updating: ...`へ整形し、Endで消す。
+initialize応答にerrorがある場合や結果を解釈できない場合は`InitializationFailed`とし、`Initialized`にはしない。クライアントは`window/workDoneProgress/create`、`workspace/configuration`、capability登録などサーバ発の要求へ応答し、サーバを待機させない。
+
+`apply_lsp` はこれらを文書単位の`starting`/`initializing`/`opening`/`coloring`/`checking hover`/`ready`/`updating`/`not found`/`error`へ変換する。`ready`はinitialize・didOpen・semantic tokensに加え、対象Document内の識別子へ送ったHoverプローブが**実際のHover内容（非null）**を返した後だけ表示する。`0:0`へのnull応答は準備完了扱いにしない。冒頭のローカル識別子だけに偏らないよう文書全体を最大12区間に分け、各区間のキーワード以外の識別子へプローブを送り、全サンプルの確認完了までRust Analyzer内部のHover計算を温める。nullなら次候補、errorなら同候補を再試行する。起動直後のクリックは最新1件を保留し、didOpen後に自動送信する。1件も成功しない場合は`ready`を出さない。`WorkDoneProgressBegin/Report`のtitle・message・percentageを`updating: ...`へ整形し、Endで消す。進捗はtoken単位に保持し、別tokenのEndで処理中の進捗を消さない。
 
 ### 8.5 補完ポップアップの操作（`Overlay::Completion`）
 
@@ -718,7 +723,8 @@ const POPUP_BG:      Rgb = 0x1e2132;  // オーバーレイ/ポップアップ�
 ```
 
 - **枠線を使わない（重要な描画原則）**: box-drawing の罫線でペインやポップアップを囲わない。**領域は背景色の差**で表現する（囲み線に上下左右 2 マスを費やす無駄を省き、狭い SSH 端末で表示領域を最大化する）。
-  - **ペイン分割（§4.4）**: 分割の境界に区切り線を引かず、**アクティブ側＝`BG` / 非アクティブ側＝`PANE_INACTIVE`** の背景差で分ける。必要なら境界に 1 桁だけアクセント背景を置く程度に留める（2 桁の枠は作らない）。
+  - **ペイン分割（§4.4）**: 中央の1セルを境界列として`│`を描く。2桁以上の枠は作らない。
+  - **端末への反映**: ratatuiのCPU側フレーム構築を完了してから同期更新（DEC mode 2026）を開始し、差分出力直前からだけ画面更新を保留する。改行で行数が増えるフレームは下の行から差分を更新し、端末カーソルは移動後に表示する。同期更新を描画途中で反映するGNOME Terminalでも、行シフト途中や一時カーソルが二重改行・タブに見えない順序を維持する。
   - **オーバーレイ/ポップアップ（§4.6, 補完 §8.5, ホバー）**: 枠で囲わず `POPUP_BG` の塗りブロックとして浮かせる（影の代わりに背景差でレイヤを示す）。
   - **通知（§4.10）**: 独立popupを出さず、ステータスバーへ集約する。
   - **ステータスバー（§9.5）**: `STATUSBG` の 1 行帯。
@@ -750,7 +756,7 @@ TUI ではミニマップや overview ruler を作らない。代わりに「ビ
 
 - **エッジ手掛かり**: ビューポートの上端より上／下端より下に対象があれば、上端行の右側に `↑ …`、下端行の右側に `↓ …` のバッジを出す。0 件の種別は出さない。色は §9.3 に従う（error=`RED`、warning=`ORANGE`、git=`BLUE`、検索=アクセント）。
   - 例: 下に error2・warning1・git変更3・追加4 → `↓ E2 W1 M3 A4`。errorは赤、warningはオレンジ、modifiedは青、addedは緑。
-- **ステータスバー要約**: 色付きセグメントは「ワークスペース相対path＋未保存/外部変更」「言語とLSP状態（例 `<lsp> rust: updating`。非LSPは`<syntax> markdown`）」「Git状態（例 `<git> clean @main`）」「診断総数 `E:5 W:2`」に絞る。LSP状態は`starting`/`initializing`/`opening`/`coloring`/`ready`/`updating`/`not found`/`error`と進捗本文を区別する。行数・列数・割合は表示しない。
+- **ステータスバー要約**: 色付きセグメントは「ワークスペース相対path＋未保存/外部変更」「言語とLSP状態（例 `<lsp> rust: updating`。非LSPは`<syntax> markdown`）」「Git状態（例 `<git> clean @main`）」「診断総数 `E:5 W:2`」に絞る。LSP状態は`starting`/`initializing`/`opening`/`coloring`/`checking hover`/`ready`/`updating`/`not found`/`error`と進捗本文を区別する。行数・列数・割合は表示しない。
 - **長い行**: ペイン幅でsoft wrapするため、横方向の`»`/`«`は表示しない。
 - **算出**: `View.scroll` と表示高から、上/下それぞれの件数を集計する**純粋関数** `offscreen_cues(diagnostics, git_gutter, search_hits, scroll, height) -> OffscreenCues` にまとめてテストする。追加の `AppEvent`/`Effect` は不要（描画時に既存状態から計算）。
 
@@ -767,7 +773,8 @@ struct EdgeSummary { errors: usize, warnings: usize, git_changes: usize, search_
 
 - **ステータスバー**: カーソル行に診断があれば、最優先（error > warning）1 件のメッセージを 1 行で常時表示。ソースも添える（例 `⚠ unused variable \`a\` — rustc(unused_variables)`）。at-a-glance 用。
 - **行末virtual text**: 各論理行で最優先の診断を`› message`としてseverity色＋italicで描画する。Rope/Selectionには入れず、クリックやカーソル移動の対象にしない。
-- **ホバーtooltip（`Overlay::Hover`, §4.6）**: 通常クリックで入力カーソルを単一caretへ移した時に、**LSP hover情報＋その位置の全診断**を集約表示する（focusを奪わない）。左右エディタ分割中は操作中ペインと反対側（右操作中は左）へ表示してコードを隠さない。Markdownをtree-sitterで、Rustのコードフェンス・シグネチャ・例をRust文法で再着色する。MouseMovedや範囲選択中は要求せず、選択開始時は既存Hoverを閉じる。
+- **ホバーtooltip（`Overlay::Hover`, §4.6）**: 通常クリックで入力カーソルを単一caretへ移した時に、**LSP hover情報＋その位置の全診断**を集約表示する（focusを奪わない）。左右エディタ分割中は操作中ペインと反対側（右操作中は左）へ表示し、中央の分割線側へ寄せて操作位置との距離を抑える。Markdownをtree-sitterで、Rustのコードフェンス・シグネチャ・例をRust文法で再着色する。MouseMovedや範囲選択中は要求せず、選択開始時は既存Hoverを閉じる。Hover単体の要求失敗は通常statusへ出さず、表示を閉じる。
+- **初回コストの前倒し**: tree-sitterのMarkdown/Rust highlight queryは`OnceLock`で共有し、設定読込時に短いサンプルをparseして初回コンパイルを済ませる。LSP側も上記の識別子プローブで実Hover計算を`ready`前に実行する。
 - 波線下線の色は severity に対応（error=`RED` / warning=`ORANGE`, §9.3）。`Editable.diagnostics` が唯一の source（gutter・下線・ステータス・ホバーはすべてここから描画時に導出）。
 
 ## 10. クリップボード
@@ -800,9 +807,16 @@ extensions = ["toml"]
 line_comment = "#"               # コメントトグル用（§7.4）
 # lsp 無し → tree-sitter（toml文法）で着色
 
+[[language]]
+name = "make"
+filenames = ["Makefile", "makefile", "GNUmakefile"]
+tab_size = 4
+insert_spaces = false             # Make recipeでは実タブを入力
+
 [editor]
 tab_size = 4
 insert_spaces = true
+shell = "/path/to/shell"          # 省略時は $SHELL、さらに無ければ /bin/sh
 large_file_threshold = "10MiB"   # これを超えると less 相当の読み取り専用で開く（§4.2.1）
 
 [search]                          # Ctrl+F / Ctrl+H の Directory スコープ既定（§13）
@@ -820,12 +834,16 @@ struct Config {
 struct LanguageConfig {
     name: LanguageId,
     extensions: Vec<String>,
+    filenames: Vec<String>,        // Makefile等の拡張子なしファイルを完全一致判定
     lsp: Option<LspCommand>,       // Vec<String>: argv
     line_comment: Option<String>,  // コメントトグル記号。無ければバンドル既定値
+    tab_size: Option<usize>,       // 未指定ならEditorConfigを継承
+    insert_spaces: Option<bool>,   // 未指定ならEditorConfigを継承
 }
 struct EditorConfig {
     tab_size: usize,
     insert_spaces: bool,
+    shell: Option<String>,
     large_file_threshold: u64,     // バイト。既定 10 MiB（§4.2.1）
 }
 struct SearchConfig {              // SearchFilters（§13）の既定シード
@@ -835,7 +853,7 @@ struct SearchConfig {              // SearchFilters（§13）の既定シード
 }
 ```
 
-- 判定: 拡張子 → `LanguageId`。将来 shebang / ファイル名規則を足す余地は残すが v1 は拡張子のみ。
+- 判定: `filenames`の完全一致を確認し、次に拡張子から`LanguageId`を決める。将来shebang規則を足す余地を残す。
 - `line_comment` は `Ctrl+/` / `Ctrl+Q` のコメントトグルに使う。未指定ならバンドル言語の既定値。
 
 ### 11.3 workspace_root の決定
@@ -860,6 +878,8 @@ enum TerminalEvent { Output(Vec<u8>), Exited(ExitReason) }
 ```
 
 - **`Ctrl+O`**: シェル未起動なら起動してペインを表示する。起動済みならプロセスを終了せず、ペインの表示/非表示だけを切り替える。
+- **シェル文字選択**: シェルペインを左ドラッグすると、選択開始時のvt100画面をスナップショットとして固定し、選択範囲を反転表示する。ドラッグ完了時に選択文字列をOSC52で端末エミュレータのクリップボードへ送る。選択中もPTY出力は内部parserへ取り込むが表示とコピー元はスナップショットのままにし、後続出力で内容を変えない。キー入力時に選択を解除して最新画面へ戻る。選択中の`Ctrl+C`はコピー、選択がなければ従来どおりSIGINTを送る。
+- **Hoverとの排他**: `Ctrl+O`でシェルを表示した時点、およびシェルペインをクリックした時に、エディタ側Hoverと保留・処理中のHover要求を消す。terminal focus中はHoverを表示しない。
 - **シェル終了時**: 子シェルが`exit`または`Ctrl+D`で終了し、PTYから`TerminalEvent::Exited`を受けた時だけセッションを破棄してシェルペインを閉じる。終了した旨の通知は出さない。再度`Ctrl+O`で新しいシェルを起こせる。
 
 ## 13. 検索・走査
@@ -1101,7 +1121,7 @@ src/
 - **P0 ランタイム骨格**: event loop、`AppEvent`/`Effect`/`update` の空実装、描画スケルトン、終了処理、raw mode。
 - **P1 エディタコア**: Document/Rope、単一カーソルの移動・挿入・削除、スクロール、行番号描画、undo。
 - **P2 マルチカーソル＋基本マウス**: `Selections`、選択拡張、`Ctrl+D`/カーソル追加、コピー・カット・ペースト（内部＋OSC52）、**基本マウス（クリック/ドラッグ選択/ホイールスクロール/ダブル・トリプルクリック）**。マウスが操作の主役のため早期に入れる。
-- **P3 ファイル入出力**: open/save、行末保持、config 読込、言語判定、**undo 履歴の永続化（§4.5.1）**、**大容量ファイルの mmap ページング（§4.2.1）**。
+- **P3 ファイル入出力**: open/save、行末保持、config 読込、言語判定、**メモリ内undo履歴と保存タグ（§4.5.1）**、**大容量ファイルの mmap ページング（§4.2.1）**。
 - **P4 オーバーレイ基盤**: overlay 描画・focus、ピッカー（`Ctrl+T`/`Ctrl+G`/`F6`/`Ctrl+P`, ignore走査＋fuzzy＋パス直接オープン＋コマンド検索）、F6の左右diff表示、スタートページ（§4.12）。
 - **P5 検索**: バッファ内検索・置換、プロジェクト grep（grep クレート）。
 - **P6 tree-sitter ハイライト**: TOML/Markdown/JSON、増分パース。

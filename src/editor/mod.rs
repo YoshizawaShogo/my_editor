@@ -32,8 +32,6 @@ use crate::{
     view::{Selection, View, is_word, move_head},
 };
 
-const TAB_SIZE: usize = 4;
-
 pub struct Editor {
     documents: HashMap<DocumentId, Document>,
     next_doc_id: u64,
@@ -63,9 +61,12 @@ pub struct Editor {
     rename_input: Option<String>,
     confirm: Option<ConfirmState>,
     hover: Option<String>,
+    deferred_hover: Option<(DocumentId, CharIdx)>,
     pending_lsp_sync: HashSet<DocumentId>,
     document_versions: HashMap<DocumentId, i32>,
+    pending_self_disk_updates: HashMap<DocumentId, usize>,
     terminal: Option<vt100::Parser>,
+    terminal_selection: Option<TerminalSelection>,
     terminal_size: (u16, u16),
     status: Option<String>,
     notifications: Vec<Toast>,
@@ -109,9 +110,12 @@ impl Default for Editor {
             rename_input: None,
             confirm: None,
             hover: None,
+            deferred_hover: None,
             pending_lsp_sync: HashSet::new(),
             document_versions: HashMap::new(),
+            pending_self_disk_updates: HashMap::new(),
             terminal: None,
+            terminal_selection: None,
             terminal_size: (0, 0),
             status: None,
             notifications: Vec::new(),
@@ -167,7 +171,7 @@ impl Editor {
                 self.terminal_size = (cols, rows);
                 let mut effects = Vec::new();
                 if let Some(parser) = &mut self.terminal {
-                    let shell_cols = (cols / 2).max(1);
+                    let shell_cols = split_right_width(cols).max(1);
                     let shell_rows = rows.saturating_sub(1).max(1);
                     parser.set_size(shell_rows, shell_cols);
                     effects.push(Effect::TerminalResize {
@@ -180,11 +184,18 @@ impl Editor {
                 effects
             }
             AppEvent::Mouse(mouse) => {
+                let on_split_divider = matches!(
+                    self.layout,
+                    Layout::EditorAndEditor { .. } | Layout::EditorAndShell { .. }
+                ) && mouse.event.column
+                    == split_left_width(self.terminal_size.0);
                 let definition =
                     matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left))
-                        && mouse.event.modifiers.contains(KeyModifiers::CONTROL);
+                        && mouse.event.modifiers.contains(KeyModifiers::CONTROL)
+                        && !on_split_divider;
                 let hover = matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left))
-                    && !definition;
+                    && !definition
+                    && !on_split_divider;
                 self.apply_mouse(mouse);
                 if definition {
                     self.request_definition()
@@ -318,6 +329,10 @@ impl Editor {
             modified: editable.modified,
             external_changed: document.external_changed,
             language: document.language.as_deref(),
+            tab_size: self
+                .config
+                .indentation_for_language(document.language.as_deref())
+                .0,
             language_status: self.document_language_status(pane.view.doc, document),
             diagnostics: &editable.diagnostics,
             git_lines: &editable.git_lines,
@@ -405,6 +420,10 @@ impl Editor {
                 modified: left_document.modified,
                 external_changed: left_doc.external_changed,
                 language: None,
+                tab_size: self
+                    .config
+                    .indentation_for_language(left_doc.language.as_deref())
+                    .0,
                 language_status: self.document_language_status(left.view.doc, left_doc),
                 diagnostics: &left_document.diagnostics,
                 git_lines: &left_document.git_lines,
@@ -426,6 +445,10 @@ impl Editor {
                 modified: right_document.modified,
                 external_changed: right_doc.external_changed,
                 language: None,
+                tab_size: self
+                    .config
+                    .indentation_for_language(right_doc.language.as_deref())
+                    .0,
                 language_status: self.document_language_status(right.view.doc, right_doc),
                 diagnostics: &right_document.diagnostics,
                 git_lines: &right_document.git_lines,
@@ -680,6 +703,7 @@ impl Editor {
                             }
                         }
                     }
+                    *self.pending_self_disk_updates.entry(id).or_insert(0) += 1;
                 }
                 Err(error) => {
                     self.notify(ToastLevel::Error, error.clone());
@@ -724,12 +748,23 @@ impl Editor {
             },
             IoEvent::DiskStateObserved { id, result } => match result {
                 Ok(state) => {
+                    let self_saved =
+                        if let Some(count) = self.pending_self_disk_updates.get_mut(&id) {
+                            *count -= 1;
+                            let finished = *count == 0;
+                            if finished {
+                                self.pending_self_disk_updates.remove(&id);
+                            }
+                            true
+                        } else {
+                            false
+                        };
                     let Some(document) = self.documents.get_mut(&id) else {
                         return effects;
                     };
                     let changed = document.disk_state.is_some_and(|old| old != state);
                     document.disk_state = Some(state);
-                    if changed {
+                    if changed && !self_saved {
                         if document
                             .editable_opt()
                             .is_some_and(|editable| editable.modified)
@@ -845,11 +880,16 @@ impl Editor {
                     }
                 }
             }
-            LspEvent::Progress { server, message } => {
+            LspEvent::Progress {
+                server,
+                token,
+                message,
+            } => {
+                let key = format!("lsp:{server}:{token}");
                 if let Some(message) = message {
-                    self.set_progress(format!("lsp:{server}"), message);
+                    self.set_progress(key, message);
                 } else {
-                    self.finish_progress(&format!("lsp:{server}"));
+                    self.finish_progress(&key);
                 }
             }
             LspEvent::Response { id, result } => match self.pending_lsp.remove(&id) {
@@ -1023,7 +1063,7 @@ impl Editor {
                         }
                         self.hover = (!parts.is_empty()).then(|| parts.join("\n\n"));
                     }
-                    Err(error) => self.status = Some(format!("hoverに失敗: {error}")),
+                    Err(_) => self.hover = None,
                 },
                 Some(PendingLsp::SemanticTokens { doc, version }) => {
                     if self.document_versions.get(&doc) == Some(&version)
@@ -1036,8 +1076,11 @@ impl Editor {
                 }
                 None => {}
             },
-            LspEvent::Exited { server, error } => {
-                self.finish_progress(&format!("lsp:{server}"));
+            LspEvent::Exited { server, error }
+            | LspEvent::InitializationFailed { server, error } => {
+                let progress_prefix = format!("lsp:{server}:");
+                self.progress
+                    .retain(|key, _| !key.starts_with(&progress_prefix));
                 let message = error.unwrap_or_else(|| "LSPが終了しました".to_owned());
                 self.lsp_errors.insert(server, message.clone());
                 self.notify(ToastLevel::Error, message.clone());
@@ -1282,6 +1325,10 @@ impl Editor {
         let editable = document.editable_opt()?;
         let language = document.language.as_ref()?;
         let server = *self.lsp_servers.get(language)?;
+        if !self.lsp_ready.contains(&server) || !self.lsp_opened_documents.contains(&pane.view.doc)
+        {
+            return None;
+        }
         let path = document.path.clone()?;
         let (line, char_col) = crate::position::char_idx_to_line_col(editable.text(), index);
         let utf16 = editable
@@ -1859,12 +1906,13 @@ impl Editor {
                 }
                 self.terminal = Some(vt100::Parser::new(
                     self.terminal_size.1.saturating_sub(1),
-                    self.terminal_size.0 / 2,
+                    split_right_width(self.terminal_size.0),
                     0,
                 ));
                 vec![Effect::SpawnShell {
-                    cols: (self.terminal_size.0 / 2).max(1),
+                    cols: split_right_width(self.terminal_size.0).max(1),
                     rows: self.terminal_size.1.saturating_sub(1).max(1),
+                    shell: self.config.editor.shell.clone(),
                 }]
             }
         }
@@ -1939,6 +1987,7 @@ impl Editor {
         self.lsp_opened_documents.remove(&id);
         self.semantic_ready_versions.remove(&id);
         self.document_versions.remove(&id);
+        self.pending_self_disk_updates.remove(&id);
         if let Some(next) = self.documents.keys().next().copied() {
             self.layout = Layout::EditorFull(EditorPane {
                 view: View::new(next),
@@ -2019,43 +2068,40 @@ impl Editor {
     }
 
     fn indent_selected_lines(&mut self, outdent: bool) {
-        self.edit_active(|document, view| {
-            let editable = document.editable_opt().expect("editable document");
-            let lines = selected_lines(editable.text(), &view.selections);
-            let mut edits = Vec::new();
-            let mut fragments = Vec::new();
-            for line in lines {
-                let start = editable.text().line_to_char(line);
-                if outdent {
-                    let text = editable.text().line(line).to_string();
-                    let length = if text.starts_with('\t') {
-                        1
-                    } else {
-                        text.chars()
-                            .take_while(|character| *character == ' ')
-                            .take(TAB_SIZE)
-                            .count()
-                    };
-                    if length == 0 {
-                        continue;
-                    }
-                    edits.push(Selection {
-                        anchor: CharIdx(start),
-                        head: CharIdx(start + length),
-                    });
-                    fragments.push(String::new());
-                } else {
-                    edits.push(Selection::caret(CharIdx(start)));
-                    fragments.push(" ".repeat(TAB_SIZE));
-                }
-            }
-            if !edits.is_empty() {
-                let mut edits = crate::view::Selections::from_vec(edits, 0);
+        let (tab_size, insert_spaces) = self.active_indentation_settings();
+        let indentation = if insert_spaces {
+            " ".repeat(tab_size)
+        } else {
+            "\t".to_owned()
+        };
+        self.edit_active(move |document, view| {
+            let has_range = view
+                .selections
+                .iter()
+                .any(|selection| !selection.is_caret());
+            if !outdent && !has_range {
+                let fragments = vec![indentation.clone(); view.selections.len()];
                 document
                     .editable_mut()
-                    .insert_fragments(&mut edits, &fragments);
+                    .insert_fragments(&mut view.selections, &fragments);
+            } else {
+                document.editable_mut().indent_lines(
+                    &mut view.selections,
+                    &indentation,
+                    tab_size,
+                    outdent,
+                );
             }
         });
+    }
+
+    fn active_indentation_settings(&self) -> (usize, bool) {
+        let language = self
+            .layout
+            .active_editor(self.focus)
+            .and_then(|pane| self.documents.get(&pane.view.doc))
+            .and_then(|document| document.language.as_deref());
+        self.config.indentation_for_language(language)
     }
 
     fn apply_terminal(&mut self, event: TerminalEvent) {
@@ -2312,7 +2358,15 @@ impl Editor {
                 });
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let right_half = mouse.column >= self.terminal_size.0 / 2;
+                let divider = split_left_width(self.terminal_size.0);
+                if matches!(
+                    self.layout,
+                    Layout::EditorAndEditor { .. } | Layout::EditorAndShell { .. }
+                ) && mouse.column == divider
+                {
+                    return;
+                }
+                let right_half = mouse.column > divider;
                 match &self.layout {
                     Layout::EditorAndEditor { .. } => {
                         self.focus =
@@ -3109,7 +3163,11 @@ impl Editor {
         if !self.lsp_spawned.contains(server) {
             return format!("<lsp> {language}: starting");
         }
-        let progress = self.progress.get(&format!("lsp:{server}"));
+        let progress_prefix = format!("lsp:{server}:");
+        let progress = self
+            .progress
+            .iter()
+            .find_map(|(key, message)| key.starts_with(&progress_prefix).then_some(message));
         if !self.lsp_ready.contains(server) {
             return progress.map_or_else(
                 || format!("<lsp> {language}: initializing"),
@@ -3151,17 +3209,26 @@ impl Editor {
         let pane = self.layout.active_editor(self.focus)?;
         let document = self.documents.get(&pane.view.doc)?;
         let text = document.editable_opt()?.text();
+        let tab_size = self
+            .config
+            .indentation_for_language(document.language.as_deref())
+            .0;
         let gutter_width = text.len_lines().max(1).to_string().len().max(2) + 3;
         let pane_width = match self.layout {
             Layout::EditorFull(_) => self.terminal_size.0,
+            Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. }
+                if matches!(self.focus, Focus::Editor(Side::Right)) =>
+            {
+                split_right_width(self.terminal_size.0)
+            }
             Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. } => {
-                self.terminal_size.0 / 2
+                split_left_width(self.terminal_size.0)
             }
         }
         .max(1);
         let text_width = pane_width.saturating_sub(gutter_width as u16).max(1);
         let local_column = if matches!(self.focus, Focus::Editor(Side::Right)) {
-            column.saturating_sub(self.terminal_size.0 / 2)
+            column.saturating_sub(split_left_width(self.terminal_size.0).saturating_add(1))
         } else {
             column
         };
@@ -3169,16 +3236,16 @@ impl Editor {
             let line = (pane.view.scroll.top_line + usize::from(row))
                 .min(text.len_lines().saturating_sub(1));
             let display_col = usize::from(local_column).saturating_sub(6);
-            return Some(display_col_to_char_idx(text, line, display_col, TAB_SIZE));
+            return Some(display_col_to_char_idx(text, line, display_col, tab_size));
         }
         let mut visual_row = usize::from(row) + pane.view.scroll.wrapped_row_offset;
         let mut line = pane.view.scroll.top_line;
         while line < text.len_lines() {
-            let line_rows = editor_wrapped_line_rows(text, line, usize::from(text_width));
+            let line_rows = editor_wrapped_line_rows(text, line, usize::from(text_width), tab_size);
             if visual_row < line_rows {
                 let text_column = local_column.saturating_sub(gutter_width as u16);
                 let display_col = visual_row * usize::from(text_width) + usize::from(text_column);
-                return Some(display_col_to_char_idx(text, line, display_col, TAB_SIZE));
+                return Some(display_col_to_char_idx(text, line, display_col, tab_size));
             }
             visual_row -= line_rows;
             line += 1;
@@ -3362,12 +3429,27 @@ impl Editor {
         let rows = usize::from(self.terminal_size.1.saturating_sub(1)).max(1);
         let pane_cols = match self.layout {
             Layout::EditorFull(_) => usize::from(self.terminal_size.0),
+            Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. }
+                if matches!(self.focus, Focus::Editor(Side::Right)) =>
+            {
+                usize::from(split_right_width(self.terminal_size.0))
+            }
             Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. } => {
-                usize::from(self.terminal_size.0 / 2)
+                usize::from(split_left_width(self.terminal_size.0))
             }
         }
         .max(1);
         let focus = self.focus;
+        let tab_size = self
+            .layout
+            .active_editor(focus)
+            .and_then(|pane| self.documents.get(&pane.view.doc))
+            .map(|document| {
+                self.config
+                    .indentation_for_language(document.language.as_deref())
+                    .0
+            })
+            .unwrap_or_else(|| self.config.editor.tab_size.max(1));
         let (documents, layout) = (&self.documents, &mut self.layout);
         let Some(pane) = layout.active_editor_mut(focus) else {
             return;
@@ -3381,7 +3463,7 @@ impl Editor {
         let position = char_idx_to_display_pos(
             editable.text(),
             pane.view.selections.primary().head,
-            TAB_SIZE,
+            tab_size,
         );
         let gutter_width = editable.text().len_lines().max(1).to_string().len().max(2) + 3;
         let text_cols = pane_cols.saturating_sub(gutter_width).max(1);
@@ -3395,7 +3477,7 @@ impl Editor {
             pane.view.scroll.wrapped_row_offset = 0;
         }
         let visual_row = (pane.view.scroll.top_line..position.line)
-            .map(|line| editor_wrapped_line_rows(editable.text(), line, text_cols))
+            .map(|line| editor_wrapped_line_rows(editable.text(), line, text_cols, tab_size))
             .sum::<usize>()
             + position.col / text_cols;
         if visual_row < pane.view.scroll.wrapped_row_offset {
@@ -3432,13 +3514,13 @@ fn selected_lines(text: &Rope, selections: &crate::view::Selections) -> Vec<usiz
     lines.into_iter().collect()
 }
 
-fn editor_wrapped_line_rows(text: &Rope, line: usize, width: usize) -> usize {
+fn editor_wrapped_line_rows(text: &Rope, line: usize, width: usize, tab_size: usize) -> usize {
     let display_width = text
         .line(line.min(text.len_lines().saturating_sub(1)))
         .chars()
         .take_while(|character| !matches!(character, '\r' | '\n'))
         .fold(0, |column, character| {
-            display_col_after(column, character, TAB_SIZE)
+            display_col_after(column, character, tab_size)
         });
     display_width.max(1).div_ceil(width.max(1))
 }
@@ -3450,6 +3532,7 @@ pub struct ActiveBuffer<'a> {
     pub modified: bool,
     pub external_changed: bool,
     pub language: Option<&'a str>,
+    pub tab_size: usize,
     pub language_status: String,
     pub diagnostics: &'a [crate::lsp::Diagnostic],
     pub git_lines: &'a [GitLine],
@@ -3845,6 +3928,16 @@ fn hover_text(contents: lsp_types::HoverContents) -> String {
     }
 }
 
+fn split_left_width(total: u16) -> u16 {
+    total / 2
+}
+
+fn split_right_width(total: u16) -> u16 {
+    total
+        .saturating_sub(split_left_width(total))
+        .saturating_sub(1)
+}
+
 fn marked_string(marked: lsp_types::MarkedString) -> String {
     match marked {
         lsp_types::MarkedString::String(value) => value,
@@ -3926,6 +4019,7 @@ mod tests {
     #[test]
     fn shell_focus_keeps_the_left_editor_available_for_rendering() {
         let mut editor = Editor::default();
+        editor.config.editor.shell = Some("/configured/shell".to_owned());
         editor.update(AppEvent::TextPaste("visible".to_owned()));
         editor.update(AppEvent::Resize { cols: 80, rows: 24 });
 
@@ -3933,7 +4027,11 @@ mod tests {
 
         assert!(editor.shell_focused());
         assert_eq!(editor.active_buffer().unwrap().text.to_string(), "visible");
-        assert!(matches!(effects.as_slice(), [Effect::SpawnShell { .. }]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SpawnShell { shell, .. }]
+                if shell.as_deref() == Some("/configured/shell")
+        ));
 
         assert!(editor.update(Command::ToggleShell.into()).is_empty());
         assert!(!editor.shell_visible());
@@ -4158,6 +4256,7 @@ mod tests {
         document.language = Some("rust".to_owned());
         editor.lsp_servers.insert("rust".to_owned(), 1);
         editor.lsp_ready.insert(1);
+        editor.lsp_opened_documents.insert(DocumentId(0));
         let moved = MouseEvent {
             kind: MouseEventKind::Moved,
             column: 6,
@@ -4624,6 +4723,14 @@ mod tests {
             id: DocumentId(1),
             result: Ok("old\n".to_owned()),
         }));
+        let before = crate::document::DiskState {
+            size: 4,
+            modified_nanos: 1,
+        };
+        editor.update(AppEvent::Io(IoEvent::DiskStateObserved {
+            id: DocumentId(1),
+            result: Ok(before),
+        }));
         editor.update(AppEvent::TextInput('x'));
 
         let effects = editor.update(Command::Save.into());
@@ -4633,7 +4740,7 @@ mod tests {
                 doc: DocumentId(1),
                 path: path.clone(),
                 contents: "xold\n".to_owned(),
-                expected: None,
+                expected: Some(before),
             }]
         );
 
@@ -4649,6 +4756,24 @@ mod tests {
             }] if git_path == &path
         ));
         assert!(!editor.active_buffer().unwrap().modified);
+
+        let effects = editor.update(AppEvent::Io(IoEvent::DiskStateObserved {
+            id: DocumentId(1),
+            result: Ok(crate::document::DiskState {
+                size: 5,
+                modified_nanos: 2,
+            }),
+        }));
+        assert!(effects.is_empty());
+
+        editor.update(AppEvent::TextInput('y'));
+        editor.update(Command::Undo.into());
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "xold\n");
+        assert!(!editor.active_buffer().unwrap().modified);
+
+        editor.update(Command::Undo.into());
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "old\n");
+        assert!(editor.active_buffer().unwrap().modified);
     }
 
     #[test]
@@ -4770,6 +4895,8 @@ mod tests {
         editor.open_paths([path]);
         editor.documents.get_mut(&DocumentId(1)).unwrap().language = Some("rust".to_owned());
         editor.lsp_servers.insert("rust".to_owned(), 7);
+        editor.lsp_ready.insert(7);
+        editor.lsp_opened_documents.insert(DocumentId(1));
 
         let effects = editor.update(Command::Format.into());
 
@@ -4880,6 +5007,31 @@ mod tests {
             "<lsp> rust: ready"
         );
 
+        editor.update(AppEvent::Lsp(LspEvent::Progress {
+            server: 1,
+            token: "index".to_owned(),
+            message: Some("Indexing 20%".to_owned()),
+        }));
+        editor.update(AppEvent::Lsp(LspEvent::Progress {
+            server: 1,
+            token: "check".to_owned(),
+            message: Some("Checking".to_owned()),
+        }));
+        editor.update(AppEvent::Lsp(LspEvent::Progress {
+            server: 1,
+            token: "index".to_owned(),
+            message: None,
+        }));
+        assert_eq!(
+            editor.active_buffer().unwrap().language_status,
+            "<lsp> rust: updating (Checking)"
+        );
+        editor.update(AppEvent::Lsp(LspEvent::Progress {
+            server: 1,
+            token: "check".to_owned(),
+            message: None,
+        }));
+
         editor.update(AppEvent::TextInput('x'));
         assert_eq!(
             editor.active_buffer().unwrap().language_status,
@@ -4924,6 +5076,28 @@ mod tests {
             editor.lsp_errors.get(&1).map(String::as_str),
             Some("crashed")
         );
+    }
+
+    #[test]
+    fn failed_lsp_initialization_never_reports_ready() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("main.rs")]);
+        editor.update(AppEvent::ConfigLoaded(Ok(Config::default())));
+        editor.update(AppEvent::Lsp(LspEvent::Spawned {
+            server: 1,
+            language: "rust".to_owned(),
+        }));
+
+        editor.update(AppEvent::Lsp(LspEvent::InitializationFailed {
+            server: 1,
+            error: Some("initialize rejected".to_owned()),
+        }));
+
+        assert_eq!(
+            editor.active_buffer().unwrap().language_status,
+            "<lsp> rust: error"
+        );
+        assert!(!editor.lsp_ready.contains(&1));
     }
 
     #[test]
@@ -5035,5 +5209,65 @@ mod tests {
             editor.active_buffer().unwrap().text.to_string(),
             "    one\n    two"
         );
+    }
+
+    #[test]
+    fn tab_without_a_selection_inserts_configured_spaces_at_the_caret() {
+        let mut editor = Editor::default();
+        editor.config.editor.tab_size = 3;
+        editor.update(AppEvent::TextPaste("ab".to_owned()));
+        editor.update(
+            Command::Move {
+                direction: Direction::Left,
+                unit: Unit::Character,
+                extend: false,
+            }
+            .into(),
+        );
+
+        editor.update(Command::Indent.into());
+
+        let buffer = editor.active_buffer().unwrap();
+        assert_eq!(buffer.text.to_string(), "a   b");
+        assert_eq!(buffer.view.selections.primary().head, CharIdx(4));
+    }
+
+    #[test]
+    fn selected_lines_indent_together_and_outdent_clamps_to_existing_space() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::TextPaste(" a\n    b".to_owned()));
+        editor.update(Command::SelectAll.into());
+
+        editor.update(Command::Outdent.into());
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "a\nb");
+
+        editor.update(Command::Undo.into());
+        assert_eq!(
+            editor.active_buffer().unwrap().text.to_string(),
+            " a\n    b"
+        );
+        assert_eq!(
+            editor
+                .active_buffer()
+                .unwrap()
+                .view
+                .selections
+                .primary()
+                .range(),
+            0..8
+        );
+    }
+
+    #[test]
+    fn makefile_tab_inserts_a_real_tab() {
+        let mut editor = Editor::default();
+        editor.documents.get_mut(&DocumentId(0)).unwrap().language = Some("make".to_owned());
+
+        editor.update(Command::Indent.into());
+
+        let buffer = editor.active_buffer().unwrap();
+        assert_eq!(buffer.text.to_string(), "\t");
+        assert_eq!(buffer.view.selections.primary().head, CharIdx(1));
+        assert_eq!(buffer.tab_size, 4);
     }
 }

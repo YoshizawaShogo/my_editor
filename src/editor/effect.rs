@@ -78,6 +78,7 @@ pub enum Effect {
     SpawnShell {
         cols: u16,
         rows: u16,
+        shell: Option<String>,
     },
     TerminalInput(Vec<u8>),
     TerminalResize {

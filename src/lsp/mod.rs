@@ -33,12 +33,17 @@ pub enum LspEvent {
         server: u64,
         incremental_sync: bool,
     },
+    InitializationFailed {
+        server: u64,
+        error: Option<String>,
+    },
     Diagnostics {
         uri: String,
         diagnostics: Vec<Diagnostic>,
     },
     Progress {
         server: u64,
+        token: String,
         message: Option<String>,
     },
     Response {

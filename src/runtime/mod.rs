@@ -9,7 +9,7 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-use lsp_server::{Message, Notification, Request, RequestId};
+use lsp_server::{Message, Notification, Request, RequestId, Response, ResponseError};
 use nix::pty::{Winsize, openpty};
 use tokio::sync::mpsc;
 
@@ -449,7 +449,7 @@ impl Runtime {
                     }));
                 });
             }
-            Effect::SpawnShell { cols, rows } => self.spawn_shell(cols, rows),
+            Effect::SpawnShell { cols, rows, shell } => self.spawn_shell(cols, rows, shell),
             Effect::TerminalInput(bytes) => {
                 if let Some(shell) = &mut self.shell {
                     shell.writer.write_all(&bytes)?;
@@ -521,30 +521,24 @@ impl Runtime {
             }
         });
         let tx = self.tx.clone();
+        let response_sender = sender.clone();
+        let workspace_root = root.clone();
         std::thread::spawn(move || {
             let mut stdout = BufReader::new(stdout);
             loop {
                 match Message::read(&mut stdout) {
                     Ok(Some(Message::Response(response))) if response.id.to_string() == "0" => {
-                        let incremental_sync = response
-                            .result
-                            .and_then(|result| {
-                                serde_json::from_value::<lsp_types::InitializeResult>(result).ok()
-                            })
-                            .and_then(|result| result.capabilities.text_document_sync)
-                            .is_some_and(|sync| match sync {
-                                lsp_types::TextDocumentSyncCapability::Kind(kind) => {
-                                    kind == lsp_types::TextDocumentSyncKind::INCREMENTAL
-                                }
-                                lsp_types::TextDocumentSyncCapability::Options(options) => {
-                                    options.change
-                                        == Some(lsp_types::TextDocumentSyncKind::INCREMENTAL)
-                                }
-                            });
-                        let _ = tx.send(AppEvent::Lsp(crate::lsp::LspEvent::Initialized {
-                            server,
-                            incremental_sync,
-                        }));
+                        let event = match parse_initialize_response(response) {
+                            Ok(incremental_sync) => crate::lsp::LspEvent::Initialized {
+                                server,
+                                incremental_sync,
+                            },
+                            Err(error) => crate::lsp::LspEvent::InitializationFailed {
+                                server,
+                                error: Some(error),
+                            },
+                        };
+                        let _ = tx.send(AppEvent::Lsp(event));
                     }
                     Ok(Some(Message::Response(response))) => {
                         if let Ok(id) = response.id.to_string().parse::<i64>() {
@@ -559,7 +553,10 @@ impl Runtime {
                     Ok(Some(Message::Notification(notification))) => {
                         handle_lsp_notification(server, notification, &tx);
                     }
-                    Ok(Some(_)) => {}
+                    Ok(Some(Message::Request(request))) => {
+                        let response = lsp_client_response(request, &workspace_root);
+                        let _ = response_sender.send(Message::Response(response));
+                    }
                     Ok(None) => {
                         let _ = tx.send(AppEvent::Lsp(crate::lsp::LspEvent::Exited {
                             server,
@@ -583,7 +580,35 @@ impl Runtime {
             params: serde_json::json!({
                 "processId": std::process::id(),
                 "rootUri": format!("file://{}", root.display()),
-                "capabilities": {},
+                "capabilities": {
+                    "window": {"workDoneProgress": true},
+                    "workspace": {
+                        "configuration": true,
+                        "workspaceFolders": true
+                    },
+                    "textDocument": {
+                        "hover": {"contentFormat": ["markdown", "plaintext"]},
+                        "semanticTokens": {
+                            "requests": {"full": true},
+                            "tokenTypes": [
+                                "namespace", "type", "class", "enum", "interface", "struct",
+                                "typeParameter", "parameter", "variable", "property",
+                                "enumMember", "event", "function", "method", "macro", "keyword",
+                                "modifier", "comment", "string", "number", "regexp", "operator",
+                                "decorator"
+                            ],
+                            "tokenModifiers": [
+                                "declaration", "definition", "readonly", "static", "deprecated",
+                                "abstract", "async", "modification", "documentation", "defaultLibrary"
+                            ],
+                            "formats": ["relative"]
+                        }
+                    }
+                },
+                "workspaceFolders": [{
+                    "uri": format!("file://{}", root.display()),
+                    "name": root.file_name().and_then(|name| name.to_str()).unwrap_or("workspace")
+                }],
                 "clientInfo": {"name": "my_editor", "version": env!("CARGO_PKG_VERSION")}
             }),
         });
@@ -595,7 +620,7 @@ impl Runtime {
         }));
     }
 
-    fn spawn_shell(&mut self, cols: u16, rows: u16) {
+    fn spawn_shell(&mut self, cols: u16, rows: u16, configured_shell: Option<String>) {
         if let Some(mut existing) = self.shell.take() {
             let _ = existing.child.kill();
             let _ = existing.child.wait();
@@ -626,7 +651,9 @@ impl Runtime {
             Err(_) => return,
         };
         let slave_fd = pty.slave.as_raw_fd();
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+        let shell = configured_shell
+            .or_else(|| std::env::var("SHELL").ok())
+            .unwrap_or_else(|| "/bin/sh".to_owned());
         let mut shell_command = Command::new(shell);
         shell_command
             .stdin(stdin)
@@ -763,12 +790,90 @@ fn handle_lsp_notification(
             uri: params.uri.as_str().to_owned(),
             diagnostics,
         }));
-    } else if notification.method == "$/progress" {
+    } else if notification.method == "$/progress"
+        && let Some(token) = lsp_progress_token(&notification.params)
+    {
         let _ = tx.send(AppEvent::Lsp(crate::lsp::LspEvent::Progress {
             server,
+            token,
             message: lsp_progress_message(&notification.params),
         }));
     }
+}
+
+fn parse_initialize_response(response: Response) -> std::result::Result<bool, String> {
+    if let Some(error) = response.error {
+        return Err(format!("LSP initialize failed: {}", error.message));
+    }
+    let value = response
+        .result
+        .ok_or_else(|| "LSP initialize returned no result".to_owned())?;
+    let result = serde_json::from_value::<lsp_types::InitializeResult>(value)
+        .map_err(|error| format!("Invalid LSP initialize result: {error}"))?;
+    Ok(result
+        .capabilities
+        .text_document_sync
+        .is_some_and(|sync| match sync {
+            lsp_types::TextDocumentSyncCapability::Kind(kind) => {
+                kind == lsp_types::TextDocumentSyncKind::INCREMENTAL
+            }
+            lsp_types::TextDocumentSyncCapability::Options(options) => {
+                options.change == Some(lsp_types::TextDocumentSyncKind::INCREMENTAL)
+            }
+        }))
+}
+
+fn lsp_client_response(request: Request, root: &Path) -> Response {
+    let result = match request.method.as_str() {
+        "window/workDoneProgress/create"
+        | "client/registerCapability"
+        | "client/unregisterCapability" => Some(serde_json::Value::Null),
+        "workspace/configuration" => {
+            let count = request
+                .params
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            Some(serde_json::Value::Array(vec![
+                serde_json::Value::Null;
+                count
+            ]))
+        }
+        "workspace/workspaceFolders" => Some(serde_json::json!([{
+            "uri": format!("file://{}", root.display()),
+            "name": root.file_name().and_then(|name| name.to_str()).unwrap_or("workspace")
+        }])),
+        "workspace/applyEdit" => Some(serde_json::json!({
+            "applied": false,
+            "failureReason": "server-initiated edits are not supported"
+        })),
+        _ => {
+            return Response {
+                id: request.id,
+                result: None,
+                error: Some(ResponseError {
+                    code: -32601,
+                    message: format!("unsupported client method: {}", request.method),
+                    data: None,
+                }),
+            };
+        }
+    };
+    Response {
+        id: request.id,
+        result,
+        error: None,
+    }
+}
+
+fn lsp_progress_token(params: &serde_json::Value) -> Option<String> {
+    let token = params.get("token")?;
+    Some(
+        token
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| token.to_string()),
+    )
 }
 
 fn lsp_progress_message(params: &serde_json::Value) -> Option<String> {
@@ -1086,6 +1191,7 @@ mod tests {
     fn lsp_progress_parser_returns_readable_state_and_detects_end() {
         assert_eq!(
             lsp_progress_message(&serde_json::json!({
+                "token": "index",
                 "value": {
                     "kind": "report",
                     "title": "Indexing",
@@ -1096,9 +1202,54 @@ mod tests {
             Some("Indexing: workspace 40%".to_owned())
         );
         assert_eq!(
-            lsp_progress_message(&serde_json::json!({"value": {"kind": "end"}})),
+            lsp_progress_message(&serde_json::json!({"token": "index", "value": {"kind": "end"}})),
             None
         );
+        assert_eq!(
+            lsp_progress_token(&serde_json::json!({"token": "index"})),
+            Some("index".to_owned())
+        );
+    }
+
+    #[test]
+    fn initialize_errors_are_not_accepted_as_initialized() {
+        let response = Response {
+            id: RequestId::from(0),
+            result: None,
+            error: Some(ResponseError {
+                code: -32002,
+                message: "not ready".to_owned(),
+                data: None,
+            }),
+        };
+
+        assert_eq!(
+            parse_initialize_response(response),
+            Err("LSP initialize failed: not ready".to_owned())
+        );
+    }
+
+    #[test]
+    fn client_answers_lsp_progress_and_configuration_requests() {
+        let progress = lsp_client_response(
+            Request {
+                id: RequestId::from(3),
+                method: "window/workDoneProgress/create".to_owned(),
+                params: serde_json::json!({"token": "index"}),
+            },
+            Path::new("/workspace"),
+        );
+        assert_eq!(progress.result, Some(serde_json::Value::Null));
+
+        let configuration = lsp_client_response(
+            Request {
+                id: RequestId::from(4),
+                method: "workspace/configuration".to_owned(),
+                params: serde_json::json!({"items": [{}, {}]}),
+            },
+            Path::new("/workspace"),
+        );
+        assert_eq!(configuration.result, Some(serde_json::json!([null, null])));
     }
 
     #[test]

@@ -49,8 +49,16 @@ impl TerminalSession {
     }
 
     pub fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> Result<()> {
-        execute!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
-        let draw_result = self.terminal.draw(render).map(|_| ());
+        let draw_result = self
+            .terminal
+            .try_draw(|frame| {
+                render(frame);
+                // Start the synchronized window after CPU-side rendering. VTE terminals
+                // automatically time out long synchronized updates, which otherwise exposes
+                // ratatui's row-by-row diff while a newline shifts the following rows.
+                execute!(io::stdout(), BeginSynchronizedUpdate)
+            })
+            .map(|_| ());
         let end_result = execute!(self.terminal.backend_mut(), EndSynchronizedUpdate);
         draw_result?;
         end_result?;

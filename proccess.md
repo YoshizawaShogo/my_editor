@@ -100,6 +100,16 @@
 - 画面外バッジを診断`E`/`W`、git`M`/`A`へ分離した。行ガターはgit縦棒、error=`×`、warning=`▲`を維持した。
 - Shell focus中も描画用active bufferは左Editorを参照し、terminal起動時に左側が空になる問題を修正した。
 - 上記対応後は単体テスト105件、`cargo clippy --all-targets -- -D warnings`、`git diff --check`が成功した。
+- initializeエラーを成功扱いしていたLSP状態遷移を修正した。サーバ発の進捗登録・設定要求へ応答し、進捗をtoken別に追跡して、処理中に`ready`へ戻らないようにした。未準備中はHover要求を送らず、Hover単体の失敗は通常statusへ出さない。
+- 左右分割の中央に専用1セルの縦罫線を追加し、描画幅・PTY幅・マウス座標を境界列込みで補正した。右ペイン操作時のHoverは左ペイン内の分割線側へ寄せた。
+- 同期更新の開始をCPU側レンダリング完了後へ移し、端末の同期タイムアウトにより改行後の行シフト途中が一瞬露出する問題を修正した。
+- 保存直後のDiskState通知を外部変更として再読込してundo履歴を消していた問題を修正した。`Ctrl+S`は履歴を保持したまま保存タグを更新し、入力グループだけを区切る。
+- 上記対応後は単体テスト110件、`cargo clippy --all-targets -- -D warnings`、`git diff --check`が成功した。
+- TOMLの`editor.tab_size`/`editor.insert_spaces`を編集・描画・hit-testへ接続し、言語単位の`tab_size`/`insert_spaces`上書きと拡張子なしの`filenames`判定を追加した。Makefileは既定で実タブを使う。
+- 選択なしTabは各カーソル位置へ設定幅を挿入してcaretを進め、範囲選択時だけ対象行をまとめてインデントするよう修正した。アンインデントは既存の先頭空白量でクランプし、undo時の選択も保持する。
+- `editor.shell`をPTY起動へ接続し、未指定時だけ`$SHELL`/`/bin/sh`へフォールバックするようにした。`/home/shogo/.my_editor_rc.toml`には幅4・space入力・Makefile実タブ・Rust設定と`my_shell_using_crates` release binaryを明示した。
+- マルチカーソルの副カーソルをセル置換ではなく結合縦線の重ね描画へ変更し、カーソル位置の文字と隣接セルが消えないようにした。
+- 上記対応後は単体テスト114件、`cargo clippy --all-targets -- -D warnings`、`git diff --check`が成功した。
 - undo/redo履歴のディスク保存・復元を廃止し、バッファが開いている間だけメモリに保持する構成へ変更した。
 - 補完ポップアップの横位置を入力中の単語先頭へ固定し、1文字ごとの不要な横移動をなくした。
 - `Ctrl+O`は起動済みシェルを終了せず表示だけ切り替えるようにした。`exit`/`Ctrl+D`によるPTY終了時だけセッションを破棄してエディタへ戻し、通常終了メッセージは表示しない。

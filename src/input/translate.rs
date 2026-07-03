@@ -107,6 +107,9 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
         return Some(Command::PickerCancel.into());
     }
     if matches!(focus, Focus::Shell) {
+        if ctrl && key.code == KeyCode::Char('c') {
+            return Some(Command::CopyShellSelection.into());
+        }
         return shell_key(key).map(AppEvent::TerminalInput);
     }
     if matches!(focus, Focus::Completion(_)) {

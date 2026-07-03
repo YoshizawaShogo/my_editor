@@ -1,5 +1,6 @@
 use ropey::Rope;
 
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 use crate::{
@@ -57,6 +58,7 @@ impl Editable {
     }
 
     pub fn mark_saved(&mut self) {
+        self.history.break_group();
         self.saved_hash = content_hash(&self.text.to_string());
         self.modified = false;
     }
@@ -143,6 +145,101 @@ impl Editable {
             })
             .collect();
         self.replace_ranges(selections, targets, replacements, None, None);
+    }
+
+    pub fn indent_lines(
+        &mut self,
+        selections: &mut Selections,
+        indentation: &str,
+        tab_size: usize,
+        outdent: bool,
+    ) {
+        let mut lines = BTreeSet::new();
+        for selection in selections.iter() {
+            let range = selection.range();
+            let start = self
+                .text
+                .char_to_line(range.start.min(self.text.len_chars()));
+            let last = if range.end > range.start {
+                range.end.saturating_sub(1)
+            } else {
+                range.end
+            };
+            let end = self.text.char_to_line(last.min(self.text.len_chars()));
+            lines.extend(start..=end);
+        }
+
+        let mut edits = Vec::new();
+        for line in lines {
+            let start = self.text.line_to_char(line);
+            if outdent {
+                let text = self.text.line(line);
+                let length = if text.get_char(0) == Some('\t') {
+                    1
+                } else {
+                    text.chars()
+                        .take_while(|character| *character == ' ')
+                        .take(tab_size.max(1))
+                        .count()
+                };
+                if length > 0 {
+                    edits.push((start..start + length, String::new()));
+                }
+            } else {
+                edits.push((start..start, indentation.to_owned()));
+            }
+        }
+        if edits.is_empty() {
+            return;
+        }
+
+        let before = selections.clone();
+        let remapped = selections
+            .iter()
+            .map(|selection| Selection {
+                anchor: CharIdx(remap_index(selection.anchor.0, &edits)),
+                head: CharIdx(remap_index(selection.head.0, &edits)),
+            })
+            .collect::<Vec<_>>();
+        let primary = selections.primary_index();
+        let mut changes = edits
+            .into_iter()
+            .rev()
+            .map(|(range, inserted)| Change {
+                removed: self.text.slice(range.clone()).to_string(),
+                range: CharIdx(range.start)..CharIdx(range.end),
+                inserted,
+            })
+            .collect::<Vec<_>>();
+        for change in &changes {
+            if let Some(syntax) = &mut self.syntax {
+                syntax.edit(
+                    &self.text,
+                    change.range.start.0..change.range.end.0,
+                    &change.inserted,
+                );
+            }
+            self.record_lsp_change(change.range.start.0..change.range.end.0, &change.inserted);
+            self.update_semantic_spans(
+                change.range.start.0..change.range.end.0,
+                change.inserted.chars().count(),
+            );
+            self.apply_change(change);
+        }
+        if let Some(syntax) = &mut self.syntax {
+            syntax.reparse(&self.text.to_string(), true);
+        }
+        let after = Selections::from_vec(remapped, primary);
+        *selections = after.clone();
+        self.history.record(
+            Revision {
+                changes: std::mem::take(&mut changes),
+                selections_before: before,
+                selections_after: after,
+            },
+            None,
+        );
+        self.refresh_modified();
     }
 
     pub fn delete_backward(&mut self, selections: &mut Selections) {
@@ -434,6 +531,20 @@ fn continued_line_comment(prefix: &str, indentation: &str, marker: &str) -> Opti
     Some(marker.to_owned())
 }
 
+fn remap_index(index: usize, edits: &[(std::ops::Range<usize>, String)]) -> usize {
+    let mut offset = 0isize;
+    for (range, inserted) in edits {
+        if index < range.start {
+            break;
+        }
+        if !range.is_empty() && index < range.end {
+            return (range.start as isize + offset) as usize;
+        }
+        offset += inserted.chars().count() as isize - range.len() as isize;
+    }
+    (index as isize + offset) as usize
+}
+
 fn shift_index(index: usize, inserted_len: usize, removed_len: usize) -> usize {
     if inserted_len >= removed_len {
         index + inserted_len - removed_len
@@ -481,6 +592,28 @@ mod tests {
 
         assert_eq!(editable.text().to_string(), "saved");
         assert!(!editable.modified);
+    }
+
+    #[test]
+    fn save_marks_a_history_boundary_without_discarding_undo() {
+        let mut editable = Editable::new("");
+        let mut selections = Selections::single(Selection::caret(CharIdx(0)));
+        let start = Instant::now();
+
+        editable.insert_timed(&mut selections, "a", start);
+        editable.mark_saved();
+        editable.insert_timed(
+            &mut selections,
+            "b",
+            start + std::time::Duration::from_millis(10),
+        );
+
+        assert!(editable.undo(&mut selections));
+        assert_eq!(editable.text().to_string(), "a");
+        assert!(!editable.modified);
+        assert!(editable.undo(&mut selections));
+        assert_eq!(editable.text().to_string(), "");
+        assert!(editable.modified);
     }
 
     #[test]
