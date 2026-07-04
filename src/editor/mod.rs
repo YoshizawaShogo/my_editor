@@ -1084,7 +1084,7 @@ impl Editor {
                             }))
                         })
                         .collect();
-                        items.sort_by(|left, right| right.0.cmp(&left.0));
+                        items.sort_by_key(|right| std::cmp::Reverse(right.0));
                         let items = items.into_iter().map(|(_, item)| item).collect::<Vec<_>>();
                         if !items.is_empty() {
                             self.completion = Some(CompletionState {
