@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use crate::{
@@ -15,6 +15,9 @@ const BG: Color = Color::Rgb(0x16, 0x18, 0x21);
 const FG: Color = Color::Rgb(0xc6, 0xc8, 0xd1);
 const MUTED: Color = Color::Rgb(0x6b, 0x70, 0x89);
 const SELECTION: Color = Color::Rgb(0x27, 0x2c, 0x42);
+/// A more prominent selection tint for list rows (pickers), where the subtle
+/// editor selection colour is hard to spot.
+const SELECTION_STRONG: Color = Color::Rgb(0x3c, 0x4a, 0x78);
 const STATUS_BG: Color = Color::Rgb(0x0f, 0x11, 0x17);
 const ADDED_BG: Color = Color::Rgb(0x24, 0x30, 0x25);
 const REMOVED_BG: Color = Color::Rgb(0x38, 0x22, 0x28);
@@ -28,7 +31,26 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
         .split(frame.area());
 
     frame.render_widget(Block::default().style(Style::default().bg(BG)), areas[0]);
-    if editor.shell_visible() {
+    if editor.search_pane_visible() {
+        let (left, divider, right) = split_panes(areas[0]);
+        if let Some(buffer) = editor.active_buffer() {
+            draw_buffer(frame, left, &buffer, false);
+            draw_status(frame, areas[1], editor, &buffer);
+        } else if let Some(buffer) = editor.active_large_buffer() {
+            draw_large_buffer(frame, left, &buffer);
+            draw_status_text(
+                frame,
+                areas[1],
+                editor.status().unwrap_or("READ ONLY · large file"),
+            );
+        } else {
+            draw_status_text(frame, areas[1], editor.status().unwrap_or("Ready"));
+        }
+        draw_split_divider(frame, divider);
+        if let Some(search) = editor.search_view() {
+            draw_search_pane(frame, right, &search);
+        }
+    } else if editor.shell_visible() {
         let (left, divider, right) = split_panes(areas[0]);
         if let Some(buffer) = editor.active_buffer() {
             draw_buffer(frame, left, &buffer, !editor.shell_focused());
@@ -113,9 +135,6 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
     }
     if let Some(picker) = editor.picker_view() {
         draw_picker(frame, &picker);
-    }
-    if let Some(search) = editor.search_view() {
-        draw_search(frame, &search);
     }
     if let Some(completion) = editor.completion_view() {
         draw_completion(frame, editor, &completion);
@@ -562,113 +581,218 @@ fn completion_popup_area(viewport: Rect, cursor: (u16, u16), item_count: usize) 
     Some(Rect::new(x, y, width, height))
 }
 
-fn draw_search(frame: &mut Frame<'_>, search: &crate::editor::SearchView) {
-    let viewport = overlay_area(frame);
-    let width = viewport.width.saturating_sub(4).clamp(1, 76);
-    let available_height = viewport.height.saturating_sub(1).max(1);
-    let filter_rows = u16::from(search.scope == crate::editor::SearchScope::Directory) * 2;
-    let input_rows = 1 + u16::from(search.replacement.is_some()) + filter_rows;
-    let height = (search.items.len() as u16 + input_rows + 2)
-        .min(available_height)
-        .max(1);
-    let area = Rect {
-        x: viewport.x + (viewport.width.saturating_sub(width)) / 2,
-        y: viewport.y + 1,
-        width,
-        height,
+fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::SearchView) {
+    use crate::editor::{
+        SEARCH_SCOPE_LABELS, SEARCH_TOGGLE_LABELS, SearchFilterField, SearchScope,
+        search_pane_layout,
     };
-    let inner = draw_popup_frame(frame, area);
-    let scope = match search.scope {
-        crate::editor::SearchScope::CurrentBuffer => "buffer",
-        crate::editor::SearchScope::AllBuffers => "buffers",
-        crate::editor::SearchScope::Directory => "directory",
-    };
-    let mut lines = vec![Line::from(vec![
-        Span::styled(format!("Search [{scope}]  "), Style::default().fg(MUTED)),
-        Span::styled(&search.query, Style::default().fg(FG)),
-        Span::styled(
-            format!(
-                "  [{}]aA [{}]word [{}].*",
-                if search.options.case_sensitive {
-                    "x"
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(Block::default().style(Style::default().bg(POPUP_BG)), area);
+
+    let directory = search.scope == SearchScope::Directory;
+    let replace_enabled = search.replacement.is_some();
+    let layout = search_pane_layout(directory, replace_enabled);
+    let active_include = search.editing_filter == Some(SearchFilterField::Include);
+    let active_exclude = search.editing_filter == Some(SearchFilterField::Exclude);
+    let active_replace = search.editing_filter.is_none() && search.editing_replace;
+    let active_query = !active_include && !active_exclude && !active_replace;
+    let row_at = |offset: u16| area.y + offset;
+    let visible = |offset: u16| row_at(offset) < area.bottom();
+    fn line_at(frame: &mut Frame<'_>, area: Rect, offset: u16, line: Line<'static>) {
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(area.x + 1, area.y + offset, area.width.saturating_sub(1), 1),
+        );
+    }
+
+    // Scope tabs — the active one is highlighted prominently.
+    if visible(layout.scope_row) {
+        let scopes = [
+            SearchScope::CurrentBuffer,
+            SearchScope::AllBuffers,
+            SearchScope::Directory,
+        ];
+        let spans = SEARCH_SCOPE_LABELS
+            .iter()
+            .zip(scopes)
+            .map(|(label, scope)| {
+                Span::styled(
+                    (*label).to_owned(),
+                    if search.scope == scope {
+                        Style::default()
+                            .fg(BG)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(MUTED)
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        line_at(frame, area, layout.scope_row, Line::from(spans));
+    }
+
+    // Option toggles — labels are separated by two blanks; the gaps stay uncolored.
+    if visible(layout.toggle_row) {
+        let states = [
+            search.options.case_sensitive,
+            search.options.whole_word,
+            search.options.regex,
+        ];
+        let mut spans = Vec::new();
+        for (index, (label, on)) in SEARCH_TOGGLE_LABELS.iter().zip(states).enumerate() {
+            if index > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                (*label).to_owned(),
+                if on {
+                    Style::default().fg(BG).bg(Color::Yellow)
                 } else {
-                    " "
+                    Style::default().fg(MUTED)
                 },
-                if search.options.whole_word { "x" } else { " " },
-                if search.options.regex { "x" } else { " " },
-            ),
-            Style::default().fg(MUTED),
-        ),
-    ])];
-    if let Some(replacement) = &search.replacement {
-        lines.push(Line::from(vec![
-            Span::styled("Replace  ", Style::default().fg(MUTED)),
-            Span::styled(
-                replacement,
-                Style::default().fg(if search.editing_replace {
-                    Color::Yellow
-                } else {
-                    FG
-                }),
-            ),
-        ]));
+            ));
+        }
+        line_at(frame, area, layout.toggle_row, Line::from(spans));
     }
-    if search.scope == crate::editor::SearchScope::Directory {
-        lines.push(Line::from(vec![
-            Span::styled("Include  ", Style::default().fg(MUTED)),
-            Span::styled(
-                &search.include,
-                Style::default().fg(
-                    if search.editing_filter == Some(crate::editor::SearchFilterField::Include) {
-                        Color::Yellow
-                    } else {
-                        FG
-                    },
-                ),
-            ),
-            Span::styled(
-                format!(
-                    "  ignore:{} hidden:{}",
-                    if search.filters.respect_ignore_files {
-                        "on"
-                    } else {
-                        "off"
-                    },
-                    if search.filters.include_hidden {
-                        "on"
-                    } else {
-                        "off"
-                    },
-                ),
+
+    draw_search_field(
+        frame,
+        area,
+        layout.find_top,
+        "Find",
+        &search.query,
+        active_query,
+    );
+
+    // Replace checkbox toggles the replacement field; the run button sits to its
+    // right, and only while replace is enabled.
+    if visible(layout.replace_checkbox_row) {
+        let mark = if replace_enabled { "[x]" } else { "[ ]" };
+        let mut spans = vec![Span::styled(
+            format!("{mark} Replace"),
+            Style::default().fg(if replace_enabled { FG } else { MUTED }),
+        )];
+        if replace_enabled {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                crate::editor::SEARCH_RUN_BUTTON,
+                Style::default()
+                    .fg(BG)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        line_at(frame, area, layout.replace_checkbox_row, Line::from(spans));
+    }
+    if let Some(top) = layout.replace_top {
+        draw_search_field(
+            frame,
+            area,
+            top,
+            "Replace",
+            search.replacement.as_deref().unwrap_or(""),
+            active_replace,
+        );
+    }
+
+    if let Some(top) = layout.include_top {
+        draw_search_field(
+            frame,
+            area,
+            top,
+            "include (-name)",
+            &search.include,
+            active_include,
+        );
+    }
+    if let Some(top) = layout.exclude_top {
+        draw_search_field(
+            frame,
+            area,
+            top,
+            "exclude (-name)",
+            &search.exclude,
+            active_exclude,
+        );
+    }
+
+    // Result list — scrollable, and each row opens its file on click.
+    if visible(layout.results_top) {
+        let results_area = Rect::new(
+            area.x,
+            row_at(layout.results_top),
+            area.width,
+            area.bottom() - row_at(layout.results_top),
+        );
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(MUTED))
+            .title(Span::styled(
+                format!(" {} 件 ", search.total),
                 Style::default().fg(MUTED),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("Exclude  ", Style::default().fg(MUTED)),
-            Span::styled(
-                &search.exclude,
-                Style::default().fg(
-                    if search.editing_filter == Some(crate::editor::SearchFilterField::Exclude) {
-                        Color::Yellow
-                    } else {
-                        FG
-                    },
-                ),
-            ),
-        ]));
+            ));
+        let inner = block.inner(results_area);
+        frame.render_widget(block, results_area);
+        let lines = search
+            .items
+            .iter()
+            .skip(search.results_scroll)
+            .take(usize::from(inner.height))
+            .map(|item| Line::styled(item.clone(), Style::default().fg(FG)))
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(POPUP_BG)),
+            inner,
+        );
     }
-    for (index, item) in search.items.iter().enumerate() {
-        lines.push(Line::styled(
-            item,
-            if index == search.current {
-                Style::default().fg(FG).bg(SELECTION)
-            } else {
-                Style::default().fg(FG).bg(POPUP_BG)
-            },
+
+    // Caret in the active input field.
+    let field_top = if active_include {
+        layout.include_top
+    } else if active_exclude {
+        layout.exclude_top
+    } else if active_replace {
+        layout.replace_top
+    } else {
+        Some(layout.find_top)
+    };
+    if let Some(top) = field_top {
+        let cursor_x = area.x + 1 + search.field_cursor as u16;
+        let cursor_y = row_at(top + 1);
+        if cursor_x < area.right() && cursor_y < area.bottom() {
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
+    }
+}
+
+fn draw_search_field(
+    frame: &mut Frame<'_>,
+    pane: Rect,
+    top: u16,
+    title: &str,
+    value: &str,
+    active: bool,
+) {
+    let y = pane.y + top;
+    if y >= pane.bottom() {
+        return;
+    }
+    let area = Rect::new(pane.x, y, pane.width, 3.min(pane.bottom() - y));
+    let color = if active { Color::Yellow } else { MUTED };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(color),
         ));
-    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(POPUP_BG)),
+        Paragraph::new(value.to_owned()).style(Style::default().fg(FG).bg(POPUP_BG)),
         inner,
     );
 }
@@ -801,7 +925,11 @@ fn draw_picker(frame: &mut Frame<'_>, picker: &crate::editor::PickerView) {
         lines.push(Line::styled("…", Style::default().fg(MUTED).bg(POPUP_BG)));
     }
     for (index, item) in picker.items.iter().enumerate() {
-        lines.push(picker_item_line(item, index == picker.selected));
+        lines.push(picker_item_line(
+            item,
+            index == picker.selected,
+            inner.width,
+        ));
     }
     if picker.has_after {
         lines.push(Line::styled(
@@ -815,18 +943,28 @@ fn draw_picker(frame: &mut Frame<'_>, picker: &crate::editor::PickerView) {
     );
 }
 
-fn picker_item_line(item: &crate::editor::PickerViewItem, selected: bool) -> Line<'static> {
-    let background = if selected { SELECTION } else { POPUP_BG };
-    let spans = item
+fn picker_item_line(
+    item: &crate::editor::PickerViewItem,
+    selected: bool,
+    width: u16,
+) -> Line<'static> {
+    let background = if selected { SELECTION_STRONG } else { POPUP_BG };
+    let mut spans = item
         .label
         .chars()
         .enumerate()
         .map(|(index, character)| {
             let matched = item.matched.contains(&index);
             let style = Style::default()
-                .fg(if matched { Color::Yellow } else { FG })
+                .fg(if matched {
+                    Color::Yellow
+                } else if selected {
+                    Color::White
+                } else {
+                    FG
+                })
                 .bg(background)
-                .add_modifier(if matched {
+                .add_modifier(if matched || selected {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
@@ -834,6 +972,16 @@ fn picker_item_line(item: &crate::editor::PickerViewItem, selected: bool) -> Lin
             Span::styled(character.to_string(), style)
         })
         .collect::<Vec<_>>();
+    // Extend the highlight across the whole row so the selection is easy to spot.
+    if selected {
+        let used = item.label.chars().count() as u16;
+        if used < width {
+            spans.push(Span::styled(
+                " ".repeat(usize::from(width - used)),
+                Style::default().bg(background),
+            ));
+        }
+    }
     Line::from(spans)
 }
 
@@ -1088,7 +1236,12 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
                 Style::default().fg(MUTED).bg(BG),
             ),
         ];
-        let mut spans = Vec::new();
+        // Wrap the line into fixed-width visual rows ourselves so the rendered
+        // layout matches the caret/gutter/scroll math, which all assume a hard
+        // wrap at exactly `text_width` display columns. Relying on ratatui's
+        // word wrapping instead would drift whenever a wrapped line contains
+        // spaces (e.g. tab-expanded indentation).
+        let mut rows: Vec<Vec<Span>> = vec![Vec::new()];
         let line = buffer.text.line(line_index);
         let line_start = buffer.text.line_to_char(line_index);
         let mut display_col = 0;
@@ -1097,11 +1250,6 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
                 break;
             }
             let next_col = display_col_after(display_col, character, buffer.tab_size);
-            let rendered = if character == '\t' {
-                " ".repeat(next_col - display_col)
-            } else {
-                character.to_string()
-            };
             let index = line_start + char_col;
             let byte = buffer.text.char_to_byte(index);
             let style = if selections
@@ -1131,7 +1279,16 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
                     ))
                     .bg(BG)
             };
-            spans.push(Span::styled(rendered, style));
+            if character == '\t' {
+                for column in display_col..next_col {
+                    push_cell(&mut rows, column / text_width, " ".to_owned(), style);
+                }
+            } else {
+                // Keep a wide glyph whole: if it would straddle a wrap boundary,
+                // place it on the row where it finishes.
+                let target_row = next_col.saturating_sub(1) / text_width;
+                push_cell(&mut rows, target_row, character.to_string(), style);
+            }
             display_col = next_col;
         }
         if let Some(diagnostic) = line_diagnostic {
@@ -1149,21 +1306,26 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
                     crate::lsp::DiagnosticSeverity::Information => Color::Rgb(0x89, 0xb8, 0xc2),
                     crate::lsp::DiagnosticSeverity::Hint => MUTED,
                 };
-                spans.push(Span::styled(
-                    text,
-                    Style::default()
-                        .fg(color)
-                        .bg(BG)
-                        .add_modifier(Modifier::ITALIC),
-                ));
+                if let Some(last) = rows.last_mut() {
+                    last.push(Span::styled(
+                        text,
+                        Style::default()
+                            .fg(color)
+                            .bg(BG)
+                            .add_modifier(Modifier::ITALIC),
+                    ));
+                }
             }
         }
+        // Keep the visual row count aligned with the caret/gutter math.
+        let row_count = display_col.max(1).div_ceil(text_width);
+        while rows.len() < row_count {
+            rows.push(Vec::new());
+        }
         gutter_lines.push(Line::from(gutter_spans));
-        gutter_lines.extend(
-            std::iter::repeat_with(Line::default)
-                .take(display_col.max(1).div_ceil(text_width).saturating_sub(1)),
-        );
-        text_lines.push(Line::from(spans));
+        gutter_lines
+            .extend(std::iter::repeat_with(Line::default).take(rows.len().saturating_sub(1)));
+        text_lines.extend(rows.into_iter().map(Line::from));
     }
     frame.render_widget(
         Paragraph::new(gutter_lines)
@@ -1177,7 +1339,6 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
     frame.render_widget(
         Paragraph::new(text_lines)
             .style(Style::default().bg(BG))
-            .wrap(Wrap { trim: false })
             .scroll((
                 buffer.view.scroll.wrapped_row_offset.min(u16::MAX as usize) as u16,
                 0,
@@ -1318,6 +1479,13 @@ fn truncate_virtual_diagnostic(message: &str, available: usize) -> String {
     let mut text = PREFIX.to_owned();
     text.extend(message.chars().take(available - PREFIX.len()));
     text
+}
+
+fn push_cell(rows: &mut Vec<Vec<Span<'static>>>, row: usize, text: String, style: Style) {
+    while rows.len() <= row {
+        rows.push(Vec::new());
+    }
+    rows[row].push(Span::styled(text, style));
 }
 
 fn wrapped_line_rows(text: &ropey::Rope, line: usize, width: usize, tab_size: usize) -> usize {
@@ -1649,7 +1817,7 @@ mod tests {
             matched: vec![0, 2],
         };
 
-        let line = picker_item_line(&item, false);
+        let line = picker_item_line(&item, false, 20);
 
         assert_eq!(line.spans[0].style.fg, Some(Color::Yellow));
         assert_eq!(line.spans[1].style.fg, Some(FG));
@@ -1678,6 +1846,57 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert!((0..5).all(|column| buffer[(column, 1)].symbol() == " "));
         assert_eq!(buffer[(5, 1)].symbol(), "f");
+    }
+
+    #[test]
+    fn tab_expanded_lines_wrap_at_a_fixed_width_so_the_caret_stays_aligned() {
+        let backend = TestBackend::new(10, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 10, rows: 5 });
+        // A leading tab expands to spaces (word-break opportunities); the display
+        // string "    abcdef" is 10 columns wide and must wrap at exactly text_width
+        // (5) rather than at the whitespace, or the caret math drifts from the text.
+        editor.update(crate::editor::AppEvent::TextPaste("\tabcdef".to_owned()));
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // gutter is 5 wide, so text begins at column 5: row 0 shows "    a".
+        assert!((5..9).all(|column| buffer[(column, 0)].symbol() == " "));
+        assert_eq!(buffer[(9, 0)].symbol(), "a");
+        // The continuation row resumes with the very next character, "bcdef".
+        assert_eq!(buffer[(5, 1)].symbol(), "b");
+        assert_eq!(buffer[(6, 1)].symbol(), "c");
+    }
+
+    #[test]
+    fn find_and_replace_opens_as_a_right_pane_with_scope_tabs_and_results() {
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 40, rows: 12 });
+        editor.update(crate::editor::AppEvent::TextPaste("foo bar foo".to_owned()));
+        editor.update(crate::editor::Command::OpenReplace.into());
+        for character in "foo".chars() {
+            editor.update(crate::editor::AppEvent::TextInput(character));
+        }
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..12)
+            .flat_map(|row| (0..40).map(move |column| (column, row)))
+            .map(|(column, row)| buffer[(column, row)].symbol().to_owned())
+            .collect();
+        assert!(screen.contains("Find"), "find box missing: {screen:?}");
+        assert!(
+            screen.contains("Replace"),
+            "replace box missing: {screen:?}"
+        );
+        assert!(screen.contains("file"), "scope tabs missing: {screen:?}");
+        // "foo" occurs twice in the current buffer.
+        assert!(screen.contains("2 件"), "result count missing: {screen:?}");
     }
 
     #[test]

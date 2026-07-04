@@ -168,10 +168,12 @@ impl Default for SearchConfig {
         Self {
             respect_ignore_files: true,
             include_hidden: false,
+            // Directory names pruned from every search, applied behind the scenes
+            // rather than shown in the exclude field.
             exclude: vec![
-                "**/.git/**".to_owned(),
-                "**/target/**".to_owned(),
-                "**/node_modules/**".to_owned(),
+                ".git".to_owned(),
+                "target".to_owned(),
+                "node_modules".to_owned(),
             ],
         }
     }

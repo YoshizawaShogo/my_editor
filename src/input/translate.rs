@@ -77,13 +77,8 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
     if ctrl && key.code == KeyCode::Char('t') {
         return Some(Command::OpenDirectoryPicker.into());
     }
-    if ctrl && shift && key.code == KeyCode::Char('f') {
-        return Some(Command::OpenSearchInDirectory.into());
-    }
     if ctrl && key.code == KeyCode::Char('f') {
-        return Some(Command::OpenSearch.into());
-    }
-    if ctrl && key.code == KeyCode::Char('h') {
+        // Open (or, when already open, cycle the scope of) the find & replace pane.
         return Some(Command::OpenReplace.into());
     }
     if ctrl
@@ -128,6 +123,8 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
             KeyCode::Up => Some(Command::PickerUp.into()),
             KeyCode::Down => Some(Command::PickerDown.into()),
             KeyCode::Backspace => Some(Command::PickerBackspace.into()),
+            KeyCode::Left => Some(Command::SearchCursorLeft.into()),
+            KeyCode::Right => Some(Command::SearchCursorRight.into()),
             KeyCode::Tab => Some(Command::SearchToggleField.into()),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Some(Command::SearchToggleCase.into())
@@ -161,6 +158,8 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
         KeyCode::F(2) => Some(Command::Rename.into()),
         KeyCode::Char('z') if ctrl => Some(Command::Undo.into()),
         KeyCode::Char('y') if ctrl => Some(Command::Redo.into()),
+        KeyCode::Char('e') if ctrl => Some(Command::NavigateBack.into()),
+        KeyCode::Char('r') if ctrl => Some(Command::NavigateForward.into()),
         KeyCode::Char('a') if ctrl => Some(Command::SelectAll.into()),
         KeyCode::Char('d') if ctrl => Some(Command::SelectNextOccurrence.into()),
         KeyCode::Char('c') if ctrl => Some(Command::Copy.into()),
@@ -329,13 +328,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_f_opens_search() {
+    fn ctrl_f_opens_the_find_and_replace_pane() {
         let raw = raw_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         let mut pending = KeyChordState::default();
 
         assert_eq!(
             translate(raw, &Focus::Editor(Side::Left), &mut pending),
-            Some(AppEvent::Command(Command::OpenSearch))
+            Some(AppEvent::Command(Command::OpenReplace))
         );
     }
 
@@ -449,16 +448,17 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_f_opens_directory_search() {
+    fn ctrl_shift_f_no_longer_has_a_separate_directory_search_binding() {
         let raw = raw_key(KeyEvent::new(
             KeyCode::Char('f'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ));
         let mut pending = KeyChordState::default();
 
+        // Directory search is now reached by cycling the scope of the unified pane.
         assert_eq!(
             translate(raw, &Focus::Editor(Side::Left), &mut pending),
-            Some(AppEvent::Command(Command::OpenSearchInDirectory))
+            Some(AppEvent::Command(Command::OpenReplace))
         );
     }
 }

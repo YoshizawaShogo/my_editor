@@ -67,6 +67,10 @@ impl Runtime {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        // Hover popups render Markdown/Rust with tree-sitter, whose queries compile
+        // lazily on first use. Nothing is hovered at startup, so warm the caches now
+        // (off the event loop) to avoid a stall on the first hover.
+        tokio::task::spawn_blocking(crate::highlight::warm_hover_highlighting);
         let input_task = input::spawn(self.raw_tx.clone());
         let size = self.terminal.terminal_mut().size()?;
         self.editor.update(AppEvent::Resize {
@@ -253,31 +257,35 @@ impl Runtime {
                         .git_ignore(filters.respect_ignore_files)
                         .git_exclude(filters.respect_ignore_files)
                         .ignore(filters.respect_ignore_files);
-                    let mut overrides = ignore::overrides::OverrideBuilder::new(&root);
-                    for include in &filters.include {
-                        if let Err(error) = overrides.add(include) {
-                            let _ = tx.send(AppEvent::Grep(GrepEvent::Failed {
-                                token,
-                                error: format!("include globが不正です: {error}"),
-                            }));
-                            return;
-                        }
-                    }
-                    for exclude in &filters.exclude {
-                        if let Err(error) = overrides.add(&format!("!{exclude}")) {
-                            let _ = tx.send(AppEvent::Grep(GrepEvent::Failed {
-                                token,
-                                error: format!("exclude globが不正です: {error}"),
-                            }));
-                            return;
-                        }
-                    }
-                    if let Ok(overrides) = overrides.build() {
-                        walker.overrides(overrides);
-                    }
+                    // Prune the always-excluded directories (.git, target, …) so entire
+                    // subtrees are skipped regardless of the user's exclude field.
+                    let exclude_dirs = filters.exclude_dirs.clone();
+                    walker.filter_entry(move |entry| {
+                        !entry.file_type().is_some_and(|kind| kind.is_dir())
+                            || !exclude_dirs
+                                .iter()
+                                .any(|dir| dir.as_str() == entry.file_name().to_string_lossy())
+                    });
                     let mut hits = Vec::new();
                     for entry in walker.build().flatten() {
                         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                            continue;
+                        }
+                        // include/exclude follow `find -name`: shell globs on the file name.
+                        let name = entry.file_name().to_string_lossy();
+                        if !filters.include.is_empty()
+                            && !filters
+                                .include
+                                .iter()
+                                .any(|pattern| name_glob_match(pattern, &name))
+                        {
+                            continue;
+                        }
+                        if filters
+                            .exclude
+                            .iter()
+                            .any(|pattern| name_glob_match(pattern, &name))
+                        {
                             continue;
                         }
                         let Ok(file) = File::open(entry.path()) else {
@@ -938,6 +946,26 @@ fn lsp_progress_message(params: &serde_json::Value) -> Option<String> {
     Some(text)
 }
 
+/// Match a file name against a `find -name` style shell glob (`*` and `?`).
+fn name_glob_match(pattern: &str, name: &str) -> bool {
+    fn matches(pattern: &[char], name: &[char]) -> bool {
+        match pattern.first() {
+            None => name.is_empty(),
+            Some('*') => {
+                matches(&pattern[1..], name) || (!name.is_empty() && matches(pattern, &name[1..]))
+            }
+            Some('?') => !name.is_empty() && matches(&pattern[1..], &name[1..]),
+            Some(character) => {
+                !name.is_empty() && name[0] == *character && matches(&pattern[1..], &name[1..])
+            }
+        }
+    }
+    matches(
+        &pattern.chars().collect::<Vec<_>>(),
+        &name.chars().collect::<Vec<_>>(),
+    )
+}
+
 fn read_utf8_file(path: &std::path::Path) -> std::result::Result<String, String> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("ファイルを開けません {}: {error}", path.display()))?;
@@ -1204,6 +1232,16 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::result::Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_glob_matches_like_find_dash_name() {
+        assert!(name_glob_match("*.rs", "main.rs"));
+        assert!(!name_glob_match("*.rs", "main.toml"));
+        assert!(name_glob_match("mod?.rs", "mod1.rs"));
+        assert!(!name_glob_match("mod?.rs", "mod.rs"));
+        assert!(name_glob_match("*test*", "my_test_file"));
+        assert!(name_glob_match("exact", "exact"));
+    }
 
     #[test]
     fn git_status_parser_keeps_the_two_column_porcelain_code() {

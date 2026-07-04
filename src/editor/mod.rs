@@ -32,6 +32,9 @@ use crate::{
     view::{Selection, View, is_word, move_head},
 };
 
+/// Number of picker candidates shown at once (and the mouse hit-test window).
+const PICKER_VIEW_WINDOW: usize = 20;
+
 pub struct Editor {
     documents: HashMap<DocumentId, Document>,
     next_doc_id: u64,
@@ -68,6 +71,8 @@ pub struct Editor {
     deferred_hover: Option<(DocumentId, CharIdx)>,
     pending_lsp_sync: HashSet<DocumentId>,
     document_versions: HashMap<DocumentId, i32>,
+    nav_back: Vec<(DocumentId, CharIdx)>,
+    nav_forward: Vec<(DocumentId, CharIdx)>,
     pending_self_disk_updates: HashMap<DocumentId, usize>,
     terminal: Option<vt100::Parser>,
     terminal_selection: Option<TerminalSelection>,
@@ -121,6 +126,8 @@ impl Default for Editor {
             deferred_hover: None,
             pending_lsp_sync: HashSet::new(),
             document_versions: HashMap::new(),
+            nav_back: Vec::new(),
+            nav_forward: Vec::new(),
             pending_self_disk_updates: HashMap::new(),
             terminal: None,
             terminal_selection: None,
@@ -160,6 +167,7 @@ impl Editor {
                         at,
                     );
                 });
+                self.autocomplete_after_typing(character);
                 Vec::new()
             }
             AppEvent::TextPaste(text) => {
@@ -192,6 +200,29 @@ impl Editor {
                 effects
             }
             AppEvent::Mouse(mouse) => {
+                if self.search.is_some() {
+                    let (pane_x, _, pane_width, _) = self.search_pane_rect();
+                    let over_pane =
+                        mouse.event.column >= pane_x && mouse.event.column < pane_x + pane_width;
+                    match mouse.event.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Some(effects) =
+                                self.search_pane_click(mouse.event.column, mouse.event.row)
+                            {
+                                return effects;
+                            }
+                        }
+                        MouseEventKind::ScrollDown if over_pane => {
+                            self.scroll_search_results(3);
+                            return Vec::new();
+                        }
+                        MouseEventKind::ScrollUp if over_pane => {
+                            self.scroll_search_results(-3);
+                            return Vec::new();
+                        }
+                        _ => {}
+                    }
+                }
                 let on_split_divider = matches!(
                     self.layout,
                     Layout::EditorAndEditor { .. } | Layout::EditorAndShell { .. }
@@ -206,6 +237,16 @@ impl Editor {
                     && !on_split_divider;
                 let copy_shell_selection = self.focus == Focus::Shell
                     && matches!(mouse.event.kind, MouseEventKind::Up(MouseButton::Left));
+                if matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    self.dismiss_completion();
+                    // A plain click is a jump; remember where we were so Ctrl+E can
+                    // return. Ctrl+click goes to definition, which records its own origin.
+                    if !mouse.event.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(self.focus, Focus::Editor(_))
+                    {
+                        self.record_jump_origin();
+                    }
+                }
                 self.apply_mouse(mouse);
                 if copy_shell_selection {
                     self.copy_shell_selection(false)
@@ -233,7 +274,6 @@ impl Editor {
                 let effects = match result {
                     Ok(config) => {
                         self.config = config;
-                        crate::highlight::warm_hover_highlighting();
                         self.refresh_languages();
                         self.start_workspace_lsps()
                     }
@@ -487,17 +527,16 @@ impl Editor {
 
     pub fn picker_view(&self) -> Option<PickerView> {
         let picker = self.picker.as_ref()?;
-        const VIEW_WINDOW: usize = 5;
         let start = picker
             .selected
-            .saturating_sub(VIEW_WINDOW / 2)
-            .min(picker.filtered.len().saturating_sub(VIEW_WINDOW));
+            .saturating_sub(PICKER_VIEW_WINDOW / 2)
+            .min(picker.filtered.len().saturating_sub(PICKER_VIEW_WINDOW));
         let matcher = SkimMatcherV2::default();
         let items = picker
             .filtered
             .iter()
             .skip(start)
-            .take(VIEW_WINDOW)
+            .take(PICKER_VIEW_WINDOW)
             .filter_map(|index| picker.candidates.get(*index))
             .map(|candidate| {
                 let label = self.candidate_label(candidate);
@@ -522,7 +561,7 @@ impl Editor {
             items,
             selected: picker.selected.saturating_sub(start),
             has_before: start > 0,
-            has_after: start + VIEW_WINDOW < picker.filtered.len(),
+            has_after: start + PICKER_VIEW_WINDOW < picker.filtered.len(),
             total: picker.filtered.len(),
         })
     }
@@ -532,7 +571,7 @@ impl Editor {
         let items = search
             .hits
             .iter()
-            .take(12)
+            .take(500)
             .map(|hit| match hit {
                 SearchHit::Buffer { doc, range } => {
                     format!(
@@ -564,6 +603,9 @@ impl Editor {
             filters: search.filters.clone(),
             items,
             current: search.current,
+            total: search.hits.len(),
+            field_cursor: search.field_cursor,
+            results_scroll: search.results_scroll,
         })
     }
 
@@ -622,6 +664,10 @@ impl Editor {
 
     pub fn shell_visible(&self) -> bool {
         matches!(self.layout, Layout::EditorAndShell { .. })
+    }
+
+    pub fn search_pane_visible(&self) -> bool {
+        self.search.is_some()
     }
 
     pub fn focused_side(&self) -> Side {
@@ -1032,6 +1078,7 @@ impl Editor {
                             }
                         };
                         if let Some(location) = location {
+                            self.record_jump_origin();
                             let path =
                                 PathBuf::from(location.uri.as_str().trim_start_matches("file://"));
                             if let Some((doc, document)) = self
@@ -1255,17 +1302,105 @@ impl Editor {
         self.request_completion(true)
     }
 
+    fn current_location(&self) -> Option<(DocumentId, CharIdx)> {
+        let pane = self.layout.active_editor(self.focus)?;
+        Some((pane.view.doc, pane.view.selections.primary().head))
+    }
+
+    /// Remember the caret's current spot before a jump so Ctrl+E can return to it.
+    fn record_jump_origin(&mut self) {
+        if let Some(location) = self.current_location() {
+            if self.nav_back.last() == Some(&location) {
+                return;
+            }
+            self.nav_back.push(location);
+            if self.nav_back.len() > 200 {
+                self.nav_back.remove(0);
+            }
+            self.nav_forward.clear();
+        }
+    }
+
+    /// Ctrl+E / Ctrl+R: step back and forward through visited caret locations.
+    fn navigate_history(&mut self, back: bool) {
+        let Some(current) = self.current_location() else {
+            return;
+        };
+        let target = if back {
+            self.nav_back.pop()
+        } else {
+            self.nav_forward.pop()
+        };
+        let Some((doc, head)) = target else {
+            self.status = Some(if back {
+                "戻る履歴がありません".to_owned()
+            } else {
+                "進む履歴がありません".to_owned()
+            });
+            self.dirty = true;
+            return;
+        };
+        if !self.documents.contains_key(&doc) {
+            // The document was closed; drop the stale entry and retry.
+            return self.navigate_history(back);
+        }
+        if back {
+            self.nav_forward.push(current);
+        } else {
+            self.nav_back.push(current);
+        }
+        self.go_to_location(doc, head);
+    }
+
+    fn go_to_location(&mut self, doc: DocumentId, head: CharIdx) {
+        let clamped = self
+            .documents
+            .get(&doc)
+            .and_then(Document::editable_opt)
+            .map_or(head, |editable| {
+                CharIdx(head.0.min(editable.text().len_chars()))
+            });
+        let focus = self.focus;
+        if let Some(pane) = self.layout.active_editor_mut(focus) {
+            if pane.view.doc != doc {
+                pane.view = View::new(doc);
+            }
+            pane.view.selections.set_single(Selection::caret(clamped));
+        }
+        self.ensure_cursor_visible();
+        self.dirty = true;
+    }
+
+    /// Close the completion popup (e.g. when the caret moves away). Restores editor
+    /// focus if the popup currently holds it.
+    fn dismiss_completion(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            if matches!(self.focus, Focus::Completion(_)) {
+                self.focus = Focus::Editor(completion.return_side);
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Hide the hover popup and cancel any in-flight or deferred hover request.
+    /// Opening any other pane or window dismisses hover, since the newest surface
+    /// takes priority.
+    fn dismiss_hover(&mut self) {
+        self.hover = None;
+        self.deferred_hover = None;
+        self.pending_lsp
+            .retain(|_, pending| !matches!(pending, PendingLsp::Hover { .. }));
+    }
+
     fn request_completion(&mut self, manual: bool) -> Vec<Effect> {
         let side = match self.focus {
             Focus::Editor(side) | Focus::Completion(side) => side,
             Focus::Shell | Focus::Overlay => Side::Left,
         };
         let Some((server, path, line, character)) = self.active_lsp_context() else {
-            if manual {
-                self.status = Some("このバッファではLSP補完を利用できません".to_owned());
-                self.dirty = true;
-            }
-            return Vec::new();
+            // No LSP completion for this buffer: fall back to the words already
+            // present in the file.
+            return self.word_completion(manual);
         };
         let Some((doc, version, prefix, anchor)) = self.completion_context() else {
             return Vec::new();
@@ -1297,6 +1432,89 @@ impl Editor {
             })
             .to_string(),
         }]
+    }
+
+    /// After typing a word character in a buffer without LSP completion, pop up
+    /// word-based suggestions. LSP buffers use the debounced didChange path instead.
+    fn autocomplete_after_typing(&mut self, character: char) {
+        if is_word(character) && self.active_lsp_context().is_none() {
+            self.word_completion(false);
+        }
+    }
+
+    /// Completion fallback for buffers without an LSP: offer the identifiers that
+    /// already appear in the file, ranked by frequency.
+    fn word_completion(&mut self, manual: bool) -> Vec<Effect> {
+        let side = match self.focus {
+            Focus::Editor(side) | Focus::Completion(side) => side,
+            Focus::Shell | Focus::Overlay => Side::Left,
+        };
+        let Some((doc, _version, prefix, anchor)) = self.completion_context() else {
+            return Vec::new();
+        };
+        if prefix.is_empty() {
+            if manual {
+                self.status = Some("補完候補がありません".to_owned());
+                self.dirty = true;
+            }
+            return Vec::new();
+        }
+        let Some(text) = self
+            .documents
+            .get(&doc)
+            .and_then(Document::editable_opt)
+            .map(|editable| editable.text().to_string())
+        else {
+            return Vec::new();
+        };
+        let prefix_lower = prefix.to_lowercase();
+        let prefix_len = prefix.chars().count();
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for word in text.split(|character| !is_word(character)) {
+            if word.chars().count() <= prefix_len {
+                continue;
+            }
+            if word.to_lowercase().starts_with(&prefix_lower) {
+                *counts.entry(word).or_insert(0) += 1;
+            }
+        }
+        let mut ranked: Vec<(usize, &str)> = counts
+            .into_iter()
+            .map(|(word, count)| (count, word))
+            .collect();
+        ranked.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.len().cmp(&right.1.len()))
+                .then_with(|| left.1.cmp(right.1))
+        });
+        let items: Vec<_> = ranked
+            .into_iter()
+            .take(50)
+            .map(|(_, word)| CompletionCandidate {
+                insert: word.to_owned(),
+                cursor_back: 0,
+                label: word.to_owned(),
+                prefix_len,
+            })
+            .collect();
+        if items.is_empty() {
+            if manual {
+                self.status = Some("補完候補がありません".to_owned());
+                self.dirty = true;
+            }
+            return Vec::new();
+        }
+        self.completion = Some(CompletionState {
+            items,
+            selected: 0,
+            return_side: side,
+            anchor,
+        });
+        self.focus = Focus::Completion(side);
+        self.dirty = true;
+        Vec::new()
     }
 
     fn completion_context(&self) -> Option<(DocumentId, i32, String, CharIdx)> {
@@ -1942,29 +2160,16 @@ impl Editor {
                 return self.open_search(false, SearchScope::Directory);
             }
             Command::CycleSearchScope => return self.cycle_search_scope(),
+            Command::SearchCursorLeft => self.move_search_cursor(false),
+            Command::SearchCursorRight => self.move_search_cursor(true),
             Command::PickerUp => self.move_picker(-1),
             Command::PickerDown => self.move_picker(1),
             Command::PickerBackspace => {
                 if let Some(rename) = &mut self.rename_input {
                     rename.pop();
                     self.dirty = true;
-                } else if let Some(search) = &mut self.search {
-                    if let Some(field) = search.editing_filter {
-                        match field {
-                            SearchFilterField::Include => {
-                                search.include_input.pop();
-                            }
-                            SearchFilterField::Exclude => {
-                                search.exclude_input.pop();
-                            }
-                        }
-                    } else if search.editing_replace {
-                        if let Some(replacement) = &mut search.replacement {
-                            replacement.pop();
-                        }
-                    } else {
-                        search.query.pop();
-                    }
+                } else if self.search.is_some() {
+                    self.backspace_search_char();
                     return self.refresh_search();
                 } else if let Some(picker) = &mut self.picker {
                     picker.query.pop();
@@ -1999,6 +2204,7 @@ impl Editor {
                         }
                         None => {}
                     }
+                    search.field_cursor = search_field_len(search);
                     self.dirty = true;
                 }
             }
@@ -2052,6 +2258,8 @@ impl Editor {
             Command::Redo => self.edit_active(|document, view| {
                 document.editable_mut().redo(&mut view.selections);
             }),
+            Command::NavigateBack => self.navigate_history(true),
+            Command::NavigateForward => self.navigate_history(false),
             Command::Quit => {
                 if self.documents.values().any(|document| {
                     document
@@ -2096,10 +2304,7 @@ impl Editor {
                     editor: EditorPane { view },
                 };
                 self.focus = Focus::Shell;
-                self.hover = None;
-                self.deferred_hover = None;
-                self.pending_lsp
-                    .retain(|_, pending| !matches!(pending, PendingLsp::Hover { .. }));
+                self.dismiss_hover();
                 self.dirty = true;
                 if self.terminal.is_some() {
                     return Vec::new();
@@ -2621,10 +2826,7 @@ impl Editor {
                     }
                     Layout::EditorAndShell { .. } if right_half => {
                         self.focus = Focus::Shell;
-                        self.hover = None;
-                        self.deferred_hover = None;
-                        self.pending_lsp
-                            .retain(|_, pending| !matches!(pending, PendingLsp::Hover { .. }));
+                        self.dismiss_hover();
                         if let Some(point) = self.terminal_mouse_position(mouse.column, mouse.row)
                             && let Some(parser) = &self.terminal
                         {
@@ -2729,7 +2931,7 @@ impl Editor {
     }
 
     fn open_picker(&mut self, mode: PickerMode) {
-        self.hover = None;
+        self.dismiss_hover();
         let Some(base) = self
             .layout
             .active_editor(self.focus)
@@ -2780,7 +2982,7 @@ impl Editor {
     }
 
     fn open_command_palette(&mut self) {
-        self.hover = None;
+        self.dismiss_hover();
         let base = self
             .layout
             .active_editor(self.focus)
@@ -2807,7 +3009,7 @@ impl Editor {
     }
 
     fn open_directory_picker(&mut self) -> Vec<Effect> {
-        self.hover = None;
+        self.dismiss_hover();
         let base = self
             .layout
             .active_editor(self.focus)
@@ -2870,31 +3072,287 @@ impl Editor {
 
     fn open_search(&mut self, replace: bool, scope: SearchScope) -> Vec<Effect> {
         if self.search.is_some() {
-            return self.cycle_search_scope();
+            // Ctrl+F only toggles the pane's visibility; scope and options are
+            // adjusted with the mouse inside the pane.
+            return self.close_search_pane();
         }
+        // Replace is opt-in via the checkbox; a fresh pane starts as find-only.
+        let _ = replace;
         self.picker = None;
+        self.dismiss_hover();
         self.search = Some(SearchState {
             query: String::new(),
-            replacement: replace.then(String::new),
+            replacement: None,
             editing_replace: false,
             editing_filter: None,
             scope,
             options: SearchOptions::default(),
             include_input: String::new(),
-            exclude_input: self.config.search.exclude.join(","),
+            exclude_input: String::new(),
             filters: SearchFilters {
                 include: Vec::new(),
-                exclude: self.config.search.exclude.clone(),
+                exclude: Vec::new(),
+                exclude_dirs: self.config.search.exclude.clone(),
                 respect_ignore_files: self.config.search.respect_ignore_files,
                 include_hidden: self.config.search.include_hidden,
             },
             hits: Vec::new(),
             current: 0,
             grep_token: None,
+            field_cursor: 0,
+            results_scroll: 0,
         });
         self.focus = Focus::Overlay;
         self.dirty = true;
         Vec::new()
+    }
+
+    fn toggle_replace_field(&mut self) {
+        if let Some(search) = &mut self.search {
+            if search.replacement.is_some() {
+                search.replacement = None;
+                search.editing_replace = false;
+            } else {
+                search.replacement = Some(String::new());
+                search.editing_filter = None;
+                search.editing_replace = true;
+                search.field_cursor = 0;
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Jump to and open the file for the given result index, closing the pane.
+    fn open_search_hit(&mut self, index: usize) -> Vec<Effect> {
+        let Some(hit) = self
+            .search
+            .as_ref()
+            .and_then(|search| search.hits.get(index).cloned())
+        else {
+            return Vec::new();
+        };
+        self.record_jump_origin();
+        let effects = match hit {
+            SearchHit::Buffer { doc, range } => {
+                let mut view = View::new(doc);
+                view.selections.set_single(Selection {
+                    anchor: CharIdx(range.start),
+                    head: CharIdx(range.end),
+                });
+                self.layout = Layout::EditorFull(EditorPane { view });
+                Vec::new()
+            }
+            SearchHit::Disk(hit) => {
+                if let Some((doc, _)) = self.documents.iter().find(|(_, document)| {
+                    document.path.as_ref() == Some(&hit.path) && document.large().is_some()
+                }) {
+                    let mut view = View::new(*doc);
+                    view.scroll.top_line = hit.line;
+                    self.layout = Layout::EditorFull(EditorPane { view });
+                    Vec::new()
+                } else {
+                    self.open_paths([hit.path])
+                }
+            }
+        };
+        self.search = None;
+        self.focus = Focus::Editor(Side::Left);
+        self.dirty = true;
+        effects
+    }
+
+    /// The "Run Replace" button: replace every match in one shot.
+    fn run_replace(&mut self) -> Vec<Effect> {
+        let Some(search) = self.search.take() else {
+            return Vec::new();
+        };
+        let Some(replacement) = search.replacement else {
+            return Vec::new();
+        };
+        let Ok(pattern) = search_pattern(&search.query, search.options) else {
+            self.status = Some("検索式が不正です".to_owned());
+            self.focus = Focus::Editor(Side::Left);
+            self.dirty = true;
+            return Vec::new();
+        };
+        if search.scope == SearchScope::Directory {
+            let paths: HashSet<_> = search
+                .hits
+                .into_iter()
+                .filter_map(|hit| match hit {
+                    SearchHit::Disk(hit) => Some(hit.path),
+                    SearchHit::Buffer { .. } => None,
+                })
+                .collect();
+            self.confirm = Some(ConfirmState {
+                message: format!(
+                    "{}ファイルをディスク上で置換します。続行しますか? [Enter / Esc]",
+                    paths.len()
+                ),
+                action: ConfirmAction::DirectoryReplace {
+                    paths: paths.into_iter().collect(),
+                    pattern: pattern.as_str().to_owned(),
+                    replacement,
+                },
+            });
+            self.focus = Focus::Overlay;
+            self.dirty = true;
+            return Vec::new();
+        }
+        let mut by_document: HashMap<DocumentId, Vec<Selection>> = HashMap::new();
+        for hit in search.hits {
+            if let SearchHit::Buffer { doc, range } = hit {
+                by_document.entry(doc).or_default().push(Selection {
+                    anchor: CharIdx(range.start),
+                    head: CharIdx(range.end),
+                });
+            }
+        }
+        for (id, selections) in by_document {
+            let Some(document) = self.documents.get_mut(&id) else {
+                continue;
+            };
+            let Some(editable) = document.editable_opt() else {
+                continue;
+            };
+            let fragments: Vec<_> = selections
+                .iter()
+                .map(|selection| {
+                    let matched = editable.text().slice(selection.range()).to_string();
+                    pattern.replace(&matched, replacement.as_str()).into_owned()
+                })
+                .collect();
+            let mut selections = crate::view::Selections::from_vec(selections, 0);
+            document
+                .editable_mut()
+                .insert_fragments(&mut selections, &fragments);
+        }
+        self.status = Some("置換を適用しました".to_owned());
+        self.focus = Focus::Editor(Side::Left);
+        self.dirty = true;
+        Vec::new()
+    }
+
+    fn close_search_pane(&mut self) -> Vec<Effect> {
+        if self.search.take().is_some() {
+            self.finish_progress("grep");
+            self.focus = Focus::Editor(self.focused_side());
+            self.dirty = true;
+        }
+        Vec::new()
+    }
+
+    fn set_search_scope(&mut self, scope: SearchScope) -> Vec<Effect> {
+        if let Some(search) = &mut self.search {
+            if search.scope == scope {
+                return Vec::new();
+            }
+            search.scope = scope;
+        }
+        self.refresh_search()
+    }
+
+    /// The right-half rectangle occupied by the search pane: `(x, y, width, height)`.
+    fn search_pane_rect(&self) -> (u16, u16, u16, u16) {
+        let (cols, rows) = self.terminal_size;
+        let content_height = rows.saturating_sub(1);
+        let x = split_left_width(cols).saturating_add(1);
+        (x, 0, cols.saturating_sub(x), content_height)
+    }
+
+    /// Handle a left-click while the search pane is open. Returns `Some` when the
+    /// click landed inside the pane (and was consumed), `None` otherwise.
+    fn search_pane_click(&mut self, column: u16, row: u16) -> Option<Vec<Effect>> {
+        let (pane_x, pane_y, pane_width, pane_height) = self.search_pane_rect();
+        if column < pane_x
+            || column >= pane_x + pane_width
+            || row < pane_y
+            || row >= pane_y + pane_height
+        {
+            return None;
+        }
+        let search = self.search.as_ref()?;
+        let directory = search.scope == SearchScope::Directory;
+        let replace_enabled = search.replacement.is_some();
+        let layout = search_pane_layout(directory, replace_enabled);
+        let relative = row - pane_y;
+        let inner_x = pane_x + 1;
+
+        if relative == layout.scope_row {
+            let scopes = [
+                SearchScope::CurrentBuffer,
+                SearchScope::AllBuffers,
+                SearchScope::Directory,
+            ];
+            for (index, (start, end)) in search_scope_tab_ranges(inner_x).into_iter().enumerate() {
+                if column >= start && column < end {
+                    return Some(self.set_search_scope(scopes[index]));
+                }
+            }
+            return Some(Vec::new());
+        }
+        if relative == layout.toggle_row {
+            for (index, (start, end)) in search_toggle_click_ranges(inner_x).into_iter().enumerate()
+            {
+                if column >= start && column < end {
+                    return Some(self.toggle_search_option(move |options| match index {
+                        0 => options.case_sensitive = !options.case_sensitive,
+                        1 => options.whole_word = !options.whole_word,
+                        _ => options.regex = !options.regex,
+                    }));
+                }
+            }
+            return Some(Vec::new());
+        }
+        if in_box(relative, layout.find_top) {
+            self.focus_search_field(None, false);
+            return Some(Vec::new());
+        }
+        if relative == layout.replace_checkbox_row {
+            // The run button lives to the right of a ticked checkbox on this row.
+            let (button_start, button_end) = search_run_button_range(inner_x);
+            if replace_enabled && column >= button_start && column < button_end {
+                return Some(self.run_replace());
+            }
+            self.toggle_replace_field();
+            return Some(Vec::new());
+        }
+        if let Some(top) = layout.replace_top
+            && in_box(relative, top)
+        {
+            self.focus_search_field(None, true);
+            return Some(Vec::new());
+        }
+        if let Some(top) = layout.include_top
+            && in_box(relative, top)
+        {
+            self.focus_search_field(Some(SearchFilterField::Include), false);
+            return Some(Vec::new());
+        }
+        if let Some(top) = layout.exclude_top
+            && in_box(relative, top)
+        {
+            self.focus_search_field(Some(SearchFilterField::Exclude), false);
+            return Some(Vec::new());
+        }
+        if relative > layout.results_top {
+            let index = usize::from(relative - layout.results_top - 1)
+                + self
+                    .search
+                    .as_ref()
+                    .map_or(0, |search| search.results_scroll);
+            return Some(self.open_search_hit(index));
+        }
+        Some(Vec::new())
+    }
+
+    fn focus_search_field(&mut self, filter: Option<SearchFilterField>, replace: bool) {
+        if let Some(search) = &mut self.search {
+            search.editing_filter = filter;
+            search.editing_replace = replace && search.replacement.is_some();
+            search.field_cursor = search_field_len(search);
+            self.dirty = true;
+        }
     }
 
     fn cycle_search_scope(&mut self) -> Vec<Effect> {
@@ -3030,99 +3488,65 @@ impl Editor {
         self.dirty = true;
     }
 
-    fn confirm_search(&mut self) -> Vec<Effect> {
-        let Some(search) = self.search.take() else {
-            return Vec::new();
-        };
-        if let Some(replacement) = search.replacement {
-            let Ok(pattern) = search_pattern(&search.query, search.options) else {
-                self.status = Some("検索式が不正です".to_owned());
-                return Vec::new();
-            };
-            if search.scope == SearchScope::Directory {
-                let paths: HashSet<_> = search
-                    .hits
-                    .into_iter()
-                    .filter_map(|hit| match hit {
-                        SearchHit::Disk(hit) => Some(hit.path),
-                        SearchHit::Buffer { .. } => None,
-                    })
-                    .collect();
-                self.confirm = Some(ConfirmState {
-                    message: format!(
-                        "{}ファイルをディスク上で置換します。続行しますか? [Enter / Esc]",
-                        paths.len()
-                    ),
-                    action: ConfirmAction::DirectoryReplace {
-                        paths: paths.into_iter().collect(),
-                        pattern: pattern.as_str().to_owned(),
-                        replacement,
-                    },
-                });
-                self.focus = Focus::Overlay;
-                self.dirty = true;
-                return Vec::new();
-            }
-            let mut by_document: HashMap<DocumentId, Vec<Selection>> = HashMap::new();
-            for hit in search.hits {
-                if let SearchHit::Buffer { doc, range } = hit {
-                    by_document.entry(doc).or_default().push(Selection {
-                        anchor: CharIdx(range.start),
-                        head: CharIdx(range.end),
-                    });
-                }
-            }
-            for (id, selections) in by_document {
-                let Some(document) = self.documents.get_mut(&id) else {
-                    continue;
-                };
-                let Some(editable) = document.editable_opt() else {
-                    continue;
-                };
-                let fragments: Vec<_> = selections
-                    .iter()
-                    .map(|selection| {
-                        let range = selection.range();
-                        let matched = editable.text().slice(range).to_string();
-                        pattern.replace(&matched, replacement.as_str()).into_owned()
-                    })
-                    .collect();
-                let mut selections = crate::view::Selections::from_vec(selections, 0);
-                document
-                    .editable_mut()
-                    .insert_fragments(&mut selections, &fragments);
-            }
-            self.status = Some("置換を適用しました".to_owned());
-        } else if let Some(hit) = search.hits.get(search.current) {
-            match hit {
-                SearchHit::Buffer { doc, range } => {
-                    let mut view = View::new(*doc);
-                    view.selections.set_single(Selection {
-                        anchor: CharIdx(range.start),
-                        head: CharIdx(range.end),
-                    });
-                    self.layout = Layout::EditorFull(EditorPane { view });
-                }
-                SearchHit::Disk(hit) => {
-                    let path = hit.path.clone();
-                    if let Some((doc, _)) = self.documents.iter().find(|(_, document)| {
-                        document.path.as_ref() == Some(&path) && document.large().is_some()
-                    }) {
-                        let mut view = View::new(*doc);
-                        view.scroll.top_line = hit.line;
-                        self.layout = Layout::EditorFull(EditorPane { view });
-                        self.focus = Focus::Editor(Side::Left);
-                        self.dirty = true;
-                        return Vec::new();
-                    }
-                    self.focus = Focus::Editor(Side::Left);
-                    return self.open_paths([path]);
-                }
-            }
+    fn active_search_field_mut(&mut self) -> Option<&mut String> {
+        let search = self.search.as_mut()?;
+        match search.editing_filter {
+            Some(SearchFilterField::Include) => Some(&mut search.include_input),
+            Some(SearchFilterField::Exclude) => Some(&mut search.exclude_input),
+            None if search.editing_replace => search.replacement.as_mut(),
+            None => Some(&mut search.query),
         }
-        self.focus = Focus::Editor(Side::Left);
-        self.dirty = true;
-        Vec::new()
+    }
+
+    fn insert_search_char(&mut self, character: char) {
+        let cursor = self.search.as_ref().map_or(0, |search| search.field_cursor);
+        let Some(field) = self.active_search_field_mut() else {
+            return;
+        };
+        let byte = char_byte_index(field, cursor);
+        field.insert(byte, character);
+        if let Some(search) = &mut self.search {
+            search.field_cursor = cursor + 1;
+        }
+    }
+
+    fn backspace_search_char(&mut self) {
+        let cursor = self.search.as_ref().map_or(0, |search| search.field_cursor);
+        if cursor == 0 {
+            return;
+        }
+        if let Some(field) = self.active_search_field_mut() {
+            let end = char_byte_index(field, cursor);
+            let start = char_byte_index(field, cursor - 1);
+            field.replace_range(start..end, "");
+        }
+        if let Some(search) = &mut self.search {
+            search.field_cursor = cursor - 1;
+        }
+    }
+
+    fn move_search_cursor(&mut self, right: bool) {
+        if let Some(search) = &mut self.search {
+            let len = search_field_len(search);
+            search.field_cursor = if right {
+                (search.field_cursor + 1).min(len)
+            } else {
+                search.field_cursor.saturating_sub(1)
+            };
+            self.dirty = true;
+        }
+    }
+
+    fn scroll_search_results(&mut self, delta: isize) {
+        if let Some(search) = &mut self.search {
+            let max = search.hits.len().saturating_sub(1);
+            search.results_scroll = if delta < 0 {
+                search.results_scroll.saturating_sub(delta.unsigned_abs())
+            } else {
+                (search.results_scroll + delta as usize).min(max)
+            };
+            self.dirty = true;
+        }
     }
 
     fn overlay_input(&mut self, character: char) -> Vec<Effect> {
@@ -3131,19 +3555,8 @@ impl Editor {
             self.dirty = true;
             return Vec::new();
         }
-        if let Some(search) = &mut self.search {
-            if let Some(field) = search.editing_filter {
-                match field {
-                    SearchFilterField::Include => search.include_input.push(character),
-                    SearchFilterField::Exclude => search.exclude_input.push(character),
-                }
-            } else if search.editing_replace {
-                if let Some(replacement) = &mut search.replacement {
-                    replacement.push(character);
-                }
-            } else {
-                search.query.push(character);
-            }
+        if self.search.is_some() {
+            self.insert_search_char(character);
             return self.refresh_search();
         }
         if let Some(picker) = &mut self.picker {
@@ -3214,14 +3627,8 @@ impl Editor {
             self.dirty = true;
             return;
         }
-        if let Some(search) = &mut self.search {
-            let max = search.hits.len().saturating_sub(1);
-            search.current = if amount < 0 {
-                search.current.saturating_sub(amount.unsigned_abs())
-            } else {
-                (search.current + amount as usize).min(max)
-            };
-            self.dirty = true;
+        if self.search.is_some() {
+            // Results are browsed with the mouse wheel, not the keyboard.
             return;
         }
         let Some(picker) = &mut self.picker else {
@@ -3327,7 +3734,9 @@ impl Editor {
             return Vec::new();
         }
         if self.search.is_some() {
-            return self.confirm_search();
+            // The search pane is entirely mouse-driven: results open on click and
+            // replacement runs from the button, so Enter does nothing here.
+            return Vec::new();
         }
         let Some(picker) = self.picker.take() else {
             return Vec::new();
@@ -3501,15 +3910,20 @@ impl Editor {
             .indentation_for_language(document.language.as_deref())
             .0;
         let gutter_width = text.len_lines().max(1).to_string().len().max(2) + 3;
-        let pane_width = match self.layout {
-            Layout::EditorFull(_) => self.terminal_size.0,
-            Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. }
-                if matches!(self.focus, Focus::Editor(Side::Right)) =>
-            {
-                split_right_width(self.terminal_size.0)
-            }
-            Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. } => {
-                split_left_width(self.terminal_size.0)
+        let pane_width = if self.search.is_some() {
+            // The search pane occupies the right half; the editor is on the left.
+            split_left_width(self.terminal_size.0)
+        } else {
+            match self.layout {
+                Layout::EditorFull(_) => self.terminal_size.0,
+                Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. }
+                    if matches!(self.focus, Focus::Editor(Side::Right)) =>
+                {
+                    split_right_width(self.terminal_size.0)
+                }
+                Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. } => {
+                    split_left_width(self.terminal_size.0)
+                }
             }
         }
         .max(1);
@@ -3654,6 +4068,7 @@ impl Editor {
     }
 
     fn move_active(&mut self, direction: Direction, unit: Unit, extend: bool) {
+        self.dismiss_completion();
         let focus = self.focus;
         let (documents, layout) = (&mut self.documents, &mut self.layout);
         let Some(pane) = layout.active_editor_mut(focus) else {
@@ -3714,15 +4129,19 @@ impl Editor {
             return;
         }
         let rows = usize::from(self.terminal_size.1.saturating_sub(1)).max(1);
-        let pane_cols = match self.layout {
-            Layout::EditorFull(_) => usize::from(self.terminal_size.0),
-            Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. }
-                if matches!(self.focus, Focus::Editor(Side::Right)) =>
-            {
-                usize::from(split_right_width(self.terminal_size.0))
-            }
-            Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. } => {
-                usize::from(split_left_width(self.terminal_size.0))
+        let pane_cols = if self.search.is_some() {
+            usize::from(split_left_width(self.terminal_size.0))
+        } else {
+            match self.layout {
+                Layout::EditorFull(_) => usize::from(self.terminal_size.0),
+                Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. }
+                    if matches!(self.focus, Focus::Editor(Side::Right)) =>
+                {
+                    usize::from(split_right_width(self.terminal_size.0))
+                }
+                Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. } => {
+                    usize::from(split_left_width(self.terminal_size.0))
+                }
             }
         }
         .max(1);
@@ -3851,20 +4270,8 @@ impl CommandPaletteEntry {
 const COMMAND_PALETTE: &[CommandPaletteEntry] = &[
     CommandPaletteEntry {
         key: "Ctrl+F",
-        name: "Find / 検索",
-        description: "現在→全バッファ→ディレクトリを検索",
-        command: Command::OpenSearch,
-    },
-    CommandPaletteEntry {
-        key: "Ctrl+Shift+F",
-        name: "Find in Files / 全体検索",
-        description: "ディレクトリを直接検索",
-        command: Command::OpenSearchInDirectory,
-    },
-    CommandPaletteEntry {
-        key: "Ctrl+H",
-        name: "Replace / 置換",
-        description: "検索と置換を開く",
+        name: "Find & Replace / 検索・置換",
+        description: "右ペインを開く。再押下で現在→全バッファ→ディレクトリと範囲切替",
         command: Command::OpenReplace,
     },
     CommandPaletteEntry {
@@ -3914,6 +4321,18 @@ const COMMAND_PALETTE: &[CommandPaletteEntry] = &[
         name: "Redo / やり直す",
         description: "元に戻した編集をやり直す",
         command: Command::Redo,
+    },
+    CommandPaletteEntry {
+        key: "Ctrl+E",
+        name: "Go Back / 戻る",
+        description: "直前のカーソル位置へ戻る",
+        command: Command::NavigateBack,
+    },
+    CommandPaletteEntry {
+        key: "Ctrl+R",
+        name: "Go Forward / 進む",
+        description: "戻る前のカーソル位置へ進む",
+        command: Command::NavigateForward,
     },
     CommandPaletteEntry {
         key: "Ctrl+C",
@@ -4073,6 +4492,8 @@ struct SearchState {
     hits: Vec<SearchHit>,
     current: usize,
     grep_token: Option<u64>,
+    field_cursor: usize,
+    results_scroll: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4131,17 +4552,33 @@ pub struct SearchOptions {
 pub struct SearchFilters {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
+    /// Directory names pruned from the walk regardless of the exclude field.
+    pub exclude_dirs: Vec<String>,
     pub respect_ignore_files: bool,
     pub include_hidden: bool,
 }
 
+fn char_byte_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
+fn search_field_len(search: &SearchState) -> usize {
+    match search.editing_filter {
+        Some(SearchFilterField::Include) => search.include_input.chars().count(),
+        Some(SearchFilterField::Exclude) => search.exclude_input.chars().count(),
+        None if search.editing_replace => {
+            search.replacement.as_deref().unwrap_or("").chars().count()
+        }
+        None => search.query.chars().count(),
+    }
+}
+
+/// Split an include/exclude field into `-name` patterns. Patterns are separated by
+/// whitespace, so `*.rs *.md` matches either extension.
 fn split_globs(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|glob| !glob.is_empty())
-        .map(str::to_owned)
-        .collect()
+    value.split_whitespace().map(str::to_owned).collect()
 }
 
 fn file_uri_path(uri: &str) -> Option<PathBuf> {
@@ -4163,6 +4600,110 @@ fn search_pattern(query: &str, options: SearchOptions) -> Result<regex::Regex, r
     regex::Regex::new(&source)
 }
 
+// Geometry of the search pane, shared between rendering and mouse hit-testing so
+// clicks land on the same controls that are drawn. Rows are relative to the pane
+// top; input boxes are three rows tall (border / text / border). The replace box
+// and directory filters appear conditionally, so row positions are computed rather
+// than fixed.
+pub(crate) const SEARCH_SCOPE_LABELS: [&str; 3] = [" file ", " buffers ", " dir "];
+pub(crate) const SEARCH_TOGGLE_LABELS: [&str; 3] = ["[Aa]", "[W]", "[.*]"];
+/// The checkbox + label drawn at the start of the replace row.
+pub(crate) const SEARCH_REPLACE_CHECKBOX: &str = "[ ] Replace";
+/// The "Run Replace" button drawn to the right of a ticked checkbox.
+pub(crate) const SEARCH_RUN_BUTTON: &str = "[ Run Replace ]";
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SearchPaneLayout {
+    pub scope_row: u16,
+    pub toggle_row: u16,
+    pub find_top: u16,
+    pub replace_checkbox_row: u16,
+    pub replace_top: Option<u16>,
+    pub include_top: Option<u16>,
+    pub exclude_top: Option<u16>,
+    pub results_top: u16,
+}
+
+/// Column range of the "Run Replace" button on the checkbox row (a gap after the
+/// checkbox label).
+pub(crate) fn search_run_button_range(inner_x: u16) -> (u16, u16) {
+    let start = inner_x + SEARCH_REPLACE_CHECKBOX.chars().count() as u16 + 2;
+    (start, start + SEARCH_RUN_BUTTON.chars().count() as u16)
+}
+
+pub(crate) fn search_pane_layout(directory: bool, replace_enabled: bool) -> SearchPaneLayout {
+    let find_top = 2;
+    let replace_checkbox_row = find_top + 3;
+    let mut next = replace_checkbox_row + 1;
+    let replace_top = if replace_enabled {
+        let top = next;
+        next += 3; // 3-row box; the run button shares the checkbox row
+        Some(top)
+    } else {
+        None
+    };
+    let (include_top, exclude_top) = if directory {
+        let include = next;
+        next += 6; // two 3-row boxes
+        (Some(include), Some(include + 3))
+    } else {
+        (None, None)
+    };
+    SearchPaneLayout {
+        scope_row: 0,
+        toggle_row: 1,
+        find_top,
+        replace_checkbox_row,
+        replace_top,
+        include_top,
+        exclude_top,
+        results_top: next,
+    }
+}
+
+/// Whether a pane-relative row falls inside a three-row bordered input box.
+pub(crate) fn in_box(relative: u16, top: u16) -> bool {
+    relative >= top && relative < top + 3
+}
+
+pub(crate) fn search_scope_tab_ranges(inner_x: u16) -> [(u16, u16); 3] {
+    let mut x = inner_x;
+    let mut ranges = [(0, 0); 3];
+    for (index, label) in SEARCH_SCOPE_LABELS.iter().enumerate() {
+        let width = label.chars().count() as u16;
+        ranges[index] = (x, x + width);
+        x += width;
+    }
+    ranges
+}
+
+/// Rendered x-position of each toggle label (contiguous label, then two spaces).
+pub(crate) fn search_toggle_label_starts(inner_x: u16) -> [u16; 3] {
+    let mut x = inner_x;
+    let mut starts = [0; 3];
+    for (index, label) in SEARCH_TOGGLE_LABELS.iter().enumerate() {
+        starts[index] = x;
+        x += label.chars().count() as u16 + 2;
+    }
+    starts
+}
+
+/// Clickable ranges for the toggles, tiled so a click in the gap between two
+/// toggles selects the nearer one.
+pub(crate) fn search_toggle_click_ranges(inner_x: u16) -> [(u16, u16); 3] {
+    let starts = search_toggle_label_starts(inner_x);
+    let widths: [u16; 3] = [
+        SEARCH_TOGGLE_LABELS[0].chars().count() as u16,
+        SEARCH_TOGGLE_LABELS[1].chars().count() as u16,
+        SEARCH_TOGGLE_LABELS[2].chars().count() as u16,
+    ];
+    // Boundaries sit at the midpoint of each gap between adjacent labels.
+    let split0 = (starts[0] + widths[0] + starts[1]) / 2;
+    let split1 = (starts[1] + widths[1] + starts[2]) / 2;
+    let end = starts[2] + widths[2];
+    [(inner_x, split0), (split0, split1), (split1, end)]
+}
+
 pub struct SearchView {
     pub query: String,
     pub replacement: Option<String>,
@@ -4175,6 +4716,9 @@ pub struct SearchView {
     pub filters: SearchFilters,
     pub items: Vec<String>,
     pub current: usize,
+    pub total: usize,
+    pub field_cursor: usize,
+    pub results_scroll: usize,
 }
 
 #[derive(Debug)]
@@ -4642,6 +5186,268 @@ mod tests {
                 .primary()
                 .head,
             CharIdx(1)
+        );
+    }
+
+    #[test]
+    fn word_completion_offers_file_words_without_an_lsp() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+        editor.update(AppEvent::TextPaste("hello helper\nhel".to_owned()));
+
+        editor.update(Command::ToggleCompletion.into());
+
+        let view = editor.completion_view().expect("completion popup");
+        assert!(
+            view.items.iter().any(|item| item == "hello"),
+            "{:?}",
+            view.items
+        );
+        assert!(
+            view.items.iter().any(|item| item == "helper"),
+            "{:?}",
+            view.items
+        );
+        // The word being typed is not offered as its own completion.
+        assert!(!view.items.iter().any(|item| item == "hel"));
+    }
+
+    #[test]
+    fn typing_a_word_character_pops_word_completion_without_lsp() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+        editor.update(AppEvent::TextPaste("hello\n".to_owned()));
+
+        editor.update(AppEvent::TextInputAt {
+            character: 'h',
+            at: std::time::Instant::now(),
+        });
+
+        let view = editor.completion_view().expect("completion popup");
+        assert!(
+            view.items.iter().any(|item| item == "hello"),
+            "{:?}",
+            view.items
+        );
+    }
+
+    #[test]
+    fn moving_the_caret_dismisses_the_completion_popup() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+        editor.update(AppEvent::TextPaste("hello\nhel".to_owned()));
+        editor.update(Command::ToggleCompletion.into());
+        assert!(editor.completion_view().is_some());
+
+        editor.update(
+            Command::Move {
+                direction: Direction::Left,
+                unit: Unit::Character,
+                extend: false,
+            }
+            .into(),
+        );
+
+        assert!(editor.completion_view().is_none());
+    }
+
+    #[test]
+    fn navigation_history_returns_to_the_pre_click_caret() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 10 });
+        editor.update(AppEvent::TextPaste("abcdefghij".to_owned()));
+        assert_eq!(
+            editor.current_location(),
+            Some((DocumentId(0), CharIdx(10)))
+        );
+
+        // Click into the middle of the line (gutter is 5 wide, so column 8 is
+        // display column 3).
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 8,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+        assert_eq!(editor.current_location(), Some((DocumentId(0), CharIdx(3))));
+
+        editor.update(Command::NavigateBack.into());
+        assert_eq!(
+            editor.current_location(),
+            Some((DocumentId(0), CharIdx(10)))
+        );
+
+        editor.update(Command::NavigateForward.into());
+        assert_eq!(editor.current_location(), Some((DocumentId(0), CharIdx(3))));
+    }
+
+    #[test]
+    fn replace_is_off_until_the_checkbox_is_ticked() {
+        let mut editor = Editor::default();
+        editor.update(Command::OpenReplace.into());
+        assert!(editor.search_view().unwrap().replacement.is_none());
+
+        editor.toggle_replace_field();
+        assert!(editor.search_view().unwrap().replacement.is_some());
+
+        editor.toggle_replace_field();
+        assert!(editor.search_view().unwrap().replacement.is_none());
+    }
+
+    #[test]
+    fn clicking_the_gap_between_toggles_flips_the_nearer_one() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 24 });
+        editor.update(Command::OpenReplace.into());
+        assert!(!editor.search.as_ref().unwrap().options.case_sensitive);
+
+        // Column 26 is the blank just after the "[Aa]" label; the nearer toggle
+        // is still case-sensitivity.
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 26,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+
+        assert!(editor.search.as_ref().unwrap().options.case_sensitive);
+    }
+
+    #[test]
+    fn clicking_a_result_opens_it_and_closes_the_pane() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 24 });
+        editor.update(AppEvent::TextPaste("foo foo".to_owned()));
+        editor.update(Command::OpenReplace.into());
+        for character in "foo".chars() {
+            editor.update(AppEvent::TextInput(character));
+        }
+        assert_eq!(editor.search_view().unwrap().total, 2);
+
+        // Results start at row 7 (find box + replace checkbox, then the list border).
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 25,
+                row: 7,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+
+        assert!(editor.search_view().is_none());
+        assert_eq!(
+            editor
+                .active_buffer()
+                .unwrap()
+                .view
+                .selections
+                .primary()
+                .head,
+            CharIdx(3)
+        );
+    }
+
+    #[test]
+    fn clicking_the_run_button_replaces_every_match() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 24 });
+        editor.update(AppEvent::TextPaste("one two one".to_owned()));
+        editor.update(Command::OpenReplace.into());
+        for character in "one".chars() {
+            editor.update(AppEvent::TextInput(character));
+        }
+        editor.toggle_replace_field();
+        editor.update(AppEvent::TextInput('X'));
+
+        // The run button sits on the checkbox row (row 5), right of "[x] Replace".
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 36,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "X two X");
+    }
+
+    #[test]
+    fn glob_fields_split_into_multiple_patterns_on_whitespace() {
+        assert_eq!(
+            split_globs("*.rs *.md"),
+            vec!["*.rs".to_owned(), "*.md".to_owned()]
+        );
+        assert_eq!(
+            split_globs("   *.rs    *.md   "),
+            vec!["*.rs".to_owned(), "*.md".to_owned()]
+        );
+        assert!(split_globs("").is_empty());
+    }
+
+    #[test]
+    fn exclude_field_is_empty_with_default_directories_pruned_behind_the_scenes() {
+        let mut editor = Editor::default();
+        editor.update(Command::OpenReplace.into());
+
+        assert_eq!(editor.search_view().unwrap().exclude, "");
+        assert!(
+            editor
+                .search
+                .as_ref()
+                .unwrap()
+                .filters
+                .exclude_dirs
+                .contains(&".git".to_owned())
+        );
+    }
+
+    #[test]
+    fn search_field_supports_horizontal_cursor_editing() {
+        let mut editor = Editor::default();
+        editor.update(Command::OpenReplace.into());
+        for character in "abc".chars() {
+            editor.update(AppEvent::TextInput(character));
+        }
+        editor.update(Command::SearchCursorLeft.into());
+        editor.update(AppEvent::TextInput('X'));
+
+        assert_eq!(editor.search_view().unwrap().query, "abXc");
+    }
+
+    #[test]
+    fn clicking_a_scope_tab_switches_the_search_scope() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 24 });
+        editor.update(Command::OpenReplace.into());
+        assert_eq!(
+            editor.search.as_ref().unwrap().scope,
+            SearchScope::CurrentBuffer
+        );
+
+        // The pane starts at column split_left_width(40)+1 = 21, so its inner
+        // content begins at 22 and the " dir " tab spans columns 37..42.
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 38,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+
+        assert_eq!(
+            editor.search.as_ref().unwrap().scope,
+            SearchScope::Directory
         );
     }
 
@@ -5142,11 +5948,45 @@ mod tests {
 
         let view = editor.picker_view().unwrap();
 
-        assert_eq!(view.items.len(), 5);
+        assert_eq!(view.items.len(), PICKER_VIEW_WINDOW);
         assert!(view.selected < view.items.len());
         assert!(view.items[view.selected].label.contains("file-9000.txt"));
         assert!(view.has_before);
         assert!(view.has_after);
+    }
+
+    #[test]
+    fn picker_ignores_mouse_input() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+        editor.open_command_palette();
+        let selected = editor.picker.as_ref().unwrap().selected;
+
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+
+        // The picker is keyboard-only; the click neither closes it nor moves it.
+        assert!(editor.picker.is_some());
+        assert_eq!(editor.picker.as_ref().unwrap().selected, selected);
+    }
+
+    #[test]
+    fn opening_the_find_pane_dismisses_the_hover_popup() {
+        let mut editor = Editor {
+            hover: Some("docs".to_owned()),
+            ..Default::default()
+        };
+
+        editor.update(Command::OpenReplace.into());
+
+        assert!(editor.hover_view().is_none());
     }
 
     #[test]
@@ -5249,10 +6089,10 @@ mod tests {
             editor.update(AppEvent::TextInput(character));
         }
         assert_eq!(editor.search_view().unwrap().items.len(), 2);
-        editor.update(Command::SearchToggleField.into());
+        // Enable replace via the checkbox, type the replacement, run it.
+        editor.toggle_replace_field();
         editor.update(AppEvent::TextInput('X'));
-
-        editor.update(Command::PickerConfirm.into());
+        editor.run_replace();
 
         assert_eq!(editor.active_buffer().unwrap().text.to_string(), "X two X");
     }
@@ -5327,11 +6167,12 @@ mod tests {
     fn directory_replace_is_confirmed_before_disk_effect() {
         let mut editor = Editor::default();
         editor.update(Command::OpenReplace.into());
-        editor.update(Command::OpenReplace.into());
-        editor.update(Command::OpenReplace.into());
+        editor.update(Command::CycleSearchScope.into());
+        editor.update(Command::CycleSearchScope.into());
         editor.update(AppEvent::TextInput('o'));
-        editor.update(Command::SearchToggleField.into());
+        editor.toggle_replace_field();
         editor.update(AppEvent::TextInput('X'));
+        // Each keystroke restarts the grep, so feed hits for the latest token.
         let token = editor.search.as_ref().unwrap().grep_token.unwrap();
         editor.update(AppEvent::Grep(GrepEvent::Hits {
             token,
@@ -5342,7 +6183,8 @@ mod tests {
             }],
         }));
 
-        assert!(editor.update(Command::PickerConfirm.into()).is_empty());
+        // Running replace over a directory asks for confirmation first.
+        assert!(editor.run_replace().is_empty());
         assert!(editor.confirm_view().is_some());
         let effects = editor.update(Command::PickerConfirm.into());
         assert!(matches!(

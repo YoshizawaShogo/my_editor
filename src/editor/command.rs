@@ -27,6 +27,8 @@ pub enum Command {
     OpenReplace,
     OpenSearchInDirectory,
     CycleSearchScope,
+    SearchCursorLeft,
+    SearchCursorRight,
     SearchToggleField,
     SearchToggleCase,
     SearchToggleWholeWord,
@@ -49,6 +51,8 @@ pub enum Command {
     PickerCancel,
     Undo,
     Redo,
+    NavigateBack,
+    NavigateForward,
     Quit,
 }
 
