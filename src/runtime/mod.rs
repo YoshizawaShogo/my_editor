@@ -797,6 +797,8 @@ fn handle_lsp_notification(
             .map(|diagnostic| crate::lsp::Diagnostic {
                 line: diagnostic.range.start.line,
                 character: diagnostic.range.start.character,
+                end_line: diagnostic.range.end.line,
+                end_character: diagnostic.range.end.character,
                 severity: match diagnostic.severity {
                     Some(lsp_types::DiagnosticSeverity::ERROR) => {
                         crate::lsp::DiagnosticSeverity::Error

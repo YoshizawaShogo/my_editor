@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 base64 = "0.22"
-crossterm = { version = "0.28.1", features = ["event-stream"] }
+crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
 futures-util = "0.3"
 fuzzy-matcher = "0.3.7"
 ignore = "0.4"
@@ -30,8 +30,3 @@ tree-sitter-toml-ng = "0.7.0"
 unicode-width = "0.2"
 vt100 = "0.15.2"
 walkdir = "2.5.0"
-
-[patch.crates-io]
-# crossterm 0.28/0.29 discard SGR mouse buttons 8/9.  Keep the upstream
-# implementation locally with only Back/Forward button support added.
-crossterm = { path = "vendor/crossterm" }

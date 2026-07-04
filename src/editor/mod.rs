@@ -34,6 +34,7 @@ use crate::{
 
 /// Number of picker candidates shown at once (and the mouse hit-test window).
 const PICKER_VIEW_WINDOW: usize = 20;
+const TERMINAL_SCROLLBACK_LINES: usize = 10_000;
 
 pub struct Editor {
     documents: HashMap<DocumentId, Document>,
@@ -149,28 +150,34 @@ impl Editor {
                 if self.focus == Focus::Overlay {
                     return self.overlay_input(character);
                 }
-                self.edit_active(|document, view| {
-                    document
-                        .editable_mut()
-                        .insert(&mut view.selections, &character.to_string());
-                });
+                self.insert_typed_character(character, None);
                 Vec::new()
             }
             AppEvent::TextInputAt { character, at } => {
                 if self.focus == Focus::Overlay {
                     return self.overlay_input(character);
                 }
-                self.edit_active(|document, view| {
-                    document.editable_mut().insert_timed(
-                        &mut view.selections,
-                        &character.to_string(),
-                        at,
-                    );
-                });
+                self.insert_typed_character(character, Some(at));
                 self.autocomplete_after_typing(character);
                 Vec::new()
             }
             AppEvent::TextPaste(text) => {
+                if self.focus == Focus::Shell {
+                    if let Some(parser) = &mut self.terminal {
+                        let bracketed = parser.screen().bracketed_paste();
+                        parser.set_scrollback(0);
+                        let mut bytes = text.into_bytes();
+                        if bracketed {
+                            bytes.splice(0..0, b"\x1b[200~".iter().copied());
+                            bytes.extend_from_slice(b"\x1b[201~");
+                        }
+                        self.terminal_selection = None;
+                        self.dirty = true;
+                        return vec![Effect::TerminalInput(bytes)];
+                    }
+                    return Vec::new();
+                }
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 if self.focus == Focus::Overlay {
                     let mut effects = Vec::new();
                     for character in text.chars() {
@@ -200,6 +207,14 @@ impl Editor {
                 effects
             }
             AppEvent::Mouse(mouse) => {
+                if self.picker.is_some()
+                    && matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left))
+                {
+                    if !self.picker_contains(mouse.event.column, mouse.event.row) {
+                        self.close_picker();
+                    }
+                    return Vec::new();
+                }
                 if self.search.is_some() {
                     let (pane_x, _, pane_width, _) = self.search_pane_rect();
                     let over_pane =
@@ -218,6 +233,21 @@ impl Editor {
                         }
                         MouseEventKind::ScrollUp if over_pane => {
                             self.scroll_search_results(-3);
+                            return Vec::new();
+                        }
+                        _ => {}
+                    }
+                }
+                let over_terminal = matches!(self.layout, Layout::EditorAndShell { .. })
+                    && mouse.event.column > split_left_width(self.terminal_size.0);
+                if over_terminal {
+                    match mouse.event.kind {
+                        MouseEventKind::ScrollUp => {
+                            self.scroll_terminal(3);
+                            return Vec::new();
+                        }
+                        MouseEventKind::ScrollDown => {
+                            self.scroll_terminal(-3);
                             return Vec::new();
                         }
                         _ => {}
@@ -300,6 +330,9 @@ impl Editor {
             }
             AppEvent::TerminalInput(bytes) => {
                 self.terminal_selection = None;
+                if let Some(parser) = &mut self.terminal {
+                    parser.set_scrollback(0);
+                }
                 self.dirty = true;
                 vec![Effect::TerminalInput(bytes)]
             }
@@ -951,7 +984,11 @@ impl Editor {
                     }
                 }
             }
-            LspEvent::Diagnostics { uri, diagnostics } => {
+            LspEvent::Diagnostics {
+                uri,
+                mut diagnostics,
+            } => {
+                diagnostics.sort_by_key(|diagnostic| diagnostic.severity);
                 for document in self.documents.values_mut() {
                     let Some(path) = &document.path else { continue };
                     if uri == format!("file://{}", path.display())
@@ -984,6 +1021,7 @@ impl Editor {
                     prefix,
                     side,
                     anchor,
+                    add_parentheses,
                 }) if self.document_versions.get(&doc) == Some(&version)
                     && self
                         .layout
@@ -991,72 +1029,72 @@ impl Editor {
                         .is_some_and(|pane| pane.view.doc == doc)
                     && matches!(self.focus, Focus::Editor(_)) =>
                 {
-                    match result.and_then(|value| {
+                    if let Ok(response) = result.and_then(|value| {
                         serde_json::from_value::<lsp_types::CompletionResponse>(value)
                             .map_err(|error| error.to_string())
                     }) {
-                        Ok(response) => {
-                            let matcher = SkimMatcherV2::default();
-                            let mut items: Vec<_> = match response {
-                                lsp_types::CompletionResponse::Array(items) => items,
-                                lsp_types::CompletionResponse::List(list) => list.items,
+                        let matcher = SkimMatcherV2::default();
+                        let mut items: Vec<_> = match response {
+                            lsp_types::CompletionResponse::Array(items) => items,
+                            lsp_types::CompletionResponse::List(list) => list.items,
+                        }
+                        .into_iter()
+                        .filter_map(|item| {
+                            let filter = item
+                                .filter_text
+                                .clone()
+                                .unwrap_or_else(|| item.label.clone());
+                            if !prefix.is_empty()
+                                && (filter.eq_ignore_ascii_case(&prefix)
+                                    || item.label.eq_ignore_ascii_case(&prefix))
+                            {
+                                return None;
                             }
-                            .into_iter()
-                            .filter_map(|item| {
-                                let filter = item
-                                    .filter_text
+                            let score = if prefix.is_empty() {
+                                0
+                            } else {
+                                matcher.fuzzy_match(&filter, &prefix)?
+                            };
+                            Some((score, {
+                                let mut insert = item
+                                    .insert_text
                                     .clone()
                                     .unwrap_or_else(|| item.label.clone());
-                                if !prefix.is_empty()
-                                    && (filter.eq_ignore_ascii_case(&prefix)
-                                        || item.label.eq_ignore_ascii_case(&prefix))
-                                {
-                                    return None;
+                                let callable = matches!(
+                                    item.kind,
+                                    Some(
+                                        lsp_types::CompletionItemKind::FUNCTION
+                                            | lsp_types::CompletionItemKind::METHOD
+                                    )
+                                );
+                                if callable && add_parentheses && !insert.contains('(') {
+                                    insert.push_str("()");
                                 }
-                                let score = if prefix.is_empty() {
-                                    0
-                                } else {
-                                    matcher.fuzzy_match(&filter, &prefix)?
-                                };
-                                Some((score, {
-                                    let mut insert = item
-                                        .insert_text
-                                        .clone()
-                                        .unwrap_or_else(|| item.label.clone());
-                                    let callable = matches!(
-                                        item.kind,
-                                        Some(
-                                            lsp_types::CompletionItemKind::FUNCTION
-                                                | lsp_types::CompletionItemKind::METHOD
-                                        )
-                                    );
-                                    if callable && !insert.contains('(') {
-                                        insert.push_str("()");
-                                    }
-                                    let cursor_back =
-                                        usize::from(callable && insert.trim_end().ends_with("()"));
-                                    CompletionCandidate {
-                                        insert,
-                                        cursor_back,
-                                        label: item.label,
-                                        prefix_len: prefix.chars().count(),
-                                    }
-                                }))
-                            })
-                            .collect();
-                            items.sort_by(|left, right| right.0.cmp(&left.0));
-                            let items = items.into_iter().map(|(_, item)| item).collect::<Vec<_>>();
-                            if !items.is_empty() {
-                                self.completion = Some(CompletionState {
-                                    items,
-                                    selected: 0,
-                                    return_side: side,
-                                    anchor,
-                                });
-                                self.focus = Focus::Completion(side);
-                            }
+                                let cursor_back = usize::from(
+                                    callable
+                                        && add_parentheses
+                                        && insert.trim_end().ends_with("()"),
+                                );
+                                CompletionCandidate {
+                                    insert,
+                                    cursor_back,
+                                    label: item.label,
+                                    prefix_len: prefix.chars().count(),
+                                }
+                            }))
+                        })
+                        .collect();
+                        items.sort_by(|left, right| right.0.cmp(&left.0));
+                        let items = items.into_iter().map(|(_, item)| item).collect::<Vec<_>>();
+                        if !items.is_empty() {
+                            self.completion = Some(CompletionState {
+                                items,
+                                selected: 0,
+                                return_side: side,
+                                anchor,
+                            });
+                            self.focus = Focus::Completion(side);
                         }
-                        Err(error) => self.status = Some(format!("補完に失敗: {error}")),
                     }
                 }
                 Some(PendingLsp::Completion { .. }) => {}
@@ -1409,6 +1447,7 @@ impl Editor {
             return Vec::new();
         }
         let id = self.next_lsp_request;
+        let add_parentheses = self.completion_adds_parentheses(doc, anchor);
         self.next_lsp_request += 1;
         self.pending_lsp
             .retain(|_, pending| !matches!(pending, PendingLsp::Completion { .. }));
@@ -1420,6 +1459,7 @@ impl Editor {
                 prefix,
                 side,
                 anchor,
+                add_parentheses,
             },
         );
         vec![Effect::LspRequest {
@@ -1538,6 +1578,27 @@ impl Editor {
             editable.text().slice(start..head).to_string(),
             CharIdx(start),
         ))
+    }
+
+    fn completion_adds_parentheses(&self, doc: DocumentId, anchor: CharIdx) -> bool {
+        let Some(text) = self
+            .documents
+            .get(&doc)
+            .and_then(Document::editable_opt)
+            .map(|editable| editable.text())
+        else {
+            return true;
+        };
+        let anchor = anchor.0.min(text.len_chars());
+        let line = text.char_to_line(anchor);
+        let line_start = text.line_to_char(line);
+        let prefix = text.slice(line_start..anchor).to_string();
+        let keywords = prefix
+            .split(|character: char| !is_word(character))
+            .filter(|word| !word.is_empty());
+        !keywords
+            .into_iter()
+            .any(|word| matches!(word, "use" | "import" | "from"))
     }
 
     fn request_definition(&mut self) -> Vec<Effect> {
@@ -2097,11 +2158,16 @@ impl Editor {
                     );
                 });
             }
-            Command::DeleteBackward => self.edit_active(|document, view| {
-                document
-                    .editable_mut()
-                    .delete_backward(&mut view.selections);
-            }),
+            Command::DeleteBackward => {
+                let (tab_size, insert_spaces) = self.active_indentation_settings();
+                self.edit_active(|document, view| {
+                    document.editable_mut().delete_backward_smart(
+                        &mut view.selections,
+                        tab_size,
+                        insert_spaces,
+                    );
+                });
+            }
             Command::DeleteForward => self.edit_active(|document, view| {
                 document.editable_mut().delete_forward(&mut view.selections);
             }),
@@ -2178,6 +2244,11 @@ impl Editor {
             }
             Command::PickerConfirm => return self.confirm_picker(),
             Command::PickerCancel => self.close_picker(),
+            Command::Cancel => {
+                if self.search.is_none() {
+                    self.close_picker();
+                }
+            }
             Command::SearchToggleField => {
                 if self.completion.is_some() {
                     return self.confirm_picker();
@@ -2312,7 +2383,7 @@ impl Editor {
                 self.terminal = Some(vt100::Parser::new(
                     self.terminal_size.1.saturating_sub(1),
                     split_right_width(self.terminal_size.0),
-                    0,
+                    TERMINAL_SCROLLBACK_LINES,
                 ));
                 vec![Effect::SpawnShell {
                     cols: split_right_width(self.terminal_size.0).max(1),
@@ -2513,6 +2584,42 @@ impl Editor {
             .and_then(|pane| self.documents.get(&pane.view.doc))
             .and_then(|document| document.language.as_deref());
         self.config.indentation_for_language(language)
+    }
+
+    fn insert_typed_character(&mut self, character: char, at: Option<Instant>) {
+        match character {
+            '(' | '[' | '{' | '\'' | '"' | '`' => {
+                let closing = match character {
+                    '(' => ')',
+                    '[' => ']',
+                    '{' => '}',
+                    quote => quote,
+                };
+                self.edit_active(|document, view| {
+                    document.editable_mut().insert_pair(
+                        &mut view.selections,
+                        character,
+                        closing,
+                        at,
+                    );
+                });
+            }
+            '}' => self.edit_active(|document, view| {
+                document
+                    .editable_mut()
+                    .insert_closing_brace(&mut view.selections, at);
+            }),
+            _ => self.edit_active(|document, view| match at {
+                Some(at) => document.editable_mut().insert_timed(
+                    &mut view.selections,
+                    &character.to_string(),
+                    at,
+                ),
+                None => document
+                    .editable_mut()
+                    .insert(&mut view.selections, &character.to_string()),
+            }),
+        }
     }
 
     fn apply_terminal(&mut self, event: TerminalEvent) {
@@ -2799,16 +2906,6 @@ impl Editor {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_active(-3),
             MouseEventKind::ScrollDown => self.scroll_active(3),
-            MouseEventKind::Down(MouseButton::Back) => {
-                self.edit_active(|document, view| {
-                    document.editable_mut().undo(&mut view.selections);
-                });
-            }
-            MouseEventKind::Down(MouseButton::Forward) => {
-                self.edit_active(|document, view| {
-                    document.editable_mut().redo(&mut view.selections);
-                });
-            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let divider = split_left_width(self.terminal_size.0);
                 if matches!(
@@ -2931,6 +3028,18 @@ impl Editor {
     }
 
     fn open_picker(&mut self, mode: PickerMode) {
+        if mode == PickerMode::Buffer
+            && self
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.mode == PickerMode::Buffer)
+        {
+            self.close_picker();
+            return;
+        }
+        if self.picker.is_some() {
+            self.close_picker();
+        }
         self.dismiss_hover();
         let Some(base) = self
             .layout
@@ -2964,6 +3073,7 @@ impl Editor {
             self.dirty = true;
             return;
         }
+        self.dismiss_search_for_overlay();
         self.picker = Some(PickerState {
             mode,
             base,
@@ -2976,12 +3086,16 @@ impl Editor {
             query: String::new(),
             selected: 0,
             ranking_cache: Vec::new(),
+            scan_token: None,
         });
         self.focus = Focus::Overlay;
         self.dirty = true;
     }
 
     fn open_command_palette(&mut self) {
+        if self.picker.is_some() {
+            self.close_picker();
+        }
         self.dismiss_hover();
         let base = self
             .layout
@@ -2991,6 +3105,7 @@ impl Editor {
         let candidates: Vec<_> = (0..COMMAND_PALETTE.len())
             .map(PickerCandidate::Command)
             .collect();
+        self.dismiss_search_for_overlay();
         self.picker = Some(PickerState {
             mode: PickerMode::Command,
             base,
@@ -3003,12 +3118,24 @@ impl Editor {
             query: String::new(),
             selected: 0,
             ranking_cache: Vec::new(),
+            scan_token: None,
         });
         self.focus = Focus::Overlay;
         self.dirty = true;
     }
 
     fn open_directory_picker(&mut self) -> Vec<Effect> {
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.mode == PickerMode::Directory)
+        {
+            self.close_picker();
+            return Vec::new();
+        }
+        if self.picker.is_some() {
+            self.close_picker();
+        }
         self.dismiss_hover();
         let base = self
             .layout
@@ -3017,6 +3144,7 @@ impl Editor {
             .unwrap_or(DocumentId(0));
         let token = self.next_scan_token;
         self.next_scan_token += 1;
+        self.dismiss_search_for_overlay();
         self.picker = Some(PickerState {
             mode: PickerMode::Directory,
             base,
@@ -3029,6 +3157,7 @@ impl Editor {
             filtered: Vec::new(),
             selected: 0,
             ranking_cache: Vec::new(),
+            scan_token: Some(token),
         });
         self.focus = Focus::Overlay;
         self.status = Some("ファイルを走査中…".to_owned());
@@ -3040,11 +3169,18 @@ impl Editor {
         }]
     }
 
+    fn dismiss_search_for_overlay(&mut self) {
+        if self.search.take().is_some() {
+            self.finish_progress("grep");
+        }
+    }
+
     fn apply_file_scan(&mut self, event: FileScanEvent) {
         match event {
-            FileScanEvent::Batch { paths, .. } => {
+            FileScanEvent::Batch { token, paths } => {
                 if let Some(picker) = &mut self.picker
                     && picker.mode == PickerMode::Directory
+                    && picker.scan_token == Some(token)
                 {
                     let start = picker.candidates.len();
                     picker
@@ -3058,13 +3194,23 @@ impl Editor {
                     }
                 }
             }
-            FileScanEvent::Done { .. } => {
-                self.status = None;
-                self.finish_progress("file-scan");
+            FileScanEvent::Done { token } => {
+                if let Some(picker) = &mut self.picker
+                    && picker.scan_token == Some(token)
+                {
+                    picker.scan_token = None;
+                    self.status = None;
+                    self.finish_progress("file-scan");
+                }
             }
-            FileScanEvent::Failed { error, .. } => {
-                self.status = Some(error);
-                self.finish_progress("file-scan");
+            FileScanEvent::Failed { token, error } => {
+                if let Some(picker) = &mut self.picker
+                    && picker.scan_token == Some(token)
+                {
+                    picker.scan_token = None;
+                    self.status = Some(error);
+                    self.finish_progress("file-scan");
+                }
             }
         }
         self.dirty = true;
@@ -3795,7 +3941,28 @@ impl Editor {
         effects
     }
 
+    fn picker_contains(&self, column: u16, row: u16) -> bool {
+        let Some(picker) = self.picker_view() else {
+            return false;
+        };
+        let viewport_width = self.terminal_size.0;
+        let viewport_height = self.terminal_size.1.saturating_sub(1);
+        let width = viewport_width.saturating_sub(4).clamp(1, 70);
+        let available_height = viewport_height.saturating_sub(1).max(1);
+        let ellipsis_rows = u16::from(picker.has_before) + u16::from(picker.has_after);
+        let height = (picker.items.len() as u16 + 3 + ellipsis_rows)
+            .min(available_height)
+            .max(1);
+        let x = viewport_width.saturating_sub(width) / 2;
+        let y = 1;
+        column >= x && column < x.saturating_add(width) && row >= y && row < y + height
+    }
+
     fn close_picker(&mut self) {
+        let closing_directory = self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.mode == PickerMode::Directory);
         let return_side = self
             .completion
             .as_ref()
@@ -3807,6 +3974,12 @@ impl Editor {
         self.completion = None;
         self.rename_input = None;
         self.confirm = None;
+        if closing_directory {
+            self.finish_progress("file-scan");
+            if self.status.as_deref() == Some("ファイルを走査中…") {
+                self.status = None;
+            }
+        }
         self.focus = Focus::Editor(return_side);
         self.dirty = true;
     }
@@ -3975,6 +4148,21 @@ impl Editor {
             (pane.view.scroll.top_line + amount as usize).min(max_top)
         };
         pane.view.scroll.wrapped_row_offset = 0;
+        self.dirty = true;
+    }
+
+    fn scroll_terminal(&mut self, amount: isize) {
+        let Some(parser) = &mut self.terminal else {
+            return;
+        };
+        let current = parser.screen().scrollback();
+        let target = if amount < 0 {
+            current.saturating_sub(amount.unsigned_abs())
+        } else {
+            current.saturating_add(amount as usize)
+        };
+        parser.set_scrollback(target);
+        self.terminal_selection = None;
         self.dirty = true;
     }
 
@@ -4438,6 +4626,7 @@ struct PickerState {
     filtered: Vec<usize>,
     selected: usize,
     ranking_cache: Vec<(String, Vec<usize>)>,
+    scan_token: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -4729,6 +4918,7 @@ enum PendingLsp {
         prefix: String,
         side: Side,
         anchor: CharIdx,
+        add_parentheses: bool,
     },
     Definition,
     Rename {
@@ -5037,35 +5227,6 @@ mod tests {
 
         editor.update(AppEvent::Command(Command::Undo));
         assert_eq!(editor.active_buffer().unwrap().text.to_string(), "ab");
-    }
-
-    #[test]
-    fn mouse_side_buttons_undo_and_redo() {
-        let mut editor = Editor::default();
-        editor.update(AppEvent::TextInput('a'));
-        editor.update(AppEvent::Command(Command::Move {
-            direction: Direction::Right,
-            unit: Unit::Character,
-            extend: false,
-        }));
-
-        let side_button = |button| {
-            AppEvent::Mouse(MouseInput {
-                event: MouseEvent {
-                    kind: MouseEventKind::Down(button),
-                    column: 0,
-                    row: 0,
-                    modifiers: KeyModifiers::NONE,
-                },
-                clicks: 1,
-            })
-        };
-
-        editor.update(side_button(MouseButton::Back));
-        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "");
-
-        editor.update(side_button(MouseButton::Forward));
-        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "a");
     }
 
     #[test]
@@ -5910,6 +6071,100 @@ mod tests {
     }
 
     #[test]
+    fn directory_picker_replaces_the_find_pane_and_receives_keyboard_input() {
+        let mut editor = Editor::default();
+        editor.update(Command::OpenSearch.into());
+        assert!(editor.search_view().is_some());
+
+        let effects = editor.update(Command::OpenDirectoryPicker.into());
+        editor.update(AppEvent::TextInput('m'));
+
+        assert!(matches!(effects.as_slice(), [Effect::StartFileScan { .. }]));
+        assert!(editor.search_view().is_none());
+        assert_eq!(editor.picker_view().unwrap().query, "m");
+    }
+
+    #[test]
+    fn ctrl_t_and_ctrl_g_toggle_their_picker_closed() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+
+        assert!(matches!(
+            editor
+                .update(Command::OpenDirectoryPicker.into())
+                .as_slice(),
+            [Effect::StartFileScan { .. }]
+        ));
+        assert!(editor.picker_view().is_some());
+        assert!(
+            editor
+                .update(Command::OpenDirectoryPicker.into())
+                .is_empty()
+        );
+        assert!(editor.picker_view().is_none());
+
+        editor.open_paths([PathBuf::from("one.txt"), PathBuf::from("two.txt")]);
+        editor.update(Command::OpenBufferPicker.into());
+        assert!(editor.picker_view().is_some());
+        editor.update(Command::OpenBufferPicker.into());
+        assert!(editor.picker_view().is_none());
+    }
+
+    #[test]
+    fn clicking_outside_the_picker_closes_it() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+        editor.update(Command::OpenCommandPalette.into());
+
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+
+        assert!(editor.picker_view().is_none());
+        assert_eq!(editor.focus(), Focus::Editor(Side::Left));
+    }
+
+    #[test]
+    fn stale_file_scan_batches_do_not_enter_a_reopened_picker() {
+        let mut editor = Editor::default();
+        let first = editor
+            .update(Command::OpenDirectoryPicker.into())
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::StartFileScan { token, .. } => Some(token),
+                _ => None,
+            })
+            .unwrap();
+        editor.update(Command::OpenDirectoryPicker.into());
+        let second = editor
+            .update(Command::OpenDirectoryPicker.into())
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::StartFileScan { token, .. } => Some(token),
+                _ => None,
+            })
+            .unwrap();
+
+        editor.update(AppEvent::FileScan(FileScanEvent::Batch {
+            token: first,
+            paths: vec![PathBuf::from("stale.txt")],
+        }));
+        assert_eq!(editor.picker_view().unwrap().total, 0);
+
+        editor.update(AppEvent::FileScan(FileScanEvent::Batch {
+            token: second,
+            paths: vec![PathBuf::from("current.txt")],
+        }));
+        assert_eq!(editor.picker_view().unwrap().total, 1);
+    }
+
+    #[test]
     fn command_palette_restores_the_originating_pane_focus() {
         let mut editor = Editor::default();
         editor.update(AppEvent::TextPaste("abc".to_owned()));
@@ -6550,6 +6805,71 @@ mod tests {
     }
 
     #[test]
+    fn function_completion_in_an_import_statement_does_not_add_parentheses() {
+        let mut editor = Editor::default();
+        let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
+        document.path = Some(PathBuf::from("main.rs"));
+        document.language = Some("rust".to_owned());
+        editor.lsp_servers.insert("rust".to_owned(), 1);
+        editor.lsp_ready.insert(1);
+        editor.lsp_opened_documents.insert(DocumentId(0));
+        editor.document_versions.insert(DocumentId(0), 1);
+        editor.update(AppEvent::TextPaste("use crate::cur".to_owned()));
+
+        let request = editor
+            .request_completion(true)
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::LspRequest { id, .. } => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        editor.update(AppEvent::Lsp(LspEvent::Response {
+            id: request,
+            result: Ok(serde_json::json!([{
+                "label": "current_dir",
+                "insertText": "current_dir",
+                "kind": 3
+            }])),
+        }));
+        editor.update(Command::PickerConfirm.into());
+
+        assert_eq!(
+            editor.active_buffer().unwrap().text.to_string(),
+            "use crate::current_dir"
+        );
+    }
+
+    #[test]
+    fn malformed_automatic_completion_response_does_not_replace_the_status() {
+        let mut editor = Editor::default();
+        let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
+        document.path = Some(PathBuf::from("main.rs"));
+        document.language = Some("rust".to_owned());
+        editor.lsp_servers.insert("rust".to_owned(), 1);
+        editor.lsp_ready.insert(1);
+        editor.lsp_opened_documents.insert(DocumentId(0));
+        editor.document_versions.insert(DocumentId(0), 1);
+        editor.update(AppEvent::TextPaste("cur".to_owned()));
+        editor.status = Some("保存しました".to_owned());
+        let request = editor
+            .request_completion(false)
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::LspRequest { id, .. } => Some(id),
+                _ => None,
+            })
+            .unwrap();
+
+        editor.update(AppEvent::Lsp(LspEvent::Response {
+            id: request,
+            result: Err("server cancelled request".to_owned()),
+        }));
+
+        assert_eq!(editor.status(), Some("保存しました"));
+    }
+
+    #[test]
     fn indent_and_comment_apply_to_every_selected_line() {
         let mut editor = Editor::default();
         editor.documents.get_mut(&DocumentId(0)).unwrap().language = Some("rust".to_owned());
@@ -6595,6 +6915,105 @@ mod tests {
         let buffer = editor.active_buffer().unwrap();
         assert_eq!(buffer.text.to_string(), "a   b");
         assert_eq!(buffer.view.selections.primary().head, CharIdx(4));
+
+        editor.update(Command::DeleteBackward.into());
+        let buffer = editor.active_buffer().unwrap();
+        assert_eq!(buffer.text.to_string(), "ab");
+        assert_eq!(buffer.view.selections.primary().head, CharIdx(1));
+    }
+
+    #[test]
+    fn bracketed_multiline_paste_is_inserted_literally_and_normalizes_line_endings() {
+        let mut editor = Editor::default();
+
+        editor.update(AppEvent::TextPaste("if ready {\r\n  value\r\n}".to_owned()));
+
+        assert_eq!(
+            editor.active_buffer().unwrap().text.to_string(),
+            "if ready {\n  value\n}"
+        );
+    }
+
+    #[test]
+    fn typed_opening_delimiters_insert_pairs_without_treating_paste_as_typing() {
+        let mut editor = Editor::default();
+
+        editor.update(AppEvent::TextInput('['));
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "[]");
+        assert_eq!(
+            editor
+                .active_buffer()
+                .unwrap()
+                .view
+                .selections
+                .primary()
+                .head,
+            CharIdx(1)
+        );
+        editor.update(Command::DeleteBackward.into());
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "");
+
+        editor.update(AppEvent::TextPaste("[literal]".to_owned()));
+        assert_eq!(
+            editor.active_buffer().unwrap().text.to_string(),
+            "[literal]"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_keeps_the_find_pane_open() {
+        let mut editor = Editor::default();
+        editor.update(Command::OpenSearch.into());
+
+        editor.update(Command::Cancel.into());
+
+        assert!(editor.search_view().is_some());
+        assert_eq!(editor.focus(), Focus::Overlay);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_terminal_pane_scrollback() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 6 });
+        editor.update(Command::ToggleShell.into());
+        editor.update(AppEvent::Terminal(TerminalEvent::Output(
+            (0..20)
+                .map(|line| format!("line {line}\r\n"))
+                .collect::<String>()
+                .into_bytes(),
+        )));
+        assert_eq!(editor.terminal.as_ref().unwrap().screen().scrollback(), 0);
+
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 30,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 0,
+        }));
+
+        assert_eq!(editor.terminal.as_ref().unwrap().screen().scrollback(), 3);
+    }
+
+    #[test]
+    fn shell_paste_preserves_child_bracketed_paste_mode() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 6 });
+        editor.update(Command::ToggleShell.into());
+        editor.update(AppEvent::Terminal(TerminalEvent::Output(
+            b"\x1b[?2004h".to_vec(),
+        )));
+
+        let effects = editor.update(AppEvent::TextPaste("one\ntwo".to_owned()));
+
+        assert_eq!(
+            effects,
+            vec![Effect::TerminalInput(
+                b"\x1b[200~one\ntwo\x1b[201~".to_vec()
+            )]
+        );
     }
 
     #[test]

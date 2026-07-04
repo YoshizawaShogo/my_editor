@@ -75,13 +75,39 @@ impl Editable {
     pub fn insert(&mut self, selections: &mut Selections, inserted: &str) {
         let targets: Vec<_> = selections.iter().copied().collect();
         let replacements = vec![inserted.to_owned(); targets.len()];
-        self.replace_ranges(selections, targets, replacements, None, None);
+        self.replace_ranges(selections, targets, replacements, None, None, None);
     }
 
     pub fn insert_timed(&mut self, selections: &mut Selections, inserted: &str, at: Instant) {
         let targets: Vec<_> = selections.iter().copied().collect();
         let replacements = vec![inserted.to_owned(); targets.len()];
-        self.replace_ranges(selections, targets, replacements, Some(at), None);
+        self.replace_ranges(selections, targets, replacements, Some(at), None, None);
+    }
+
+    pub fn insert_pair(
+        &mut self,
+        selections: &mut Selections,
+        opening: char,
+        closing: char,
+        at: Option<Instant>,
+    ) {
+        let targets: Vec<_> = selections.iter().copied().collect();
+        let replacements = targets
+            .iter()
+            .map(|selection| {
+                let selected = self.text.slice(selection.range()).to_string();
+                format!("{opening}{selected}{closing}")
+            })
+            .collect();
+        let cursor_backs = vec![1; targets.len()];
+        self.replace_ranges(
+            selections,
+            targets,
+            replacements,
+            at,
+            None,
+            Some(cursor_backs),
+        );
     }
 
     pub fn insert_fragments(&mut self, selections: &mut Selections, fragments: &[String]) {
@@ -91,7 +117,7 @@ impl Editable {
         } else {
             vec![fragments.join("\n"); targets.len()]
         };
-        self.replace_ranges(selections, targets, replacements, None, None);
+        self.replace_ranges(selections, targets, replacements, None, None, None);
     }
 
     pub fn insert_linewise_fragments(&mut self, selections: &mut Selections, fragments: &[String]) {
@@ -112,7 +138,7 @@ impl Editable {
         } else {
             vec![format!("{}\n", fragments.join("\n")); targets.len()]
         };
-        self.replace_ranges(selections, targets, replacements, None, None);
+        self.replace_ranges(selections, targets, replacements, None, None, None);
     }
 
     pub fn insert_newline(
@@ -123,7 +149,7 @@ impl Editable {
         insert_spaces: bool,
     ) {
         let targets: Vec<_> = selections.iter().copied().collect();
-        let replacements = targets
+        let edits = targets
             .iter()
             .map(|selection| {
                 let insertion = selection.range().start;
@@ -139,19 +165,46 @@ impl Editable {
                     full_indentation
                 };
                 let indentation = normalized_indentation(&raw_indentation, tab_size, insert_spaces);
+                let inside_empty_brackets = selection.is_caret()
+                    && insertion > 0
+                    && insertion < self.text.len_chars()
+                    && matches!(self.text.char(insertion - 1), '(' | '[' | '{')
+                    && matching_pair(self.text.char(insertion - 1))
+                        == Some(self.text.char(insertion));
+                if inside_empty_brackets {
+                    let unit = if insert_spaces {
+                        " ".repeat(tab_size.max(1))
+                    } else {
+                        "\t".to_owned()
+                    };
+                    let inner_indentation = format!("{indentation}{unit}");
+                    let cursor_back = 1 + indentation.chars().count();
+                    return (format!("\n{inner_indentation}\n{indentation}"), cursor_back);
+                }
                 let prefix: String = self
                     .text
                     .slice(self.text.line_to_char(line)..insertion)
                     .into();
                 let comment = line_comment
                     .and_then(|marker| continued_line_comment(&prefix, &raw_indentation, marker));
-                comment.map_or_else(
-                    || format!("\n{indentation}"),
-                    |comment| format!("\n{indentation}{comment} "),
+                (
+                    comment.map_or_else(
+                        || format!("\n{indentation}"),
+                        |comment| format!("\n{indentation}{comment} "),
+                    ),
+                    0,
                 )
             })
-            .collect();
-        self.replace_ranges(selections, targets, replacements, None, None);
+            .collect::<Vec<_>>();
+        let (replacements, cursor_backs): (Vec<_>, Vec<_>) = edits.into_iter().unzip();
+        self.replace_ranges(
+            selections,
+            targets,
+            replacements,
+            None,
+            None,
+            Some(cursor_backs),
+        );
     }
 
     pub fn indent_lines(
@@ -250,21 +303,91 @@ impl Editable {
     }
 
     pub fn delete_backward(&mut self, selections: &mut Selections) {
+        self.delete_backward_smart(selections, 1, false);
+    }
+
+    pub fn delete_backward_smart(
+        &mut self,
+        selections: &mut Selections,
+        tab_size: usize,
+        insert_spaces: bool,
+    ) {
         let targets: Vec<_> = selections
             .iter()
             .map(|selection| {
-                if selection.is_caret() && selection.head.0 > 0 {
-                    Selection {
-                        anchor: CharIdx(selection.head.0 - 1),
-                        head: selection.head,
-                    }
+                if !selection.is_caret() || selection.head.0 == 0 {
+                    return *selection;
+                }
+                let head = selection.head.0;
+                if head < self.text.len_chars()
+                    && matching_pair(self.text.char(head - 1)) == Some(self.text.char(head))
+                {
+                    return Selection {
+                        anchor: CharIdx(head - 1),
+                        head: CharIdx(head + 1),
+                    };
+                }
+                let delete = if insert_spaces
+                    && head >= tab_size.max(1)
+                    && self
+                        .text
+                        .slice(head - tab_size.max(1)..head)
+                        .chars()
+                        .all(|character| character == ' ')
+                {
+                    tab_size.max(1)
                 } else {
-                    *selection
+                    1
+                };
+                Selection {
+                    anchor: CharIdx(head - delete),
+                    head: selection.head,
                 }
             })
             .collect();
         let replacements = vec![String::new(); targets.len()];
-        self.replace_ranges(selections, targets, replacements, None, None);
+        self.replace_ranges(selections, targets, replacements, None, None, None);
+    }
+
+    pub fn insert_closing_brace(&mut self, selections: &mut Selections, at: Option<Instant>) {
+        let edits: Vec<_> = selections
+            .iter()
+            .map(|selection| {
+                if !selection.is_caret() {
+                    return (*selection, "}".to_owned());
+                }
+                let head = selection.head.0.min(self.text.len_chars());
+                let line = self.text.char_to_line(head);
+                let line_start = self.text.line_to_char(line);
+                let only_indentation = self
+                    .text
+                    .slice(line_start..head)
+                    .chars()
+                    .all(|character| matches!(character, ' ' | '\t'));
+                if !only_indentation {
+                    return (*selection, "}".to_owned());
+                }
+                let Some(opening) = unmatched_opening_brace(&self.text, head) else {
+                    return (*selection, "}".to_owned());
+                };
+                let opening_line = self.text.char_to_line(opening);
+                let indentation: String = self
+                    .text
+                    .line(opening_line)
+                    .chars()
+                    .take_while(|character| matches!(character, ' ' | '\t'))
+                    .collect();
+                (
+                    Selection {
+                        anchor: CharIdx(line_start),
+                        head: selection.head,
+                    },
+                    format!("{indentation}}}"),
+                )
+            })
+            .collect();
+        let (targets, replacements): (Vec<_>, Vec<_>) = edits.into_iter().unzip();
+        self.replace_ranges(selections, targets, replacements, at, None, None);
     }
 
     pub fn delete_forward(&mut self, selections: &mut Selections) {
@@ -282,7 +405,7 @@ impl Editable {
             })
             .collect();
         let replacements = vec![String::new(); targets.len()];
-        self.replace_ranges(selections, targets, replacements, None, None);
+        self.replace_ranges(selections, targets, replacements, None, None, None);
     }
 
     pub fn delete_lines(&mut self, selections: &mut Selections) {
@@ -333,6 +456,7 @@ impl Editable {
             replacements,
             None,
             Some(selections_before),
+            None,
         );
     }
 
@@ -396,16 +520,19 @@ impl Editable {
         replacements: Vec<String>,
         insert_at: Option<Instant>,
         history_selections_before: Option<Selections>,
+        cursor_backs: Option<Vec<usize>>,
     ) {
         assert_eq!(targets.len(), replacements.len());
         let working_selections = selections.clone();
         let before = history_selections_before.unwrap_or_else(|| working_selections.clone());
         let primary = selections.primary_index();
+        let cursor_backs = cursor_backs.unwrap_or_else(|| vec![0; targets.len()]);
         let mut edits: Vec<PendingEdit> = targets
             .into_iter()
             .zip(replacements)
+            .zip(cursor_backs)
             .enumerate()
-            .filter_map(|(selection_index, (selection, inserted))| {
+            .filter_map(|(selection_index, ((selection, inserted), cursor_back))| {
                 let range = selection.range();
                 if range.is_empty() && inserted.is_empty() {
                     return None;
@@ -415,6 +542,7 @@ impl Editable {
                     removed: self.text.slice(range.clone()).to_string(),
                     range,
                     inserted,
+                    cursor_back,
                 })
             })
             .collect();
@@ -427,7 +555,8 @@ impl Editable {
         let mut offset = 0isize;
         for edit in &edits {
             let inserted_len = edit.inserted.chars().count();
-            let caret = (edit.range.start as isize + offset + inserted_len as isize) as usize;
+            let caret = (edit.range.start as isize + offset + inserted_len as isize
+                - edit.cursor_back.min(inserted_len) as isize) as usize;
             after_ranges[edit.selection_index] = Selection::caret(CharIdx(caret));
             offset += inserted_len as isize - edit.range.len() as isize;
         }
@@ -575,6 +704,32 @@ struct PendingEdit {
     range: std::ops::Range<usize>,
     removed: String,
     inserted: String,
+    cursor_back: usize,
+}
+
+fn matching_pair(opening: char) -> Option<char> {
+    match opening {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '\'' => Some('\''),
+        '"' => Some('"'),
+        '`' => Some('`'),
+        _ => None,
+    }
+}
+
+fn unmatched_opening_brace(text: &Rope, before: usize) -> Option<usize> {
+    let mut depth = 0;
+    for index in (0..before.min(text.len_chars())).rev() {
+        match text.char(index) {
+            '}' => depth += 1,
+            '{' if depth == 0 => return Some(index),
+            '{' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -761,5 +916,74 @@ mod tests {
         assert_eq!(editable.text().to_string(), "ab");
         assert!(editable.undo(&mut selections));
         assert_eq!(editable.text().to_string(), "");
+    }
+
+    #[test]
+    fn pairs_place_the_caret_inside_and_backspace_removes_both_characters() {
+        for (opening, closing) in [
+            ('(', ')'),
+            ('[', ']'),
+            ('{', '}'),
+            ('\'', '\''),
+            ('"', '"'),
+            ('`', '`'),
+        ] {
+            let mut editable = Editable::new("");
+            let mut selections = Selections::default();
+
+            editable.insert_pair(&mut selections, opening, closing, None);
+            assert_eq!(editable.text().to_string(), format!("{opening}{closing}"));
+            assert_eq!(selections.primary().head, CharIdx(1));
+
+            editable.delete_backward_smart(&mut selections, 4, true);
+            assert_eq!(editable.text().to_string(), "");
+            assert_eq!(selections.primary().head, CharIdx(0));
+        }
+    }
+
+    #[test]
+    fn soft_tab_backspace_removes_one_configured_indent_unit() {
+        let mut editable = Editable::new("a    b");
+        let mut selections = Selections::single(Selection::caret(CharIdx(5)));
+
+        editable.delete_backward_smart(&mut selections, 4, true);
+
+        assert_eq!(editable.text().to_string(), "ab");
+        assert_eq!(selections.primary().head, CharIdx(1));
+    }
+
+    #[test]
+    fn closing_brace_aligns_an_indented_blank_line_with_its_opening_brace() {
+        let mut editable = Editable::new("    if ready {\n        ");
+        let mut selections =
+            Selections::single(Selection::caret(CharIdx(editable.text().len_chars())));
+
+        editable.insert_closing_brace(&mut selections, None);
+
+        assert_eq!(editable.text().to_string(), "    if ready {\n    }");
+        assert_eq!(selections.primary().head, CharIdx(20));
+        assert!(editable.undo(&mut selections));
+        assert_eq!(editable.text().to_string(), "    if ready {\n        ");
+    }
+
+    #[test]
+    fn newline_inside_empty_brackets_creates_an_indented_blank_line() {
+        for (opening, closing) in [('(', ')'), ('[', ']'), ('{', '}')] {
+            let mut editable = Editable::new(&format!("    call{opening}{closing}"));
+            let mut selections = Selections::single(Selection::caret(CharIdx(9)));
+
+            editable.insert_newline(&mut selections, None, 4, true);
+
+            assert_eq!(
+                editable.text().to_string(),
+                format!("    call{opening}\n        \n    {closing}")
+            );
+            assert_eq!(selections.primary().head, CharIdx(18));
+            assert!(editable.undo(&mut selections));
+            assert_eq!(
+                editable.text().to_string(),
+                format!("    call{opening}{closing}")
+            );
+        }
     }
 }

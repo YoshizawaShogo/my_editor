@@ -99,7 +99,7 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
         && ctrl
         && key.code == KeyCode::Char('c')
     {
-        return Some(Command::PickerCancel.into());
+        return Some(Command::Cancel.into());
     }
     if matches!(focus, Focus::Shell) {
         if ctrl && key.code == KeyCode::Char('c') {
@@ -392,7 +392,7 @@ mod tests {
         let mut pending = KeyChordState::default();
         assert_eq!(
             translate(raw_key(key), &Focus::Overlay, &mut pending),
-            Some(AppEvent::Command(Command::PickerCancel))
+            Some(AppEvent::Command(Command::Cancel))
         );
         assert_eq!(
             translate(raw_key(key), &Focus::Shell, &mut pending),

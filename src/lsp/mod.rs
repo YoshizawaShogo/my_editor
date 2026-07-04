@@ -4,11 +4,13 @@ use serde::{Deserialize, Serialize};
 pub struct Diagnostic {
     pub line: u32,
     pub character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
     pub severity: DiagnosticSeverity,
     pub message: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum DiagnosticSeverity {
     Error,
     Warning,

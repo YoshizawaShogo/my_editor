@@ -8,7 +8,8 @@ use ratatui::{
 
 use crate::{
     editor::{ActiveBuffer, Editor},
-    position::{char_idx_to_display_pos, display_col_after},
+    position::{char_idx_to_display_pos, display_col_after, lsp_position_to_char_idx},
+    view::is_word,
 };
 
 const BG: Color = Color::Rgb(0x16, 0x18, 0x21);
@@ -23,6 +24,8 @@ const ADDED_BG: Color = Color::Rgb(0x24, 0x30, 0x25);
 const REMOVED_BG: Color = Color::Rgb(0x38, 0x22, 0x28);
 const CHANGED_BG: Color = Color::Rgb(0x38, 0x30, 0x22);
 const POPUP_BG: Color = Color::Rgb(0x1e, 0x21, 0x32);
+const OCCURRENCE_BG: Color = Color::Rgb(0x22, 0x27, 0x35);
+const MATCHING_BRACKET_BG: Color = Color::Rgb(0x4a, 0x50, 0x68);
 
 pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
     let areas = Layout::default()
@@ -189,7 +192,7 @@ fn draw_terminal(
         Paragraph::new(lines).style(Style::default().fg(FG).bg(Color::Rgb(0x12, 0x14, 0x1c))),
         area,
     );
-    if focused {
+    if focused && screen.scrollback() == 0 {
         let (row, col) = screen.cursor_position();
         if row < rows && col < cols {
             frame.set_cursor_position((area.x + col, area.y + row));
@@ -1203,6 +1206,36 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
         .iter()
         .map(|selection| selection.range())
         .collect();
+    let occurrence_ranges = visible_occurrence_ranges(
+        buffer.text,
+        buffer.view.selections.primary().head,
+        start,
+        end,
+    );
+    let matching_brackets =
+        matching_bracket_indices(buffer.text, buffer.view.selections.primary().head.0);
+    let diagnostic_ranges = buffer
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let start = lsp_position_to_char_idx(
+                buffer.text,
+                diagnostic.line as usize,
+                diagnostic.character as usize,
+            )
+            .0;
+            let mut end = lsp_position_to_char_idx(
+                buffer.text,
+                diagnostic.end_line as usize,
+                diagnostic.end_character as usize,
+            )
+            .0;
+            if end <= start {
+                end = (start + 1).min(buffer.text.len_chars());
+            }
+            (start..end, diagnostic.severity)
+        })
+        .collect::<Vec<_>>();
     let mut gutter_lines = Vec::with_capacity(end.saturating_sub(start));
     let mut text_lines = Vec::with_capacity(end.saturating_sub(start));
 
@@ -1220,7 +1253,11 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
         let severity = line_diagnostic.map(|diagnostic| diagnostic.severity);
         let (marker, marker_color) = match severity {
             Some(crate::lsp::DiagnosticSeverity::Error) => ("×", Color::Rgb(0xe2, 0x78, 0x78)),
-            Some(crate::lsp::DiagnosticSeverity::Warning) => ("▲", Color::Rgb(0xe2, 0xa4, 0x78)),
+            Some(crate::lsp::DiagnosticSeverity::Warning) => ("▵", Color::Rgb(0xe2, 0xa4, 0x78)),
+            Some(crate::lsp::DiagnosticSeverity::Information) => {
+                ("i", Color::Rgb(0x89, 0xb8, 0xc2))
+            }
+            Some(crate::lsp::DiagnosticSeverity::Hint) => ("·", Color::Rgb(0x84, 0xa0, 0xc6)),
             _ => (" ", MUTED),
         };
         let (git_marker, git_color) = buffer
@@ -1263,7 +1300,7 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
                     .iter()
                     .find(|span| span.start.0 <= index && index < span.end.0)
                     .map(|span| span.token_type);
-                Style::default()
+                let mut style = Style::default()
                     .fg(semantic.map_or_else(
                         || {
                             highlight_color(
@@ -1277,7 +1314,28 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
                         },
                         semantic_color,
                     ))
-                    .bg(BG)
+                    .bg(
+                        if occurrence_ranges
+                            .iter()
+                            .any(|occurrence| occurrence.contains(&index))
+                        {
+                            OCCURRENCE_BG
+                        } else {
+                            BG
+                        },
+                    );
+                if matching_brackets.contains(&index) {
+                    style = style.bg(MATCHING_BRACKET_BG).add_modifier(Modifier::BOLD);
+                }
+                if let Some((_, severity)) = diagnostic_ranges
+                    .iter()
+                    .find(|(range, _)| range.contains(&index))
+                {
+                    style = style
+                        .underline_color(diagnostic_color(*severity))
+                        .add_modifier(Modifier::UNDERLINED);
+                }
+                style
             };
             if character == '\t' {
                 for column in display_col..next_col {
@@ -1300,12 +1358,7 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
             };
             let text = truncate_virtual_diagnostic(&diagnostic.message, available);
             if !text.is_empty() {
-                let color = match diagnostic.severity {
-                    crate::lsp::DiagnosticSeverity::Error => Color::Rgb(0xe2, 0x78, 0x78),
-                    crate::lsp::DiagnosticSeverity::Warning => Color::Rgb(0xe2, 0xa4, 0x78),
-                    crate::lsp::DiagnosticSeverity::Information => Color::Rgb(0x89, 0xb8, 0xc2),
-                    crate::lsp::DiagnosticSeverity::Hint => MUTED,
-                };
+                let color = diagnostic_color(diagnostic.severity);
                 if let Some(last) = rows.last_mut() {
                     last.push(Span::styled(
                         text,
@@ -1472,13 +1525,118 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
 }
 
 fn truncate_virtual_diagnostic(message: &str, available: usize) -> String {
-    const PREFIX: &str = "  › ";
-    if available <= PREFIX.len() {
+    const PREFIX: &str = "    ● ";
+    const PREFIX_WIDTH: usize = 6;
+    if available <= PREFIX_WIDTH {
         return String::new();
     }
     let mut text = PREFIX.to_owned();
-    text.extend(message.chars().take(available - PREFIX.len()));
+    text.extend(message.chars().take(available - PREFIX_WIDTH));
     text
+}
+
+fn diagnostic_color(severity: crate::lsp::DiagnosticSeverity) -> Color {
+    match severity {
+        crate::lsp::DiagnosticSeverity::Error => Color::Rgb(0xe2, 0x78, 0x78),
+        crate::lsp::DiagnosticSeverity::Warning => Color::Rgb(0xe2, 0xa4, 0x78),
+        crate::lsp::DiagnosticSeverity::Information => Color::Rgb(0x89, 0xb8, 0xc2),
+        crate::lsp::DiagnosticSeverity::Hint => Color::Rgb(0x84, 0xa0, 0xc6),
+    }
+}
+
+fn visible_occurrence_ranges(
+    text: &ropey::Rope,
+    cursor: crate::position::CharIdx,
+    first_line: usize,
+    end_line: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let len = text.len_chars();
+    let cursor = cursor.0.min(len);
+    let adjacent = if cursor < len && is_word(text.char(cursor)) {
+        Some(cursor)
+    } else if cursor > 0 && is_word(text.char(cursor - 1)) {
+        Some(cursor - 1)
+    } else {
+        None
+    };
+    let Some(adjacent) = adjacent else {
+        return Vec::new();
+    };
+    let mut word_start = adjacent;
+    while word_start > 0 && is_word(text.char(word_start - 1)) {
+        word_start -= 1;
+    }
+    let mut word_end = adjacent + 1;
+    while word_end < len && is_word(text.char(word_end)) {
+        word_end += 1;
+    }
+    let word = text.slice(word_start..word_end).to_string();
+    let mut ranges = Vec::new();
+    for line in first_line..end_line.min(text.len_lines()) {
+        let mut index = text.line_to_char(line);
+        let line_end = if line + 1 < text.len_lines() {
+            text.line_to_char(line + 1)
+        } else {
+            len
+        };
+        while index < line_end {
+            if !is_word(text.char(index)) {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < line_end && is_word(text.char(index)) {
+                index += 1;
+            }
+            if text.slice(start..index) == word.as_str() {
+                ranges.push(start..index);
+            }
+        }
+    }
+    ranges
+}
+
+fn matching_bracket_indices(text: &ropey::Rope, cursor: usize) -> Vec<usize> {
+    let len = text.len_chars();
+    let candidate = [cursor.min(len), cursor.saturating_sub(1)]
+        .into_iter()
+        .find(|index| {
+            *index < len && matches!(text.char(*index), '(' | ')' | '[' | ']' | '{' | '}')
+        });
+    let Some(index) = candidate else {
+        return Vec::new();
+    };
+    let bracket = text.char(index);
+    let (opening, closing, forward) = match bracket {
+        '(' => ('(', ')', true),
+        '[' => ('[', ']', true),
+        '{' => ('{', '}', true),
+        ')' => ('(', ')', false),
+        ']' => ('[', ']', false),
+        '}' => ('{', '}', false),
+        _ => return Vec::new(),
+    };
+    let mut depth = 0usize;
+    if forward {
+        for other in index + 1..len {
+            match text.char(other) {
+                character if character == opening => depth += 1,
+                character if character == closing && depth == 0 => return vec![index, other],
+                character if character == closing => depth -= 1,
+                _ => {}
+            }
+        }
+    } else {
+        for other in (0..index).rev() {
+            match text.char(other) {
+                character if character == closing => depth += 1,
+                character if character == opening && depth == 0 => return vec![other, index],
+                character if character == opening => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    Vec::new()
 }
 
 fn push_cell(rows: &mut Vec<Vec<Span<'static>>>, row: usize, text: String, style: Style) {
@@ -1728,6 +1886,8 @@ mod tests {
         let diagnostics = vec![crate::lsp::Diagnostic {
             line: 0,
             character: 0,
+            end_line: 0,
+            end_character: 1,
             severity: crate::lsp::DiagnosticSeverity::Error,
             message: "error".to_owned(),
         }];
@@ -1759,6 +1919,36 @@ mod tests {
         let rendered = terminal.backend().buffer();
         assert_eq!(rendered[(0, 0)].symbol(), "▌");
         assert_eq!(rendered[(1, 0)].symbol(), "×");
+    }
+
+    #[test]
+    fn cursor_word_occurrences_are_subtly_highlighted() {
+        let backend = TestBackend::new(30, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::TextPaste("foo bar foo".to_owned()));
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        let rendered = terminal.backend().buffer();
+        assert_eq!(rendered[(5, 0)].bg, OCCURRENCE_BG);
+        assert_eq!(rendered[(13, 0)].bg, OCCURRENCE_BG);
+        assert_eq!(rendered[(9, 0)].bg, BG);
+    }
+
+    #[test]
+    fn matching_brackets_next_to_the_caret_are_highlighted() {
+        let backend = TestBackend::new(20, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::TextPaste("(x)".to_owned()));
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        let rendered = terminal.backend().buffer();
+        assert_eq!(rendered[(5, 0)].bg, MATCHING_BRACKET_BG);
+        assert_eq!(rendered[(7, 0)].bg, MATCHING_BRACKET_BG);
+        assert!(rendered[(5, 0)].modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -1985,6 +2175,8 @@ mod tests {
                 diagnostics: vec![crate::lsp::Diagnostic {
                     line: 0,
                     character: 0,
+                    end_line: 0,
+                    end_character: 3,
                     severity: crate::lsp::DiagnosticSeverity::Error,
                     message: "bad value".to_owned(),
                 }],
@@ -1994,10 +2186,13 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &editor)).unwrap();
 
-        let cell = &terminal.backend().buffer()[(14, 0)];
+        let cell = &terminal.backend().buffer()[(16, 0)];
         assert_eq!(cell.symbol(), "b");
         assert_eq!(cell.fg, Color::Rgb(0xe2, 0x78, 0x78));
         assert!(cell.modifier.contains(Modifier::ITALIC));
+        let diagnosed_code = &terminal.backend().buffer()[(5, 0)];
+        assert_eq!(diagnosed_code.underline_color, Color::Rgb(0xe2, 0x78, 0x78));
+        assert!(diagnosed_code.modifier.contains(Modifier::UNDERLINED));
 
         editor.update(crate::editor::AppEvent::Mouse(crate::editor::MouseInput {
             event: crossterm::event::MouseEvent {

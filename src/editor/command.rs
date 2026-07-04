@@ -49,6 +49,7 @@ pub enum Command {
     PickerBackspace,
     PickerConfirm,
     PickerCancel,
+    Cancel,
     Undo,
     Redo,
     NavigateBack,

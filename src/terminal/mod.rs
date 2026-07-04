@@ -3,7 +3,7 @@ use std::io::{self, Stdout, Write};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::{
     cursor::{Hide, SetCursorStyle, Show},
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{
         BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
@@ -119,6 +119,7 @@ impl TerminalSession {
         if let Err(error) = execute!(
             stdout,
             EnterAlternateScreen,
+            EnableBracketedPaste,
             EnableMouseCapture,
             SetCursorStyle::SteadyBar,
             Hide
@@ -173,6 +174,7 @@ impl Drop for TerminalSession {
             self.terminal.backend_mut(),
             Show,
             SetCursorStyle::DefaultUserShape,
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
@@ -186,6 +188,7 @@ pub fn restore_terminal() {
         io::stderr(),
         Show,
         SetCursorStyle::DefaultUserShape,
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     );
