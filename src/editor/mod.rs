@@ -54,6 +54,7 @@ pub struct Editor {
     lsp_ready: HashSet<u64>,
     lsp_hover_capable: HashSet<u64>,
     lsp_incremental_sync: HashSet<u64>,
+    semantic_token_legends: HashMap<u64, crate::lsp::SemanticTokensLegend>,
     lsp_errors: HashMap<u64, String>,
     lsp_opened_documents: HashSet<DocumentId>,
     semantic_ready_versions: HashMap<DocumentId, i32>,
@@ -112,6 +113,7 @@ impl Default for Editor {
             lsp_ready: HashSet::new(),
             lsp_hover_capable: HashSet::new(),
             lsp_incremental_sync: HashSet::new(),
+            semantic_token_legends: HashMap::new(),
             lsp_errors: HashMap::new(),
             lsp_opened_documents: HashSet::new(),
             semantic_ready_versions: HashMap::new(),
@@ -1014,6 +1016,7 @@ impl Editor {
                 server,
                 incremental_sync,
                 hover_provider,
+                semantic_tokens_legend,
             } => {
                 self.lsp_spawned.insert(server);
                 self.finish_progress(&format!("lsp:{server}"));
@@ -1027,6 +1030,11 @@ impl Editor {
                 }
                 if incremental_sync {
                     self.lsp_incremental_sync.insert(server);
+                }
+                if let Some(legend) = semantic_tokens_legend {
+                    self.semantic_token_legends.insert(server, legend);
+                } else {
+                    self.semantic_token_legends.remove(&server);
                 }
                 self.lsp_restart_counts.remove(&server);
                 effects.push(Effect::LspSend {
@@ -1312,6 +1320,7 @@ impl Editor {
                 self.lsp_spawned.remove(&server);
                 self.lsp_incremental_sync.remove(&server);
                 self.lsp_hover_capable.remove(&server);
+                self.semantic_token_legends.remove(&server);
                 if let Some(language) = self
                     .lsp_servers
                     .iter()
@@ -2146,6 +2155,13 @@ impl Editor {
             lsp_types::SemanticTokensResult::Tokens(tokens) => tokens.data,
             lsp_types::SemanticTokensResult::Partial(partial) => partial.data,
         };
+        let legend = self
+            .documents
+            .get(&doc)
+            .and_then(|document| document.language.as_deref())
+            .and_then(|language| self.lsp_servers.get(language))
+            .and_then(|server| self.semantic_token_legends.get(server))
+            .cloned();
         let Some(document) = self.documents.get_mut(&doc) else {
             return;
         };
@@ -2175,7 +2191,26 @@ impl Editor {
             spans.push(crate::lsp::SemanticSpan {
                 start: begin,
                 end,
-                token_type: token.token_type,
+                token_kind: legend
+                    .as_ref()
+                    .and_then(|legend| legend.token_types.get(token.token_type as usize))
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                token_modifiers: legend.as_ref().map_or_else(Vec::new, |legend| {
+                    legend
+                        .token_modifiers
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, modifier)| {
+                            let bit = 1u32.checked_shl(index as u32)?;
+                            if token.token_modifiers_bitset & bit != 0 {
+                                Some(modifier.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                }),
             });
         }
         document.editable_mut().semantic_spans = spans;
@@ -5820,6 +5855,7 @@ mod tests {
             server: 1,
             incremental_sync: true,
             hover_provider: true,
+            semantic_tokens_legend: None,
         }));
 
         assert!(effects.iter().any(|effect| matches!(
@@ -5873,7 +5909,8 @@ mod tests {
             .push(crate::lsp::SemanticSpan {
                 start: CharIdx(0),
                 end: CharIdx(1),
-                token_type: 0,
+                token_kind: "function".to_owned(),
+                token_modifiers: Vec::new(),
             });
         editor.lsp_servers.insert("rust".to_owned(), 1);
         editor.lsp_ready.insert(1);
@@ -5931,6 +5968,43 @@ mod tests {
 
         let span = &editor.active_buffer().unwrap().semantic_spans[0];
         assert_eq!((span.start, span.end), (CharIdx(2), CharIdx(3)));
+    }
+
+    #[test]
+    fn semantic_tokens_use_server_legend_names_instead_of_numeric_slots() {
+        let mut editor = Editor::default();
+        let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
+        document.path = Some(PathBuf::from("/tmp/legend.rs"));
+        document.language = Some("rust".to_owned());
+        document.load_text("fn main() {}");
+        editor.lsp_servers.insert("rust".to_owned(), 1);
+        editor.semantic_token_legends.insert(
+            1,
+            crate::lsp::SemanticTokensLegend {
+                token_types: vec!["unresolvedReference".to_owned(), "function".to_owned()],
+                token_modifiers: vec!["deprecated".to_owned()],
+            },
+        );
+
+        editor.apply_semantic_tokens(
+            DocumentId(0),
+            2,
+            lsp_types::SemanticTokensResult::Tokens(lsp_types::SemanticTokens {
+                result_id: None,
+                data: vec![lsp_types::SemanticToken {
+                    delta_line: 0,
+                    delta_start: 3,
+                    length: 4,
+                    token_type: 1,
+                    token_modifiers_bitset: 1,
+                }],
+            }),
+        );
+
+        let span = &editor.active_buffer().unwrap().semantic_spans[0];
+        assert_eq!(span.token_kind, "function");
+        assert_eq!(span.token_modifiers, vec!["deprecated"]);
+        assert_eq!((span.start, span.end), (CharIdx(3), CharIdx(7)));
     }
 
     #[test]
@@ -6672,6 +6746,7 @@ mod tests {
             server: 1,
             incremental_sync: true,
             hover_provider: true,
+            semantic_tokens_legend: None,
         }));
 
         editor.open_paths([PathBuf::from("/tmp/second.rs")]);
@@ -6737,6 +6812,7 @@ mod tests {
             server: 1,
             incremental_sync: true,
             hover_provider: true,
+            semantic_tokens_legend: None,
         }));
         assert_eq!(
             editor.active_buffer().unwrap().language_status,

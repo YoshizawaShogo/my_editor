@@ -1289,7 +1289,7 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
                     .semantic_spans
                     .iter()
                     .find(|span| span.start.0 <= index && index < span.end.0)
-                    .map(|span| span.token_type);
+                    .map(|span| span.token_kind.as_str());
                 let mut style = Style::default()
                     .fg(semantic.map_or_else(
                         || {
@@ -1660,13 +1660,16 @@ fn git_gutter_style(kind: crate::editor::GitLineKind) -> (&'static str, Color) {
     }
 }
 
-fn semantic_color(token_type: u32) -> Color {
-    match token_type % 6 {
-        0 => Color::Rgb(0x84, 0xa0, 0xc6),
-        1 => Color::Rgb(0x89, 0xb8, 0xc2),
-        2 => Color::Rgb(0xa0, 0x93, 0xc7),
-        3 => Color::Rgb(0xb4, 0xbe, 0x82),
-        4 => Color::Rgb(0xe2, 0xa4, 0x78),
+fn semantic_color(token_kind: &str) -> Color {
+    match token_kind {
+        "namespace" | "type" | "class" | "enum" | "interface" | "struct" | "typeParameter"
+        | "property" | "enumMember" => Color::Rgb(0x89, 0xb8, 0xc2),
+        "function" | "method" | "macro" => Color::Rgb(0x84, 0xa0, 0xc6),
+        "keyword" | "modifier" | "operator" => Color::Rgb(0xe2, 0xa4, 0x78),
+        "string" | "regexp" => Color::Rgb(0xb4, 0xbe, 0x82),
+        "number" => Color::Rgb(0xe2, 0xa4, 0x78),
+        "comment" => MUTED,
+        "parameter" | "variable" => FG,
         _ => FG,
     }
 }
@@ -1874,7 +1877,8 @@ mod tests {
 
     #[test]
     fn semantic_color_fallback_stays_readable() {
-        assert_eq!(semantic_color(5), FG);
+        assert_eq!(semantic_color("unresolvedReference"), FG);
+        assert_eq!(semantic_color("unknown"), FG);
     }
 
     #[test]

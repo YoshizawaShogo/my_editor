@@ -19,10 +19,17 @@ pub enum DiagnosticSeverity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SemanticTokensLegend {
+    pub token_types: Vec<String>,
+    pub token_modifiers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticSpan {
     pub start: crate::position::CharIdx,
     pub end: crate::position::CharIdx,
-    pub token_type: u32,
+    pub token_kind: String,
+    pub token_modifiers: Vec<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -35,6 +42,7 @@ pub enum LspEvent {
         server: u64,
         incremental_sync: bool,
         hover_provider: bool,
+        semantic_tokens_legend: Option<SemanticTokensLegend>,
     },
     InitializationFailed {
         server: u64,

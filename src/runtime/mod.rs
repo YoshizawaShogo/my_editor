@@ -550,6 +550,7 @@ impl Runtime {
                                 server,
                                 incremental_sync: capabilities.incremental_sync,
                                 hover_provider: capabilities.hover_provider,
+                                semantic_tokens_legend: capabilities.semantic_tokens_legend,
                             },
                             Err(error) => crate::lsp::LspEvent::InitializationFailed {
                                 server,
@@ -829,10 +830,11 @@ fn handle_lsp_notification(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct InitializeCapabilities {
     incremental_sync: bool,
     hover_provider: bool,
+    semantic_tokens_legend: Option<crate::lsp::SemanticTokensLegend>,
 }
 
 fn parse_initialize_response(
@@ -862,9 +864,33 @@ fn parse_initialize_response(
         Some(lsp_types::HoverProviderCapability::Simple(true))
             | Some(lsp_types::HoverProviderCapability::Options(_))
     );
+    let semantic_tokens_legend = result
+        .capabilities
+        .semantic_tokens_provider
+        .map(|provider| match provider {
+            lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(options) => {
+                options.legend
+            }
+            lsp_types::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
+                options,
+            ) => options.semantic_tokens_options.legend,
+        })
+        .map(|legend| crate::lsp::SemanticTokensLegend {
+            token_types: legend
+                .token_types
+                .into_iter()
+                .map(|token| token.as_str().to_owned())
+                .collect(),
+            token_modifiers: legend
+                .token_modifiers
+                .into_iter()
+                .map(|modifier| modifier.as_str().to_owned())
+                .collect(),
+        });
     Ok(InitializeCapabilities {
         incremental_sync,
         hover_provider,
+        semantic_tokens_legend,
     })
 }
 
@@ -1322,6 +1348,40 @@ mod tests {
             Ok(InitializeCapabilities {
                 incremental_sync: true,
                 hover_provider: true,
+                semantic_tokens_legend: None,
+            })
+        );
+    }
+
+    #[test]
+    fn initialize_capabilities_keep_semantic_token_legend() {
+        let response = Response {
+            id: RequestId::from(0),
+            result: Some(serde_json::json!({
+                "capabilities": {
+                    "hoverProvider": true,
+                    "textDocumentSync": 2,
+                    "semanticTokensProvider": {
+                        "legend": {
+                            "tokenTypes": ["unresolvedReference", "function"],
+                            "tokenModifiers": ["deprecated"]
+                        },
+                        "full": true
+                    }
+                }
+            })),
+            error: None,
+        };
+
+        assert_eq!(
+            parse_initialize_response(response),
+            Ok(InitializeCapabilities {
+                incremental_sync: true,
+                hover_provider: true,
+                semantic_tokens_legend: Some(crate::lsp::SemanticTokensLegend {
+                    token_types: vec!["unresolvedReference".to_owned(), "function".to_owned()],
+                    token_modifiers: vec!["deprecated".to_owned()],
+                }),
             })
         );
     }

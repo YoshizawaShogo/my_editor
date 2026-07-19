@@ -943,12 +943,14 @@ mod tests {
             crate::lsp::SemanticSpan {
                 start: CharIdx(0),
                 end: CharIdx(3),
-                token_type: 0,
+                token_kind: "function".to_owned(),
+                token_modifiers: Vec::new(),
             },
             crate::lsp::SemanticSpan {
                 start: CharIdx(4),
                 end: CharIdx(7),
-                token_type: 1,
+                token_kind: "variable".to_owned(),
+                token_modifiers: Vec::new(),
             },
         ];
         let mut selections = Selections::single(Selection::caret(CharIdx(0)));
