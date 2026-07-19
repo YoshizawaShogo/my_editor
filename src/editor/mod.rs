@@ -36,6 +36,51 @@ use crate::{
 const PICKER_VIEW_WINDOW: usize = 20;
 const TERMINAL_SCROLLBACK_LINES: usize = 10_000;
 
+/// One language server's lifecycle and negotiated capabilities.
+///
+/// These used to be eight parallel maps keyed by the server id, so every
+/// lifecycle transition had to touch all of them by hand — an easy place to
+/// leave a stale flag when a server died. Bundled here, spawn/exit is a single
+/// state change and the entry lives as long as the language binding (a restart
+/// reuses the id), so [`Self::mark_down`] just clears capabilities in place.
+#[derive(Debug)]
+struct LspServer {
+    language: String,
+    spawned: bool,
+    ready: bool,
+    hover_capable: bool,
+    incremental_sync: bool,
+    semantic_legend: Option<crate::lsp::SemanticTokensLegend>,
+    error: Option<String>,
+    restart_count: u8,
+}
+
+impl LspServer {
+    fn new(language: String) -> Self {
+        Self {
+            language,
+            spawned: false,
+            ready: false,
+            hover_capable: false,
+            incremental_sync: false,
+            semantic_legend: None,
+            error: None,
+            restart_count: 0,
+        }
+    }
+
+    /// The process went down (crash or failed initialization): clear every
+    /// negotiated capability so a respawn re-handshakes, and record why.
+    fn mark_down(&mut self, error: String) {
+        self.spawned = false;
+        self.ready = false;
+        self.hover_capable = false;
+        self.incremental_sync = false;
+        self.semantic_legend = None;
+        self.error = Some(error);
+    }
+}
+
 pub struct Editor {
     documents: HashMap<DocumentId, Document>,
     next_doc_id: u64,
@@ -49,18 +94,9 @@ pub struct Editor {
     next_scan_token: u64,
     search: Option<SearchState>,
     next_grep_token: u64,
+    /// Language name → server id; the index into `servers`.
     lsp_servers: HashMap<String, u64>,
-    lsp_spawned: HashSet<u64>,
-    lsp_ready: HashSet<u64>,
-    lsp_hover_capable: HashSet<u64>,
-    lsp_incremental_sync: HashSet<u64>,
-    semantic_token_legends: HashMap<u64, crate::lsp::SemanticTokensLegend>,
-    lsp_errors: HashMap<u64, String>,
-    lsp_opened_documents: HashSet<DocumentId>,
-    semantic_ready_versions: HashMap<DocumentId, i32>,
-    hover_ready_documents: HashSet<DocumentId>,
-    hover_probe_attempts: HashMap<DocumentId, usize>,
-    lsp_restart_counts: HashMap<u64, u8>,
+    servers: HashMap<u64, LspServer>,
     next_server_id: u64,
     pending_lsp: HashMap<i64, PendingLsp>,
     next_lsp_request: i64,
@@ -70,8 +106,6 @@ pub struct Editor {
     confirm: Option<ConfirmState>,
     hover: Option<String>,
     deferred_hover: Option<(DocumentId, CharIdx)>,
-    pending_lsp_sync: HashSet<DocumentId>,
-    document_versions: HashMap<DocumentId, i32>,
     nav_back: Vec<(DocumentId, CharIdx)>,
     nav_forward: Vec<(DocumentId, CharIdx)>,
     /// Caret positions to restore once a freshly opened document finishes loading,
@@ -108,17 +142,7 @@ impl Default for Editor {
             search: None,
             next_grep_token: 1,
             lsp_servers: HashMap::new(),
-            lsp_spawned: HashSet::new(),
-            lsp_ready: HashSet::new(),
-            lsp_hover_capable: HashSet::new(),
-            lsp_incremental_sync: HashSet::new(),
-            semantic_token_legends: HashMap::new(),
-            lsp_errors: HashMap::new(),
-            lsp_opened_documents: HashSet::new(),
-            semantic_ready_versions: HashMap::new(),
-            hover_ready_documents: HashSet::new(),
-            hover_probe_attempts: HashMap::new(),
-            lsp_restart_counts: HashMap::new(),
+            servers: HashMap::new(),
             next_server_id: 1,
             pending_lsp: HashMap::new(),
             next_lsp_request: 1,
@@ -128,8 +152,6 @@ impl Default for Editor {
             confirm: None,
             hover: None,
             deferred_hover: None,
-            pending_lsp_sync: HashSet::new(),
-            document_versions: HashMap::new(),
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             pending_caret_jumps: HashMap::new(),
@@ -869,9 +891,9 @@ impl Editor {
                         // 開いている文書なら全文を送り直してテキストを揃える。
                         // これを怠ると以後の差分didChangeが古いテキストに適用され、
                         // セマンティックトークンが恒久的にズレる。
-                        if self.lsp_opened_documents.contains(&id) {
+                        if document.lsp.is_opened() {
                             document.editable_mut().record_full_lsp_sync();
-                            self.pending_lsp_sync.insert(id);
+                            document.lsp.mark_dirty();
                         }
                         self.status = None;
                         if let Some(path) = document.path.clone() {
@@ -1044,8 +1066,10 @@ impl Editor {
         let mut effects = Vec::new();
         match event {
             LspEvent::Spawned { server, language } => {
-                self.lsp_spawned.insert(server);
-                self.lsp_errors.remove(&server);
+                if let Some(server) = self.server_mut(server) {
+                    server.spawned = true;
+                    server.error = None;
+                }
                 self.notify(ToastLevel::Info, format!("{language} LSPを起動しました"));
             }
             LspEvent::Initialized {
@@ -1054,25 +1078,16 @@ impl Editor {
                 hover_provider,
                 semantic_tokens_legend,
             } => {
-                self.lsp_spawned.insert(server);
                 self.finish_progress(&format!("lsp:{server}"));
-                self.lsp_ready.insert(server);
-                self.lsp_errors.remove(&server);
-                if hover_provider {
-                    self.lsp_hover_capable.insert(server);
-                } else {
-                    self.lsp_errors
-                        .insert(server, "hover is not supported".to_owned());
+                if let Some(entry) = self.server_mut(server) {
+                    entry.spawned = true;
+                    entry.ready = true;
+                    entry.hover_capable = hover_provider;
+                    entry.incremental_sync = incremental_sync;
+                    entry.semantic_legend = semantic_tokens_legend;
+                    entry.restart_count = 0;
+                    entry.error = (!hover_provider).then(|| "hover is not supported".to_owned());
                 }
-                if incremental_sync {
-                    self.lsp_incremental_sync.insert(server);
-                }
-                if let Some(legend) = semantic_tokens_legend {
-                    self.semantic_token_legends.insert(server, legend);
-                } else {
-                    self.semantic_token_legends.remove(&server);
-                }
-                self.lsp_restart_counts.remove(&server);
                 effects.push(Effect::LspSend {
                     server,
                     message: serde_json::json!({
@@ -1082,11 +1097,11 @@ impl Editor {
                     })
                     .to_string(),
                 });
-                let language = self
-                    .lsp_servers
-                    .iter()
-                    .find_map(|(language, id)| (*id == server).then(|| language.clone()));
-                if let Some(language) = language {
+                if let Some(language) = self
+                    .servers
+                    .get(&server)
+                    .map(|entry| entry.language.clone())
+                {
                     let documents: Vec<_> = self
                         .documents
                         .iter()
@@ -1133,7 +1148,7 @@ impl Editor {
                     side,
                     anchor,
                     add_parentheses,
-                }) if self.document_versions.get(&doc) == Some(&version)
+                }) if self.doc_version(doc) == Some(version)
                     && self
                         .layout
                         .active_editor(self.focus)
@@ -1287,8 +1302,10 @@ impl Editor {
                         .map_err(|error| error.to_string())
                 }) {
                     Ok(hover) => {
-                        if hover.is_some() {
-                            self.hover_ready_documents.insert(doc);
+                        if hover.is_some()
+                            && let Some(lsp) = self.doc_lsp_mut(doc)
+                        {
+                            lsp.mark_hover_ready();
                         }
                         let mut parts = hover
                             .map(|hover| hover_text(hover.contents))
@@ -1321,20 +1338,22 @@ impl Editor {
                         // 一度でも hover が返ればサーバーは応答可能。全候補を
                         // 巡回してから ready にすると往復×候補数ぶん待たされる。
                         Ok(Some(_)) => {
-                            self.hover_probe_attempts.remove(&doc);
-                            self.hover_ready_documents.insert(doc);
+                            if let Some(lsp) = self.doc_lsp_mut(doc) {
+                                lsp.mark_hover_ready();
+                            }
                             self.dirty = true;
                         }
                         Ok(None) => {
-                            let attempts = self.hover_probe_attempts.entry(doc).or_default();
-                            *attempts += 1;
+                            if let Some(lsp) = self.doc_lsp_mut(doc) {
+                                lsp.record_hover_probe_attempt();
+                            }
                             effects.push(Effect::ScheduleHoverProbe { doc, delay_ms: 50 });
                         }
                         Err(_) => effects.push(Effect::ScheduleHoverProbe { doc, delay_ms: 500 }),
                     }
                 }
                 Some(PendingLsp::SemanticTokens { doc, version }) => {
-                    if self.document_versions.get(&doc) == Some(&version)
+                    if self.doc_version(doc) == Some(version)
                         && let Ok(value) = result
                         && let Ok(Some(tokens)) =
                             serde_json::from_value::<Option<lsp_types::SemanticTokensResult>>(value)
@@ -1350,53 +1369,35 @@ impl Editor {
                 self.progress
                     .retain(|key, _| !key.starts_with(&progress_prefix));
                 let message = error.unwrap_or_else(|| "LSPが終了しました".to_owned());
-                self.lsp_errors.insert(server, message.clone());
                 self.notify(ToastLevel::Error, message.clone());
-                self.lsp_ready.remove(&server);
-                self.lsp_spawned.remove(&server);
-                self.lsp_incremental_sync.remove(&server);
-                self.lsp_hover_capable.remove(&server);
-                self.semantic_token_legends.remove(&server);
-                if let Some(language) = self
-                    .lsp_servers
-                    .iter()
-                    .find_map(|(language, id)| (*id == server).then(|| language.clone()))
-                {
-                    self.lsp_opened_documents.retain(|doc| {
-                        self.documents
-                            .get(doc)
-                            .is_none_or(|document| document.language.as_deref() != Some(&language))
-                    });
-                    self.semantic_ready_versions.retain(|doc, _| {
-                        self.documents
-                            .get(doc)
-                            .is_none_or(|document| document.language.as_deref() != Some(&language))
-                    });
-                    self.hover_ready_documents.retain(|doc| {
-                        self.documents
-                            .get(doc)
-                            .is_none_or(|document| document.language.as_deref() != Some(&language))
-                    });
-                    self.hover_probe_attempts.retain(|doc, _| {
-                        self.documents
-                            .get(doc)
-                            .is_none_or(|document| document.language.as_deref() != Some(&language))
-                    });
+                let language = self
+                    .servers
+                    .get(&server)
+                    .map(|entry| entry.language.clone());
+                let restart_count = self.server_mut(server).map_or(0, |entry| {
+                    entry.mark_down(message);
+                    entry.restart_count
+                });
+                if let Some(language) = language {
+                    self.reset_documents_for_server_loss(&language);
                 }
-                let attempts = self.lsp_restart_counts.entry(server).or_insert(0);
-                if *attempts < 3 {
-                    let delay_ms = 500u64 * (1u64 << *attempts);
-                    *attempts += 1;
+                if restart_count < 3 {
+                    let delay_ms = 500u64 * (1u64 << restart_count);
+                    if let Some(entry) = self.server_mut(server) {
+                        entry.restart_count += 1;
+                    }
                     effects.push(Effect::ScheduleLspRestart { server, delay_ms });
                 }
             }
             LspEvent::RestartDue { server } => {
-                self.lsp_spawned.remove(&server);
-                self.lsp_errors.remove(&server);
+                if let Some(entry) = self.server_mut(server) {
+                    entry.spawned = false;
+                    entry.error = None;
+                }
                 if let Some(language) = self
-                    .lsp_servers
-                    .iter()
-                    .find_map(|(language, id)| (*id == server).then(|| language.clone()))
+                    .servers
+                    .get(&server)
+                    .map(|entry| entry.language.clone())
                     && let Some(command) = self
                         .config
                         .language
@@ -1413,7 +1414,7 @@ impl Editor {
                 }
             }
             LspEvent::SemanticRefreshDue { doc, version } => {
-                if self.document_versions.get(&doc) == Some(&version) {
+                if self.doc_version(doc) == Some(version) {
                     effects.extend(self.request_semantic_tokens(doc, version));
                 }
             }
@@ -1422,7 +1423,7 @@ impl Editor {
                     .layout
                     .active_editor(self.focus)
                     .map(|pane| pane.view.doc);
-                if self.document_versions.get(&doc) == Some(&version)
+                if self.doc_version(doc) == Some(version)
                     && active_doc == Some(doc)
                     && self.completion_suppressed != Some((doc, version))
                     && matches!(self.focus, Focus::Editor(_))
@@ -1431,7 +1432,7 @@ impl Editor {
                 }
             }
             LspEvent::HoverProbeDue { doc } => {
-                if !self.hover_ready_documents.contains(&doc) {
+                if !self.doc_is_hover_ready(doc) {
                     effects.extend(self.request_hover_probe(doc));
                 }
             }
@@ -1446,9 +1447,9 @@ impl Editor {
                 .layout
                 .active_editor(self.focus)
                 .map(|pane| pane.view.doc)
-                && let Some(version) = self.document_versions.get(&doc)
+                && let Some(version) = self.doc_version(doc)
             {
-                self.completion_suppressed = Some((doc, *version));
+                self.completion_suppressed = Some((doc, version));
             }
             self.focus = Focus::Editor(completion.return_side);
             self.dirty = true;
@@ -1691,7 +1692,7 @@ impl Editor {
         }
         Some((
             pane.view.doc,
-            *self.document_versions.get(&pane.view.doc).unwrap_or(&1),
+            self.doc_version(pane.view.doc).unwrap_or(1),
             editable.text().slice(start..head).to_string(),
             CharIdx(start),
         ))
@@ -1797,9 +1798,7 @@ impl Editor {
             .get(&doc)
             .and_then(|document| document.language.as_ref())
             .and_then(|language| self.lsp_servers.get(language))
-            .is_some_and(|server| {
-                self.lsp_ready.contains(server) && self.lsp_opened_documents.contains(&doc)
-            });
+            .is_some_and(|server| self.server_ready(*server) && self.doc_is_opened(doc));
         if !ready {
             return Vec::new();
         }
@@ -1845,8 +1844,7 @@ impl Editor {
         let editable = document.editable_opt()?;
         let language = document.language.as_ref()?;
         let server = *self.lsp_servers.get(language)?;
-        if !self.lsp_ready.contains(&server) || !self.lsp_opened_documents.contains(&pane.view.doc)
-        {
+        if !self.server_ready(server) || !document.lsp.is_opened() {
             return None;
         }
         let path = document.path.clone()?;
@@ -1881,9 +1879,7 @@ impl Editor {
         else {
             return Vec::new();
         };
-        let server = self.next_server_id;
-        self.next_server_id += 1;
-        self.lsp_servers.insert(language.clone(), server);
+        let server = self.register_server(language.clone());
         vec![Effect::SpawnLsp {
             server,
             language,
@@ -1909,9 +1905,7 @@ impl Editor {
             if self.lsp_servers.contains_key(&language) {
                 continue;
             }
-            let server = self.next_server_id;
-            self.next_server_id += 1;
-            self.lsp_servers.insert(language.clone(), server);
+            let server = self.register_server(language.clone());
             effects.push(Effect::SpawnLsp {
                 server,
                 language,
@@ -1922,8 +1916,95 @@ impl Editor {
         effects
     }
 
+    fn doc_version(&self, doc: DocumentId) -> Option<i32> {
+        self.documents
+            .get(&doc)
+            .map(|document| document.lsp.version())
+    }
+
+    fn doc_is_opened(&self, doc: DocumentId) -> bool {
+        self.documents
+            .get(&doc)
+            .is_some_and(|document| document.lsp.is_opened())
+    }
+
+    fn doc_is_hover_ready(&self, doc: DocumentId) -> bool {
+        self.documents
+            .get(&doc)
+            .is_some_and(|document| document.lsp.is_hover_ready())
+    }
+
+    fn doc_lsp_mut(&mut self, doc: DocumentId) -> Option<&mut crate::document::DocumentLsp> {
+        self.documents
+            .get_mut(&doc)
+            .map(|document| &mut document.lsp)
+    }
+
+    fn server_id_for_language(&self, language: &str) -> Option<u64> {
+        self.lsp_servers.get(language).copied()
+    }
+
+    fn server(&self, id: u64) -> Option<&LspServer> {
+        self.servers.get(&id)
+    }
+
+    /// Allocate a server id for `language` and register it in both the index and
+    /// the server table. The two must move together, so nobody does it by hand.
+    fn register_server(&mut self, language: String) -> u64 {
+        let id = self.next_server_id;
+        self.next_server_id += 1;
+        self.lsp_servers.insert(language.clone(), id);
+        self.servers.insert(id, LspServer::new(language));
+        id
+    }
+
+    fn server_mut(&mut self, id: u64) -> Option<&mut LspServer> {
+        self.servers.get_mut(&id)
+    }
+
+    fn server_ready(&self, id: u64) -> bool {
+        self.servers.get(&id).is_some_and(|server| server.ready)
+    }
+
+    /// Register a language server for tests and hand back its entry so the test
+    /// can flip whichever capabilities it needs.
+    #[cfg(test)]
+    fn test_register_server(&mut self, language: &str, id: u64) -> &mut LspServer {
+        self.lsp_servers.insert(language.to_owned(), id);
+        self.servers
+            .entry(id)
+            .or_insert_with(|| LspServer::new(language.to_owned()))
+    }
+
+    /// Stand a document up as already opened at `version`, for tests that skip
+    /// the real didOpen handshake.
+    #[cfg(test)]
+    fn test_open_doc(&mut self, doc: DocumentId, version: i32) {
+        if let Some(document) = self.documents.get_mut(&doc) {
+            document.lsp = crate::document::DocumentLsp::test_opened(version);
+        }
+    }
+
+    /// Flag `doc` as owing a `didChange` sync to its server. Called from every
+    /// edit path so the flush in [`Self::take_lsp_sync_effects`] picks it up.
+    fn mark_doc_dirty(&mut self, doc: DocumentId) {
+        if let Some(lsp) = self.doc_lsp_mut(doc) {
+            lsp.mark_dirty();
+        }
+    }
+
+    /// The server for `language` died or is restarting: drop every document's
+    /// server-derived state so a respawn re-opens them from scratch.
+    fn reset_documents_for_server_loss(&mut self, language: &str) {
+        for document in self.documents.values_mut() {
+            if document.language.as_deref() == Some(language) {
+                document.lsp.reset_for_server_loss();
+            }
+        }
+    }
+
     fn open_lsp_document(&mut self, doc: DocumentId, server: u64) -> Vec<Effect> {
-        if !self.lsp_ready.contains(&server) || self.lsp_opened_documents.contains(&doc) {
+        if !self.server_ready(server) || self.doc_is_opened(doc) {
             return Vec::new();
         }
         let Some((language, path, text)) = self.documents.get(&doc).and_then(|document| {
@@ -1938,8 +2019,9 @@ impl Editor {
         if self.lsp_servers.get(&language) != Some(&server) {
             return Vec::new();
         }
-        self.lsp_opened_documents.insert(doc);
-        self.document_versions.insert(doc, 1);
+        if let Some(lsp) = self.doc_lsp_mut(doc) {
+            lsp.mark_opened();
+        }
         let request = self.next_lsp_request;
         self.next_lsp_request += 1;
         self.pending_lsp
@@ -1976,7 +2058,7 @@ impl Editor {
     }
 
     fn request_hover_probe(&mut self, doc: DocumentId) -> Vec<Effect> {
-        if self.hover_ready_documents.contains(&doc)
+        if self.doc_is_hover_ready(doc)
             || self.pending_lsp.values().any(
                 |pending| matches!(pending, PendingLsp::HoverProbe { doc: pending } if *pending == doc),
             )
@@ -1986,7 +2068,7 @@ impl Editor {
         let Some((server, path, candidate)) = self.documents.get(&doc).and_then(|document| {
             let language = document.language.as_ref()?;
             let editable = document.editable_opt()?;
-            let attempt = self.hover_probe_attempts.get(&doc).copied().unwrap_or(0);
+            let attempt = document.lsp.hover_probe_attempts();
             let candidate = sampled_hover_probe_indices(editable.text(), 12)
                 .get(attempt)
                 .copied()
@@ -2010,16 +2092,18 @@ impl Editor {
         }) else {
             return Vec::new();
         };
-        if !self.lsp_ready.contains(&server)
-            || !self.lsp_hover_capable.contains(&server)
-            || !self.lsp_opened_documents.contains(&doc)
-        {
+        let hover_capable = self
+            .server(server)
+            .is_some_and(|entry| entry.ready && entry.hover_capable);
+        if !hover_capable || !self.doc_is_opened(doc) {
             return Vec::new();
         }
         let Some((line, character)) = candidate else {
             // 候補を使い切っても hover が一度も返らなかった。サーバーの準備が
             // 遅れているだけの可能性が高いので、間を置いて最初からやり直す。
-            self.hover_probe_attempts.remove(&doc);
+            if let Some(lsp) = self.doc_lsp_mut(doc) {
+                lsp.reset_hover_probe_attempts();
+            }
             return vec![Effect::ScheduleHoverProbe { doc, delay_ms: 500 }];
         };
         let request = self.next_lsp_request;
@@ -2073,7 +2157,7 @@ impl Editor {
         }) else {
             return Vec::new();
         };
-        if !self.lsp_ready.contains(&server) || !self.lsp_opened_documents.contains(&doc) {
+        if !self.server_ready(server) || !self.doc_is_opened(doc) {
             return Vec::new();
         }
         let request = self.next_lsp_request;
@@ -2182,7 +2266,7 @@ impl Editor {
         document
             .editable_mut()
             .insert_fragments(&mut selections, &replacements);
-        self.pending_lsp_sync.insert(doc);
+        self.mark_doc_dirty(doc);
     }
 
     fn document_for_uri(&self, uri: &str) -> Option<DocumentId> {
@@ -2206,9 +2290,9 @@ impl Editor {
             .documents
             .get(&doc)
             .and_then(|document| document.language.as_deref())
-            .and_then(|language| self.lsp_servers.get(language))
-            .and_then(|server| self.semantic_token_legends.get(server))
-            .cloned();
+            .and_then(|language| self.server_id_for_language(language))
+            .and_then(|server| self.server(server))
+            .and_then(|server| server.semantic_legend.clone());
         let Some(document) = self.documents.get_mut(&doc) else {
             return;
         };
@@ -2261,7 +2345,9 @@ impl Editor {
             });
         }
         document.editable_mut().semantic_spans = spans;
-        self.semantic_ready_versions.insert(doc, version);
+        if let Some(lsp) = self.doc_lsp_mut(doc) {
+            lsp.set_semantic_ready(version);
+        }
     }
 
     fn refresh_languages(&mut self) {
@@ -2618,15 +2704,13 @@ impl Editor {
                 .to_string(),
             })
         });
+        // Removing the document drops its DocumentLsp with it, so the per-document
+        // LSP state (version, opened, semantic/hover readiness) needs no separate
+        // cleanup here — that inseparability is the point of storing it inline.
         self.documents.remove(&id);
-        self.lsp_opened_documents.remove(&id);
-        self.semantic_ready_versions.remove(&id);
-        self.hover_ready_documents.remove(&id);
-        self.hover_probe_attempts.remove(&id);
         if self.deferred_hover.is_some_and(|(doc, _)| doc == id) {
             self.deferred_hover = None;
         }
-        self.document_versions.remove(&id);
         self.pending_self_disk_updates.remove(&id);
         if let Some(next) = self.documents.keys().next().copied() {
             self.layout = Layout::EditorFull(EditorPane {
@@ -2861,11 +2945,7 @@ impl Editor {
         else {
             return Vec::new();
         };
-        let version = self
-            .document_versions
-            .get(&doc)
-            .copied()
-            .unwrap_or_default();
+        let version = self.doc_version(doc).unwrap_or(1);
         let mut effects = Vec::new();
         if let Some(language) = language
             && let Some(document) = self.documents.get_mut(&doc)
@@ -3589,7 +3669,7 @@ impl Editor {
             document
                 .editable_mut()
                 .insert_fragments(&mut selections, &fragments);
-            self.pending_lsp_sync.insert(id);
+            self.mark_doc_dirty(id);
         }
         self.status = Some("置換を適用しました".to_owned());
         self.focus = Focus::Editor(Side::Left);
@@ -4232,10 +4312,13 @@ impl Editor {
         if !has_lsp {
             return format!("<syntax> {language}");
         }
-        let Some(server) = self.lsp_servers.get(language) else {
+        let Some(server_id) = self.server_id_for_language(language) else {
             return format!("<lsp> {language}: starting");
         };
-        if let Some(error) = self.lsp_errors.get(server) {
+        let Some(server) = self.server(server_id) else {
+            return format!("<lsp> {language}: starting");
+        };
+        if let Some(error) = &server.error {
             let state = if error.to_ascii_lowercase().contains("not found") {
                 "not found"
             } else {
@@ -4243,15 +4326,15 @@ impl Editor {
             };
             return format!("<lsp> {language}: {state}");
         }
-        if !self.lsp_spawned.contains(server) {
+        if !server.spawned {
             return format!("<lsp> {language}: starting");
         }
-        let progress_prefix = format!("lsp:{server}:");
+        let progress_prefix = format!("lsp:{server_id}:");
         let progress = self
             .progress
             .iter()
             .find_map(|(key, message)| key.starts_with(&progress_prefix).then_some(message));
-        if !self.lsp_ready.contains(server) {
+        if !server.ready {
             return progress.map_or_else(
                 || format!("<lsp> {language}: initializing"),
                 |message| format!("<lsp> {language}: initializing ({message})"),
@@ -4260,18 +4343,20 @@ impl Editor {
         if let Some(message) = progress {
             return format!("<lsp> {language}: updating ({message})");
         }
-        if !self.lsp_opened_documents.contains(&doc) {
+        let Some(lsp) = self.documents.get(&doc).map(|document| &document.lsp) else {
+            return format!("<lsp> {language}: opening");
+        };
+        if !lsp.is_opened() {
             return format!("<lsp> {language}: opening");
         }
-        let current_version = self.document_versions.get(&doc).copied().unwrap_or(1);
-        match self.semantic_ready_versions.get(&doc).copied() {
+        match lsp.semantic_ready_version() {
             None => return format!("<lsp> {language}: coloring"),
-            Some(version) if version < current_version => {
+            Some(version) if version < lsp.version() => {
                 return format!("<lsp> {language}: updating");
             }
             Some(_) => {}
         }
-        if !self.hover_ready_documents.contains(&doc) {
+        if !lsp.is_hover_ready() {
             return format!("<lsp> {language}: checking hover");
         }
         format!("<lsp> {language}: ready")
@@ -4402,15 +4487,20 @@ impl Editor {
             self.dirty = true;
             return;
         }
+        let doc = pane.view.doc;
         edit(document, &mut pane.view);
         self.completion_suppressed = None;
-        self.pending_lsp_sync.insert(pane.view.doc);
+        self.mark_doc_dirty(doc);
         self.ensure_cursor_visible();
         self.dirty = true;
     }
 
     fn take_lsp_sync_effects(&mut self) -> Vec<Effect> {
-        let pending: Vec<_> = self.pending_lsp_sync.drain().collect();
+        let pending: Vec<_> = self
+            .documents
+            .iter_mut()
+            .filter_map(|(id, document)| document.lsp.take_needs_sync().then_some(*id))
+            .collect();
         let mut effects = Vec::new();
         for id in pending {
             let Some(document) = self.documents.get_mut(&id) else {
@@ -4433,17 +4523,20 @@ impl Editor {
             let Some(server) = self.lsp_servers.get(&language).copied() else {
                 continue;
             };
-            if !self.lsp_ready.contains(&server) || !self.lsp_opened_documents.contains(&id) {
+            if !self.server_ready(server) || !self.doc_is_opened(id) {
                 continue;
             }
-            let content_changes = if self.lsp_incremental_sync.contains(&server) {
+            let content_changes = if self
+                .server(server)
+                .is_some_and(|entry| entry.incremental_sync)
+            {
                 serde_json::to_value(changes).unwrap_or_else(|_| serde_json::json!([]))
             } else {
                 serde_json::json!([{"text": text}])
             };
-            let version = self.document_versions.entry(id).or_insert(1);
-            *version += 1;
-            let version = *version;
+            let version = self
+                .doc_lsp_mut(id)
+                .map_or(1, crate::document::DocumentLsp::bump_version);
             effects.push(Effect::LspSend {
                 server,
                 message: serde_json::json!({
@@ -5866,9 +5959,8 @@ mod tests {
         let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
         document.path = Some(PathBuf::from("/tmp/hover.rs"));
         document.language = Some("rust".to_owned());
-        editor.lsp_servers.insert("rust".to_owned(), 1);
-        editor.lsp_ready.insert(1);
-        editor.lsp_opened_documents.insert(DocumentId(0));
+        editor.test_register_server("rust", 1).ready = true;
+        editor.test_open_doc(DocumentId(0), 1);
         let moved = MouseEvent {
             kind: MouseEventKind::Moved,
             column: 6,
@@ -5912,7 +6004,7 @@ mod tests {
         let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
         document.path = Some(PathBuf::from("/tmp/deferred-hover.rs"));
         document.language = Some("rust".to_owned());
-        editor.lsp_servers.insert("rust".to_owned(), 1);
+        editor.test_register_server("rust", 1);
 
         let effects = editor.update(AppEvent::Mouse(MouseInput {
             event: MouseEvent {
@@ -5987,11 +6079,10 @@ mod tests {
                 token_kind: "function".to_owned(),
                 token_modifiers: Vec::new(),
             });
-        editor.lsp_servers.insert("rust".to_owned(), 1);
-        editor.lsp_ready.insert(1);
-        editor.lsp_incremental_sync.insert(1);
-        editor.lsp_opened_documents.insert(DocumentId(0));
-        editor.document_versions.insert(DocumentId(0), 1);
+        let server = editor.test_register_server("rust", 1);
+        server.ready = true;
+        server.incremental_sync = true;
+        editor.test_open_doc(DocumentId(0), 1);
 
         let effects = editor.update(AppEvent::TextInput('a'));
         let sync_message = effects
@@ -6052,14 +6143,11 @@ mod tests {
         document.path = Some(PathBuf::from("/tmp/legend.rs"));
         document.language = Some("rust".to_owned());
         document.load_text("fn main() {}");
-        editor.lsp_servers.insert("rust".to_owned(), 1);
-        editor.semantic_token_legends.insert(
-            1,
-            crate::lsp::SemanticTokensLegend {
+        editor.test_register_server("rust", 1).semantic_legend =
+            Some(crate::lsp::SemanticTokensLegend {
                 token_types: vec!["unresolvedReference".to_owned(), "function".to_owned()],
                 token_modifiers: vec!["deprecated".to_owned()],
-            },
-        );
+            });
 
         editor.apply_semantic_tokens(
             DocumentId(0),
@@ -6681,10 +6769,8 @@ mod tests {
             id: DocumentId(1),
             result: Ok("fn main() {}\n".to_owned()),
         }));
-        editor.lsp_servers.insert("rust".to_owned(), 7);
-        editor.lsp_ready.insert(7);
-        editor.lsp_opened_documents.insert(DocumentId(1));
-        editor.document_versions.insert(DocumentId(1), 3);
+        editor.test_register_server("rust", 7).ready = true;
+        editor.test_open_doc(DocumentId(1), 3);
         editor.pending_lsp.insert(
             99,
             PendingLsp::SemanticTokens {
@@ -6855,9 +6941,8 @@ mod tests {
         let path = PathBuf::from("/tmp/format.rs");
         editor.open_paths([path]);
         editor.documents.get_mut(&DocumentId(1)).unwrap().language = Some("rust".to_owned());
-        editor.lsp_servers.insert("rust".to_owned(), 7);
-        editor.lsp_ready.insert(7);
-        editor.lsp_opened_documents.insert(DocumentId(1));
+        editor.test_register_server("rust", 7).ready = true;
+        editor.test_open_doc(DocumentId(1), 1);
 
         let effects = editor.update(Command::Format.into());
 
@@ -6965,8 +7050,8 @@ mod tests {
             hover_provider: true,
             semantic_tokens_legend: None,
         }));
-        assert!(editor.lsp_opened_documents.contains(&DocumentId(1)));
-        let version_before = editor.document_versions[&DocumentId(1)];
+        assert!(editor.doc_is_opened(DocumentId(1)));
+        let version_before = editor.doc_version(DocumentId(1)).unwrap();
 
         // 外部ツールがディスク上のファイルを書き換えた後の自動再読込。
         let effects = editor.update(AppEvent::Io(IoEvent::FileLoaded {
@@ -6986,7 +7071,10 @@ mod tests {
             })
             .expect("再読込後は全文didChangeでサーバーと同期し直す");
         assert!(did_change.contains("fn after() {}"));
-        assert_eq!(editor.document_versions[&DocumentId(1)], version_before + 1);
+        assert_eq!(
+            editor.doc_version(DocumentId(1)).unwrap(),
+            version_before + 1
+        );
     }
 
     #[test]
@@ -7125,6 +7213,7 @@ mod tests {
     #[test]
     fn crashed_lsp_restarts_three_times_with_exponential_backoff() {
         let mut editor = Editor::default();
+        editor.test_register_server("rust", 1);
         for expected_delay in [500, 1_000, 2_000] {
             assert_eq!(
                 editor.update(AppEvent::Lsp(LspEvent::Exited {
@@ -7147,7 +7236,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            editor.lsp_errors.get(&1).map(String::as_str),
+            editor.server(1).and_then(|server| server.error.as_deref()),
             Some("crashed")
         );
     }
@@ -7171,7 +7260,7 @@ mod tests {
             editor.active_buffer().unwrap().language_status,
             "<lsp> rust: error"
         );
-        assert!(!editor.lsp_ready.contains(&1));
+        assert!(!editor.server_ready(1));
     }
 
     #[test]
@@ -7192,11 +7281,10 @@ mod tests {
         let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
         document.path = Some(PathBuf::from("main.rs"));
         document.language = Some("rust".to_owned());
-        editor.lsp_servers.insert("rust".to_owned(), 1);
-        editor.lsp_spawned.insert(1);
-        editor.lsp_ready.insert(1);
-        editor.lsp_opened_documents.insert(DocumentId(0));
-        editor.document_versions.insert(DocumentId(0), 1);
+        let server = editor.test_register_server("rust", 1);
+        server.spawned = true;
+        server.ready = true;
+        editor.test_open_doc(DocumentId(0), 1);
 
         editor.update(AppEvent::TextPaste("let collections".to_owned()));
         let effects = editor.request_completion(true);
@@ -7226,10 +7314,8 @@ mod tests {
         let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
         document.path = Some(PathBuf::from("main.rs"));
         document.language = Some("rust".to_owned());
-        editor.lsp_servers.insert("rust".to_owned(), 1);
-        editor.lsp_ready.insert(1);
-        editor.lsp_opened_documents.insert(DocumentId(0));
-        editor.document_versions.insert(DocumentId(0), 1);
+        editor.test_register_server("rust", 1).ready = true;
+        editor.test_open_doc(DocumentId(0), 1);
         editor.update(AppEvent::TextPaste("cur".to_owned()));
 
         let request = editor
@@ -7264,10 +7350,8 @@ mod tests {
         let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
         document.path = Some(PathBuf::from("main.rs"));
         document.language = Some("rust".to_owned());
-        editor.lsp_servers.insert("rust".to_owned(), 1);
-        editor.lsp_ready.insert(1);
-        editor.lsp_opened_documents.insert(DocumentId(0));
-        editor.document_versions.insert(DocumentId(0), 1);
+        editor.test_register_server("rust", 1).ready = true;
+        editor.test_open_doc(DocumentId(0), 1);
         editor.update(AppEvent::TextPaste("use crate::cur".to_owned()));
 
         let request = editor
@@ -7300,10 +7384,8 @@ mod tests {
         let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
         document.path = Some(PathBuf::from("main.rs"));
         document.language = Some("rust".to_owned());
-        editor.lsp_servers.insert("rust".to_owned(), 1);
-        editor.lsp_ready.insert(1);
-        editor.lsp_opened_documents.insert(DocumentId(0));
-        editor.document_versions.insert(DocumentId(0), 1);
+        editor.test_register_server("rust", 1).ready = true;
+        editor.test_open_doc(DocumentId(0), 1);
         editor.update(AppEvent::TextPaste("cur".to_owned()));
         editor.status = Some("保存しました".to_owned());
         let request = editor
