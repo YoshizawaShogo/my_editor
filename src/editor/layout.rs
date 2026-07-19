@@ -65,6 +65,14 @@ impl Layout {
         }
     }
 
+    pub fn panes_mut(&mut self) -> Vec<&mut EditorPane> {
+        match self {
+            Self::EditorFull(pane) => vec![pane],
+            Self::EditorAndShell { editor } => vec![editor],
+            Self::EditorAndEditor { left, right, .. } => vec![left, right],
+        }
+    }
+
     pub fn split(&self) -> Option<(&EditorPane, &EditorPane, bool)> {
         match self {
             Self::EditorAndEditor { left, right, diff } => Some((left, right, *diff)),

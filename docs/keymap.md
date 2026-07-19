@@ -7,7 +7,7 @@
 | Key | Action |
 | --- | --- |
 | 印字キー | 全カーソルへ文字挿入 |
-| `Enter` / `Backspace` / `Delete` | 改行 / 前削除 / 後削除。Backspaceは直前の設定幅space、または空の自動補完ペアをまとめて削除 |
+| `Enter` / `Backspace` / `Delete` | 改行 / 前削除 / 後削除。Backspaceは直前のspaceを前のインデント境界まで、または空の自動補完ペアをまとめて削除 |
 | 矢印 / `Home` / `End` | カーソル移動 |
 | `Ctrl+←/→` | 単語移動 |
 | `Ctrl+Home` / `Ctrl+End` | 文書先頭 / 末尾へ移動 |

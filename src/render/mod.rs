@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::{
     editor::{ActiveBuffer, Editor},
-    position::{char_idx_to_display_pos, display_col_after, lsp_position_to_char_idx},
+    position::{char_idx_to_display_pos, display_col_after},
     view::is_word,
 };
 
@@ -1214,26 +1214,16 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
     );
     let matching_brackets =
         matching_bracket_indices(buffer.text, buffer.view.selections.primary().head.0);
+    // Diagnostics already carry char-index ranges kept in sync with edits, so no
+    // per-frame position conversion is needed.
     let diagnostic_ranges = buffer
         .diagnostics
         .iter()
         .map(|diagnostic| {
-            let start = lsp_position_to_char_idx(
-                buffer.text,
-                diagnostic.line as usize,
-                diagnostic.character as usize,
+            (
+                diagnostic.range.start.0..diagnostic.range.end.0,
+                diagnostic.severity,
             )
-            .0;
-            let mut end = lsp_position_to_char_idx(
-                buffer.text,
-                diagnostic.end_line as usize,
-                diagnostic.end_character as usize,
-            )
-            .0;
-            if end <= start {
-                end = (start + 1).min(buffer.text.len_chars());
-            }
-            (start..end, diagnostic.severity)
         })
         .collect::<Vec<_>>();
     let mut gutter_lines = Vec::with_capacity(end.saturating_sub(start));
@@ -1243,7 +1233,7 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
         let line_diagnostic = buffer
             .diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.line as usize == line_index)
+            .filter(|diagnostic| diagnostic_line(buffer.text, diagnostic) == line_index)
             .min_by_key(|diagnostic| match diagnostic.severity {
                 crate::lsp::DiagnosticSeverity::Error => 0,
                 crate::lsp::DiagnosticSeverity::Warning => 1,
@@ -1435,7 +1425,7 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
         .diagnostics
         .iter()
         .filter(|diagnostic| {
-            (diagnostic.line as usize) < start
+            diagnostic_line(buffer.text, diagnostic) < start
                 && diagnostic.severity == crate::lsp::DiagnosticSeverity::Error
         })
         .count();
@@ -1443,7 +1433,7 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
         .diagnostics
         .iter()
         .filter(|diagnostic| {
-            (diagnostic.line as usize) < start
+            diagnostic_line(buffer.text, diagnostic) < start
                 && diagnostic.severity == crate::lsp::DiagnosticSeverity::Warning
         })
         .count();
@@ -1451,7 +1441,7 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
         .diagnostics
         .iter()
         .filter(|diagnostic| {
-            diagnostic.line as usize >= end
+            diagnostic_line(buffer.text, diagnostic) >= end
                 && diagnostic.severity == crate::lsp::DiagnosticSeverity::Error
         })
         .count();
@@ -1459,7 +1449,7 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
         .diagnostics
         .iter()
         .filter(|diagnostic| {
-            diagnostic.line as usize >= end
+            diagnostic_line(buffer.text, diagnostic) >= end
                 && diagnostic.severity == crate::lsp::DiagnosticSeverity::Warning
         })
         .count();
@@ -1533,6 +1523,11 @@ fn truncate_virtual_diagnostic(message: &str, available: usize) -> String {
     let mut text = PREFIX.to_owned();
     text.extend(message.chars().take(available - PREFIX_WIDTH));
     text
+}
+
+/// The line a diagnostic starts on, derived from its (edit-tracked) char range.
+fn diagnostic_line(text: &ropey::Rope, diagnostic: &crate::document::ActiveDiagnostic) -> usize {
+    text.char_to_line(diagnostic.range.start.0.min(text.len_chars()))
 }
 
 fn diagnostic_color(severity: crate::lsp::DiagnosticSeverity) -> Color {
@@ -1672,7 +1667,7 @@ fn semantic_color(token_type: u32) -> Color {
         2 => Color::Rgb(0xa0, 0x93, 0xc7),
         3 => Color::Rgb(0xb4, 0xbe, 0x82),
         4 => Color::Rgb(0xe2, 0xa4, 0x78),
-        _ => MUTED,
+        _ => FG,
     }
 }
 
@@ -1878,16 +1873,18 @@ mod tests {
     }
 
     #[test]
+    fn semantic_color_fallback_stays_readable() {
+        assert_eq!(semantic_color(5), FG);
+    }
+
+    #[test]
     fn git_and_diagnostic_markers_use_separate_gutter_columns() {
         let backend = TestBackend::new(20, 4);
         let mut terminal = Terminal::new(backend).unwrap();
         let text = ropey::Rope::from_str("value");
         let view = crate::view::View::new(crate::document::DocumentId(0));
-        let diagnostics = vec![crate::lsp::Diagnostic {
-            line: 0,
-            character: 0,
-            end_line: 0,
-            end_character: 1,
+        let diagnostics = vec![crate::document::ActiveDiagnostic {
+            range: crate::position::CharIdx(0)..crate::position::CharIdx(1),
             severity: crate::lsp::DiagnosticSeverity::Error,
             message: "error".to_owned(),
         }];

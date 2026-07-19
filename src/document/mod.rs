@@ -3,7 +3,7 @@ mod hash;
 mod history;
 mod large_file;
 
-pub use editable::Editable;
+pub use editable::{ActiveDiagnostic, Editable};
 pub use hash::content_hash;
 pub use history::{Change, History, Revision};
 pub use large_file::LargeFile;

@@ -74,6 +74,9 @@ pub struct Editor {
     document_versions: HashMap<DocumentId, i32>,
     nav_back: Vec<(DocumentId, CharIdx)>,
     nav_forward: Vec<(DocumentId, CharIdx)>,
+    /// Caret positions to restore once a freshly opened document finishes loading,
+    /// used by jumps that open a file whose text is not in memory yet.
+    pending_caret_jumps: HashMap<DocumentId, lsp_types::Position>,
     pending_self_disk_updates: HashMap<DocumentId, usize>,
     terminal: Option<vt100::Parser>,
     terminal_selection: Option<TerminalSelection>,
@@ -129,6 +132,7 @@ impl Default for Editor {
             document_versions: HashMap::new(),
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
+            pending_caret_jumps: HashMap::new(),
             pending_self_disk_updates: HashMap::new(),
             terminal: None,
             terminal_selection: None,
@@ -493,6 +497,48 @@ impl Editor {
         effects
     }
 
+    /// Open a single file and place the caret at `position` once its text loads.
+    /// `open_paths` assigns the new document the id `next_doc_id` at call time, so
+    /// capturing it just before delegating gives us the id to key the pending jump.
+    fn open_path_at(&mut self, path: PathBuf, position: lsp_types::Position) -> Vec<Effect> {
+        let id = DocumentId(self.next_doc_id);
+        let effects = self.open_paths([path]);
+        self.pending_caret_jumps.insert(id, position);
+        effects
+    }
+
+    /// Move the caret to the position recorded by [`Self::open_path_at`] now that
+    /// the document `id` has loaded and can resolve the UTF-16 LSP column.
+    fn apply_pending_caret_jump(&mut self, id: DocumentId) {
+        let Some(position) = self.pending_caret_jumps.remove(&id) else {
+            return;
+        };
+        let Some(document) = self.documents.get(&id) else {
+            return;
+        };
+        let caret = document.editable_opt().map(|editable| {
+            crate::position::lsp_position_to_char_idx(
+                editable.text(),
+                position.line as usize,
+                position.character as usize,
+            )
+        });
+        for pane in self.layout.panes_mut() {
+            if pane.view.doc != id {
+                continue;
+            }
+            match caret {
+                Some(index) => pane.view.selections.set_single(Selection::caret(index)),
+                // Large files have no editable text to hold a caret; scroll the
+                // target line into view instead.
+                None => pane.view.scroll.top_line = position.line as usize,
+            }
+        }
+        if caret.is_some() {
+            self.ensure_cursor_visible();
+        }
+    }
+
     pub fn set_workspace_root(&mut self, root: PathBuf) {
         self.workspace_root = root;
     }
@@ -607,12 +653,35 @@ impl Editor {
             .take(500)
             .map(|hit| match hit {
                 SearchHit::Buffer { doc, range } => {
-                    format!(
-                        "{}  {}..{}",
-                        self.document_label(*doc),
-                        range.start,
-                        range.end
-                    )
+                    // Show the matched line's text instead of raw char offsets: a
+                    // "foo.rs  120..125" tells the reader nothing about the match.
+                    // The file path only earns its space when several buffers are
+                    // in scope; for a single-buffer search it is just noise.
+                    match self
+                        .documents
+                        .get(doc)
+                        .and_then(|document| document.editable_opt())
+                    {
+                        Some(editable) => {
+                            let (line, _) = crate::position::char_idx_to_line_col(
+                                editable.text(),
+                                CharIdx(range.start),
+                            );
+                            let line_text =
+                                editable.text().line(line).to_string().trim().to_owned();
+                            if search.scope == SearchScope::AllBuffers {
+                                format!("{}:{}  {}", self.document_label(*doc), line + 1, line_text)
+                            } else {
+                                format!("{}  {}", line + 1, line_text)
+                            }
+                        }
+                        None => format!(
+                            "{}  {}..{}",
+                            self.document_label(*doc),
+                            range.start,
+                            range.end
+                        ),
+                    }
                 }
                 SearchHit::Disk(hit) => {
                     format!(
@@ -771,6 +840,7 @@ impl Editor {
                             effects.push(Effect::ComputeGitStatus { doc: id, path });
                         }
                     }
+                    self.apply_pending_caret_jump(id);
                     effects.extend(self.start_or_open_lsp(id));
                 }
                 Err(error) => self.status = Some(error),
@@ -781,6 +851,7 @@ impl Editor {
                         document.load_large(large);
                         self.status = Some("大容量ファイルを読み取り専用で開きました".to_owned());
                     }
+                    self.apply_pending_caret_jump(id);
                 }
                 Err(error) => self.status = Some(error),
             },
@@ -984,11 +1055,7 @@ impl Editor {
                     }
                 }
             }
-            LspEvent::Diagnostics {
-                uri,
-                mut diagnostics,
-            } => {
-                diagnostics.sort_by_key(|diagnostic| diagnostic.severity);
+            LspEvent::Diagnostics { uri, diagnostics } => {
                 for document in self.documents.values_mut() {
                     let Some(path) = &document.path else { continue };
                     if uri == format!("file://{}", path.display())
@@ -997,7 +1064,7 @@ impl Editor {
                             crate::document::DocumentKind::Large(_) => None,
                         }
                     {
-                        editable.diagnostics = diagnostics;
+                        editable.set_diagnostics(diagnostics);
                         break;
                     }
                 }
@@ -1126,7 +1193,10 @@ impl Editor {
                             {
                                 let mut view = View::new(*doc);
                                 if let Some(editable) = document.editable_opt() {
-                                    let index = crate::position::line_col_to_char_idx(
+                                    // LSP columns are UTF-16 units, not char indices;
+                                    // using the plain converter drifts the caret on
+                                    // lines with non-ASCII text before the target.
+                                    let index = crate::position::lsp_position_to_char_idx(
                                         editable.text(),
                                         location.range.start.line as usize,
                                         location.range.start.character as usize,
@@ -1134,8 +1204,14 @@ impl Editor {
                                     view.selections.set_single(Selection::caret(index));
                                 }
                                 self.layout = Layout::EditorFull(EditorPane { view });
+                                // The new view starts scrolled to the top; follow the
+                                // caret so the definition is on screen, not line 1.
+                                self.ensure_cursor_visible();
                             } else {
-                                effects.extend(self.open_paths([path]));
+                                // The file is not open yet, so its text is not loaded.
+                                // Remember where to land and apply it once the read
+                                // completes, otherwise the caret sits at the top.
+                                effects.extend(self.open_path_at(path, location.range.start));
                             }
                         }
                     }
@@ -1179,10 +1255,11 @@ impl Editor {
                             .get(&doc)
                             .and_then(Document::editable_opt)
                             .and_then(|editable| {
-                                editable
-                                    .diagnostics
-                                    .iter()
-                                    .find(|diagnostic| diagnostic.line as usize == line)
+                                let text = editable.text();
+                                editable.diagnostics.iter().find(|diagnostic| {
+                                    let len = text.len_chars();
+                                    text.char_to_line(diagnostic.range.start.0.min(len)) == line
+                                })
                             })
                             .map(|diagnostic| diagnostic.message.clone())
                         {
@@ -2588,6 +2665,23 @@ impl Editor {
 
     fn insert_typed_character(&mut self, character: char, at: Option<Instant>) {
         match character {
+            ')' | ']' => self.edit_active(|document, view| {
+                if !document
+                    .editable_mut()
+                    .skip_closing_character(&mut view.selections, character)
+                {
+                    match at {
+                        Some(at) => document.editable_mut().insert_timed(
+                            &mut view.selections,
+                            &character.to_string(),
+                            at,
+                        ),
+                        None => document
+                            .editable_mut()
+                            .insert(&mut view.selections, &character.to_string()),
+                    }
+                }
+            }),
             '(' | '[' | '{' | '\'' | '"' | '`' => {
                 let closing = match character {
                     '(' => ')',
@@ -2596,18 +2690,28 @@ impl Editor {
                     quote => quote,
                 };
                 self.edit_active(|document, view| {
-                    document.editable_mut().insert_pair(
-                        &mut view.selections,
-                        character,
-                        closing,
-                        at,
-                    );
+                    if !document
+                        .editable_mut()
+                        .skip_closing_character(&mut view.selections, closing)
+                    {
+                        document.editable_mut().insert_pair(
+                            &mut view.selections,
+                            character,
+                            closing,
+                            at,
+                        );
+                    }
                 });
             }
             '}' => self.edit_active(|document, view| {
-                document
+                if !document
                     .editable_mut()
-                    .insert_closing_brace(&mut view.selections, at);
+                    .skip_closing_character(&mut view.selections, '}')
+                {
+                    document
+                        .editable_mut()
+                        .insert_closing_brace(&mut view.selections, at);
+                }
             }),
             _ => self.edit_active(|document, view| match at {
                 Some(at) => document.editable_mut().insert_timed(
@@ -3278,6 +3382,7 @@ impl Editor {
             return Vec::new();
         };
         self.record_jump_origin();
+        self.focus = Focus::Editor(Side::Left);
         let effects = match hit {
             SearchHit::Buffer { doc, range } => {
                 let mut view = View::new(doc);
@@ -3286,6 +3391,8 @@ impl Editor {
                     head: CharIdx(range.end),
                 });
                 self.layout = Layout::EditorFull(EditorPane { view });
+                // The fresh view is scrolled to the top; follow the match.
+                self.ensure_cursor_visible();
                 Vec::new()
             }
             SearchHit::Disk(hit) => {
@@ -3297,12 +3404,13 @@ impl Editor {
                     self.layout = Layout::EditorFull(EditorPane { view });
                     Vec::new()
                 } else {
-                    self.open_paths([hit.path])
+                    // Not open yet: land on the matched line once it loads instead
+                    // of opening at the top of the file.
+                    self.open_path_at(hit.path, lsp_types::Position::new(hit.line as u32, 0))
                 }
             }
         };
         self.search = None;
-        self.focus = Focus::Editor(Side::Left);
         self.dirty = true;
         effects
     }
@@ -4428,7 +4536,7 @@ pub struct ActiveBuffer<'a> {
     pub language: Option<&'a str>,
     pub tab_size: usize,
     pub language_status: String,
-    pub diagnostics: &'a [crate::lsp::Diagnostic],
+    pub diagnostics: &'a [crate::document::ActiveDiagnostic],
     pub git_lines: &'a [GitLine],
     pub git_branch: Option<&'a str>,
     pub git_status: Option<&'a str>,
@@ -5826,6 +5934,86 @@ mod tests {
     }
 
     #[test]
+    fn definition_jump_to_unopened_file_lands_on_utf16_position() {
+        let mut editor = Editor::default();
+        // Stand in for a pending textDocument/definition request.
+        editor.pending_lsp.insert(7, PendingLsp::Definition);
+
+        let path = std::path::PathBuf::from("/tmp/def_target.rs");
+        editor.update(AppEvent::Lsp(LspEvent::Response {
+            id: 7,
+            result: Ok(serde_json::json!({
+                "uri": format!("file://{}", path.display()),
+                "range": {
+                    "start": {"line": 0, "character": 7},
+                    "end": {"line": 0, "character": 7},
+                },
+            })),
+        }));
+
+        // The response opens the file asynchronously, so the caret can only be
+        // placed once the text arrives. An emoji before the target column makes
+        // the UTF-16 column diverge from the char index (char 6, not 7).
+        let id = DocumentId(editor.next_doc_id - 1);
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id,
+            result: Ok("let 😀 = value;".to_owned()),
+        }));
+
+        let caret = editor
+            .layout
+            .active_editor(editor.focus)
+            .unwrap()
+            .view
+            .selections
+            .primary()
+            .head;
+        assert_eq!(caret, CharIdx(6));
+        assert!(editor.pending_caret_jumps.is_empty());
+    }
+
+    #[test]
+    fn definition_jump_scrolls_the_target_line_into_view() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 10 });
+        editor.pending_lsp.insert(7, PendingLsp::Definition);
+
+        let path = std::path::PathBuf::from("/tmp/far_target.rs");
+        editor.update(AppEvent::Lsp(LspEvent::Response {
+            id: 7,
+            result: Ok(serde_json::json!({
+                "uri": format!("file://{}", path.display()),
+                "range": {
+                    "start": {"line": 30, "character": 0},
+                    "end": {"line": 30, "character": 0},
+                },
+            })),
+        }));
+
+        let id = DocumentId(editor.next_doc_id - 1);
+        let body = (0..40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id,
+            result: Ok(body),
+        }));
+
+        // The definition sits on line 30, far below a 10-row viewport, so the
+        // view must scroll instead of leaving line 1 on screen.
+        let scroll = editor
+            .layout
+            .active_editor(editor.focus)
+            .unwrap()
+            .view
+            .scroll
+            .top_line;
+        assert!(scroll > 0, "expected the view to scroll, got {scroll}");
+        assert!(scroll <= 30);
+    }
+
+    #[test]
     fn double_and_triple_click_select_word_and_line() {
         let mut editor = Editor::default();
         editor.update(AppEvent::TextPaste("one two\nnext".to_owned()));
@@ -6918,8 +7106,8 @@ mod tests {
 
         editor.update(Command::DeleteBackward.into());
         let buffer = editor.active_buffer().unwrap();
-        assert_eq!(buffer.text.to_string(), "ab");
-        assert_eq!(buffer.view.selections.primary().head, CharIdx(1));
+        assert_eq!(buffer.text.to_string(), "a  b");
+        assert_eq!(buffer.view.selections.primary().head, CharIdx(3));
     }
 
     #[test]
@@ -6950,6 +7138,23 @@ mod tests {
                 .head,
             CharIdx(1)
         );
+        editor.update(Command::DeleteBackward.into());
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "");
+
+        editor.update(AppEvent::TextInput('{'));
+        editor.update(AppEvent::TextInput('}'));
+        assert_eq!(editor.active_buffer().unwrap().text.to_string(), "{}");
+        assert_eq!(
+            editor
+                .active_buffer()
+                .unwrap()
+                .view
+                .selections
+                .primary()
+                .head,
+            CharIdx(2)
+        );
+        editor.update(Command::DeleteBackward.into());
         editor.update(Command::DeleteBackward.into());
         assert_eq!(editor.active_buffer().unwrap().text.to_string(), "");
 

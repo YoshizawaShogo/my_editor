@@ -5,9 +5,20 @@ use std::time::Instant;
 
 use crate::{
     document::{Change, History, LineEnding, Revision, content_hash},
-    position::{CharIdx, char_idx_to_line_col},
+    position::{CharIdx, char_idx_to_display_pos, char_idx_to_line_col},
     view::{Selection, Selections},
 };
+
+/// A diagnostic resolved to char-index range against the buffer text. Storing the
+/// range (rather than the LSP line/column) lets edits shift diagnostics in lockstep
+/// with the text, so their underline/color stays on the right characters until the
+/// server republishes — the same treatment [`Editable::semantic_spans`] gets.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveDiagnostic {
+    pub range: std::ops::Range<CharIdx>,
+    pub severity: crate::lsp::DiagnosticSeverity,
+    pub message: String,
+}
 
 #[derive(Debug)]
 pub struct Editable {
@@ -16,7 +27,7 @@ pub struct Editable {
     pub modified: bool,
     saved_hash: u64,
     history: History,
-    pub diagnostics: Vec<crate::lsp::Diagnostic>,
+    pub diagnostics: Vec<ActiveDiagnostic>,
     pub git_lines: Vec<crate::editor::GitLine>,
     pub semantic_spans: Vec<crate::lsp::SemanticSpan>,
     pub syntax: Option<crate::highlight::IncrementalHighlighter>,
@@ -108,6 +119,24 @@ impl Editable {
             None,
             Some(cursor_backs),
         );
+    }
+
+    pub fn skip_closing_character(&self, selections: &mut Selections, closing: char) -> bool {
+        let targets: Vec<_> = selections.iter().copied().collect();
+        if targets.iter().any(|selection| {
+            !selection.is_caret()
+                || selection.head.0 >= self.text.len_chars()
+                || self.text.char(selection.head.0) != closing
+        }) {
+            return false;
+        }
+        let primary = selections.primary_index();
+        let moved = targets
+            .into_iter()
+            .map(|selection| Selection::caret(CharIdx(selection.head.0 + 1)))
+            .collect();
+        *selections = Selections::from_vec(moved, primary);
+        true
     }
 
     pub fn insert_fragments(&mut self, selections: &mut Selections, fragments: &[String]) {
@@ -280,7 +309,7 @@ impl Editable {
                 );
             }
             self.record_lsp_change(change.range.start.0..change.range.end.0, &change.inserted);
-            self.update_semantic_spans(
+            self.shift_annotations(
                 change.range.start.0..change.range.end.0,
                 change.inserted.chars().count(),
             );
@@ -327,15 +356,21 @@ impl Editable {
                         head: CharIdx(head + 1),
                     };
                 }
-                let delete = if insert_spaces
-                    && head >= tab_size.max(1)
-                    && self
-                        .text
-                        .slice(head - tab_size.max(1)..head)
-                        .chars()
-                        .all(|character| character == ' ')
-                {
-                    tab_size.max(1)
+                let delete = if insert_spaces && self.text.char(head - 1) == ' ' {
+                    let width = tab_size.max(1);
+                    let column = char_idx_to_display_pos(&self.text, CharIdx(head), width).col;
+                    let to_boundary = match column % width {
+                        0 => width,
+                        remainder => remainder,
+                    };
+                    let line_start = self.text.line_to_char(self.text.char_to_line(head));
+                    let mut spaces_before = 0;
+                    let mut cursor = head;
+                    while cursor > line_start && self.text.char(cursor - 1) == ' ' {
+                        spaces_before += 1;
+                        cursor -= 1;
+                    }
+                    spaces_before.min(to_boundary).max(1)
                 } else {
                     1
                 };
@@ -479,7 +514,7 @@ impl Editable {
             let start = change.range.start.0;
             let end = start + change.inserted.chars().count();
             self.record_lsp_change(start..end, &change.removed);
-            self.update_semantic_spans(start..end, change.removed.chars().count());
+            self.shift_annotations(start..end, change.removed.chars().count());
             self.text.remove(start..end);
             self.text.insert(start, &change.removed);
         }
@@ -498,7 +533,7 @@ impl Editable {
         };
         for change in &revision.changes {
             self.record_lsp_change(change.range.start.0..change.range.end.0, &change.inserted);
-            self.update_semantic_spans(
+            self.shift_annotations(
                 change.range.start.0..change.range.end.0,
                 change.inserted.chars().count(),
             );
@@ -579,7 +614,7 @@ impl Editable {
                 );
             }
             self.record_lsp_change(change.range.start.0..change.range.end.0, &change.inserted);
-            self.update_semantic_spans(
+            self.shift_annotations(
                 change.range.start.0..change.range.end.0,
                 change.inserted.chars().count(),
             );
@@ -605,6 +640,76 @@ impl Editable {
     fn apply_change(&mut self, change: &Change) {
         self.text.remove(change.range.start.0..change.range.end.0);
         self.text.insert(change.range.start.0, &change.inserted);
+    }
+
+    /// Resolve incoming LSP diagnostics to char-index ranges against the current
+    /// text and store them highest-severity first (so overlapping ranges pick the
+    /// most severe color at render time).
+    pub fn set_diagnostics(&mut self, mut diagnostics: Vec<crate::lsp::Diagnostic>) {
+        diagnostics.sort_by_key(|diagnostic| diagnostic.severity);
+        let len = self.text.len_chars();
+        self.diagnostics = diagnostics
+            .into_iter()
+            .map(|diagnostic| {
+                let start = crate::position::lsp_position_to_char_idx(
+                    &self.text,
+                    diagnostic.line as usize,
+                    diagnostic.character as usize,
+                );
+                let mut end = crate::position::lsp_position_to_char_idx(
+                    &self.text,
+                    diagnostic.end_line as usize,
+                    diagnostic.end_character as usize,
+                );
+                if end.0 <= start.0 {
+                    // Zero-width diagnostics still need a cell to underline.
+                    end = CharIdx((start.0 + 1).min(len));
+                }
+                ActiveDiagnostic {
+                    range: start..end,
+                    severity: diagnostic.severity,
+                    message: diagnostic.message,
+                }
+            })
+            .collect();
+    }
+
+    /// Keep resolved diagnostics aligned with an edit, mirroring the semantic-span
+    /// shift: ranges before the edit stay put, ranges after it move by the delta,
+    /// and ranges straddling the edit are dropped until the server republishes.
+    fn update_diagnostics(&mut self, replaced: std::ops::Range<usize>, inserted_len: usize) {
+        let removed_len = replaced.len();
+        self.diagnostics.retain_mut(|diagnostic| {
+            let range = &mut diagnostic.range;
+            if removed_len == 0 {
+                if range.end.0 <= replaced.start {
+                    return true;
+                }
+                if range.start.0 >= replaced.start {
+                    range.start.0 += inserted_len;
+                    range.end.0 += inserted_len;
+                } else {
+                    range.end.0 += inserted_len;
+                }
+                return true;
+            }
+            if range.end.0 <= replaced.start {
+                return true;
+            }
+            if range.start.0 >= replaced.end {
+                range.start.0 = shift_index(range.start.0, inserted_len, removed_len);
+                range.end.0 = shift_index(range.end.0, inserted_len, removed_len);
+                return true;
+            }
+            false
+        });
+    }
+
+    /// Shift both semantic spans and diagnostics for a single edit so their colors
+    /// track the text.
+    fn shift_annotations(&mut self, replaced: std::ops::Range<usize>, inserted_len: usize) {
+        self.update_semantic_spans(replaced.clone(), inserted_len);
+        self.update_diagnostics(replaced, inserted_len);
     }
 
     fn update_semantic_spans(&mut self, replaced: std::ops::Range<usize>, inserted_len: usize) {
@@ -857,6 +962,64 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_shift_with_edits_so_colors_stay_aligned() {
+        let mut editable = Editable::new("foo bar");
+        editable.set_diagnostics(vec![crate::lsp::Diagnostic {
+            line: 0,
+            character: 4,
+            end_line: 0,
+            end_character: 7,
+            severity: crate::lsp::DiagnosticSeverity::Error,
+            message: "bad".to_owned(),
+        }]);
+        assert_eq!(editable.diagnostics[0].range, CharIdx(4)..CharIdx(7));
+
+        // Insert before the diagnostic: it must move so the underline follows the
+        // same word rather than staying on the now-shifted characters.
+        let mut selections = Selections::single(Selection::caret(CharIdx(0)));
+        editable.insert(&mut selections, "xx");
+        assert_eq!(editable.diagnostics[0].range, CharIdx(6)..CharIdx(9));
+
+        // Editing over the diagnostic drops it until the server republishes.
+        let mut selections = Selections::single(Selection {
+            anchor: CharIdx(6),
+            head: CharIdx(9),
+        });
+        editable.insert(&mut selections, "z");
+        assert!(editable.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn set_diagnostics_orders_most_severe_first() {
+        let mut editable = Editable::new("value");
+        editable.set_diagnostics(vec![
+            crate::lsp::Diagnostic {
+                line: 0,
+                character: 0,
+                end_line: 0,
+                end_character: 1,
+                severity: crate::lsp::DiagnosticSeverity::Hint,
+                message: "hint".to_owned(),
+            },
+            crate::lsp::Diagnostic {
+                line: 0,
+                character: 0,
+                end_line: 0,
+                end_character: 1,
+                severity: crate::lsp::DiagnosticSeverity::Error,
+                message: "error".to_owned(),
+            },
+        ]);
+
+        // Overlapping diagnostics render highest-severity-first, so the error must
+        // sort ahead of the hint and win the color.
+        assert_eq!(
+            editable.diagnostics[0].severity,
+            crate::lsp::DiagnosticSeverity::Error
+        );
+    }
+
+    #[test]
     fn multi_cursor_edit_offsets_and_undo_are_correct() {
         let mut editable = Editable::new("abcd");
         let mut selections = Selections::from_vec(
@@ -942,14 +1105,25 @@ mod tests {
     }
 
     #[test]
-    fn soft_tab_backspace_removes_one_configured_indent_unit() {
+    fn soft_tab_backspace_stops_at_previous_indent_boundary() {
         let mut editable = Editable::new("a    b");
         let mut selections = Selections::single(Selection::caret(CharIdx(5)));
 
         editable.delete_backward_smart(&mut selections, 4, true);
 
-        assert_eq!(editable.text().to_string(), "ab");
-        assert_eq!(selections.primary().head, CharIdx(1));
+        assert_eq!(editable.text().to_string(), "a   b");
+        assert_eq!(selections.primary().head, CharIdx(4));
+    }
+
+    #[test]
+    fn soft_tab_backspace_removes_spaces_until_column_is_multiple_of_tab_size() {
+        let mut editable = Editable::new("      value");
+        let mut selections = Selections::single(Selection::caret(CharIdx(6)));
+
+        editable.delete_backward_smart(&mut selections, 4, true);
+
+        assert_eq!(editable.text().to_string(), "    value");
+        assert_eq!(selections.primary().head, CharIdx(4));
     }
 
     #[test]
