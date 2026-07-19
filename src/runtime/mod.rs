@@ -1073,9 +1073,20 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 fn find_workspace_root() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    cwd.ancestors()
-        .find(|directory| directory.join(".git").exists())
-        .map_or(cwd.clone(), Path::to_path_buf)
+    // このルートはそのままLSPのrootUriになる。gitルートの直下にマニフェストが
+    // あるとは限らず(1リポジトリに複数クレートを置く構成など)、浅すぎるルートを
+    // 渡すとrust-analyzerがプロジェクトを発見できずhover等が機能しないため、
+    // 最寄りのプロジェクトマーカーを.gitより優先する。
+    let markers = ["Cargo.toml", "pyproject.toml", "compile_commands.json"];
+    let root = cwd
+        .ancestors()
+        .find(|directory| markers.iter().any(|marker| directory.join(marker).exists()))
+        .or_else(|| {
+            cwd.ancestors()
+                .find(|directory| directory.join(".git").exists())
+        })
+        .map(Path::to_path_buf);
+    root.unwrap_or(cwd)
 }
 
 fn compute_git_info(path: &Path) -> std::result::Result<GitInfo, String> {

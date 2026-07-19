@@ -214,4 +214,48 @@ mod tests {
                 >= 2
         );
     }
+
+    #[test]
+    fn rust_comment_newline_incremental_highlight_matches_full_reparse() {
+        let source = "// comment\nfn solve() {}\n";
+        let mut text = Rope::from_str(source);
+        let mut highlighter = IncrementalHighlighter::new("rust", source).unwrap();
+        let insertion = "// comment".chars().count();
+
+        highlighter.edit(&text, insertion..insertion, "\n// ");
+        text.insert(insertion, "\n// ");
+        let edited = text.to_string();
+        highlighter.reparse(&edited, true);
+
+        assert_eq!(highlighter.spans(), highlight("rust", &edited).as_slice());
+    }
+
+    #[test]
+    fn repeated_rust_comment_newlines_do_not_leak_comment_highlight_to_code() {
+        let source = "//\nfn solve(s: &mut String) {\n    s.push(\"d\");\n}\n";
+        let mut text = Rope::from_str(source);
+        let mut highlighter = IncrementalHighlighter::new("rust", source).unwrap();
+
+        for _ in 0..8 {
+            let insertion = text.line_to_char(0) + 2;
+            highlighter.edit(&text, insertion..insertion, "\n// ");
+            text.insert(insertion, "\n// ");
+            highlighter.reparse(&text.to_string(), true);
+        }
+
+        let edited = text.to_string();
+        let spans = highlighter.spans();
+        assert_eq!(spans, highlight("rust", &edited).as_slice());
+        let solve_start = edited.find("solve").unwrap();
+        let solve_span = spans
+            .iter()
+            .rev()
+            .find(|span| span.start_byte <= solve_start && solve_start < span.end_byte)
+            .unwrap();
+        assert!(
+            !solve_span.kind.contains("comment"),
+            "solve highlighted as {:?}",
+            solve_span
+        );
+    }
 }

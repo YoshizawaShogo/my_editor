@@ -59,6 +59,13 @@ impl Document {
         }
     }
 
+    pub fn editable_opt_mut(&mut self) -> Option<&mut Editable> {
+        match &mut self.kind {
+            DocumentKind::Editable(editable) => Some(editable),
+            DocumentKind::Large(_) => None,
+        }
+    }
+
     pub fn large(&self) -> Option<&LargeFile> {
         match &self.kind {
             DocumentKind::Editable(_) => None,

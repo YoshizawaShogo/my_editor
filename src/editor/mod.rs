@@ -59,7 +59,6 @@ pub struct Editor {
     lsp_opened_documents: HashSet<DocumentId>,
     semantic_ready_versions: HashMap<DocumentId, i32>,
     hover_ready_documents: HashSet<DocumentId>,
-    hover_probe_successes: HashMap<DocumentId, usize>,
     hover_probe_attempts: HashMap<DocumentId, usize>,
     lsp_restart_counts: HashMap<u64, u8>,
     next_server_id: u64,
@@ -118,7 +117,6 @@ impl Default for Editor {
             lsp_opened_documents: HashSet::new(),
             semantic_ready_versions: HashMap::new(),
             hover_ready_documents: HashSet::new(),
-            hover_probe_successes: HashMap::new(),
             hover_probe_attempts: HashMap::new(),
             lsp_restart_counts: HashMap::new(),
             next_server_id: 1,
@@ -477,15 +475,25 @@ impl Editor {
         }
         let mut effects = Vec::new();
         for path in paths {
-            let id = DocumentId(self.next_doc_id);
-            self.next_doc_id += 1;
-            let mut document = Document::scratch();
-            document.path = Some(path.clone());
-            document.language = self
-                .config
-                .language_for_path(&path)
-                .map(|language| language.name.clone());
-            self.documents.insert(id, document);
+            // 既に開いているファイルはそのバッファへ切り替える。複製すると同じ
+            // URIを指す文書が増え、古い方を編集したときにLSPサーバーのテキスト
+            // と食い違ってハイライトや診断がズレる。
+            let existing = self
+                .documents
+                .iter()
+                .find_map(|(id, document)| (document.path.as_ref() == Some(&path)).then_some(*id));
+            let id = existing.unwrap_or_else(|| {
+                let id = DocumentId(self.next_doc_id);
+                self.next_doc_id += 1;
+                let mut document = Document::scratch();
+                document.path = Some(path.clone());
+                document.language = self
+                    .config
+                    .language_for_path(&path)
+                    .map(|language| language.name.clone());
+                self.documents.insert(id, document);
+                id
+            });
             if matches!(self.layout, Layout::EditorAndEditor { diff: true, .. }) {
                 self.layout = Layout::EditorFull(EditorPane {
                     view: View::new(id),
@@ -494,18 +502,38 @@ impl Editor {
             } else if let Some(pane) = self.layout.active_editor_mut(self.focus) {
                 pane.view = View::new(id);
             }
-            effects.push(Effect::ReadFile { id, path });
+            let unsaved_edits = existing.is_some_and(|id| {
+                self.documents
+                    .get(&id)
+                    .and_then(crate::document::Document::editable_opt)
+                    .is_some_and(|editable| editable.modified)
+            });
+            if !unsaved_edits {
+                effects.push(Effect::ReadFile { id, path });
+            }
         }
         effects
     }
 
     /// Open a single file and place the caret at `position` once its text loads.
-    /// `open_paths` assigns the new document the id `next_doc_id` at call time, so
-    /// capturing it just before delegating gives us the id to key the pending jump.
     fn open_path_at(&mut self, path: PathBuf, position: lsp_types::Position) -> Vec<Effect> {
-        let id = DocumentId(self.next_doc_id);
-        let effects = self.open_paths([path]);
+        let effects = self.open_paths([path.clone()]);
+        let Some(id) = self
+            .documents
+            .iter()
+            .find_map(|(id, document)| (document.path.as_ref() == Some(&path)).then_some(*id))
+        else {
+            return effects;
+        };
         self.pending_caret_jumps.insert(id, position);
+        // 再読込が走らないケース(未保存編集のある既存バッファ)は FileLoaded が
+        // 来ないので、その場でジャンプを適用する。
+        if !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReadFile { id: read_id, .. } if *read_id == id))
+        {
+            self.apply_pending_caret_jump(id);
+        }
         effects
     }
 
@@ -836,6 +864,14 @@ impl Editor {
                         document.external_changed = false;
                         if let Some(language) = document.language.clone() {
                             document.editable_mut().enable_highlight(&language);
+                        }
+                        // 再読込はエディタ内の編集を経由しないため、LSPサーバーが
+                        // 開いている文書なら全文を送り直してテキストを揃える。
+                        // これを怠ると以後の差分didChangeが古いテキストに適用され、
+                        // セマンティックトークンが恒久的にズレる。
+                        if self.lsp_opened_documents.contains(&id) {
+                            document.editable_mut().record_full_lsp_sync();
+                            self.pending_lsp_sync.insert(id);
                         }
                         self.status = None;
                         if let Some(path) = document.path.clone() {
@@ -1282,12 +1318,12 @@ impl Editor {
                         serde_json::from_value::<Option<lsp_types::Hover>>(value)
                             .map_err(|error| error.to_string())
                     }) {
+                        // 一度でも hover が返ればサーバーは応答可能。全候補を
+                        // 巡回してから ready にすると往復×候補数ぶん待たされる。
                         Ok(Some(_)) => {
-                            let successes = self.hover_probe_successes.entry(doc).or_default();
-                            *successes += 1;
-                            let attempts = self.hover_probe_attempts.entry(doc).or_default();
-                            *attempts += 1;
-                            effects.push(Effect::ScheduleHoverProbe { doc, delay_ms: 50 });
+                            self.hover_probe_attempts.remove(&doc);
+                            self.hover_ready_documents.insert(doc);
+                            self.dirty = true;
                         }
                         Ok(None) => {
                             let attempts = self.hover_probe_attempts.entry(doc).or_default();
@@ -1337,11 +1373,6 @@ impl Editor {
                             .is_none_or(|document| document.language.as_deref() != Some(&language))
                     });
                     self.hover_ready_documents.retain(|doc| {
-                        self.documents
-                            .get(doc)
-                            .is_none_or(|document| document.language.as_deref() != Some(&language))
-                    });
-                    self.hover_probe_successes.retain(|doc, _| {
                         self.documents
                             .get(doc)
                             .is_none_or(|document| document.language.as_deref() != Some(&language))
@@ -1986,11 +2017,10 @@ impl Editor {
             return Vec::new();
         }
         let Some((line, character)) = candidate else {
-            if self.hover_probe_successes.get(&doc).copied().unwrap_or(0) > 0 {
-                self.hover_ready_documents.insert(doc);
-                self.dirty = true;
-            }
-            return Vec::new();
+            // 候補を使い切っても hover が一度も返らなかった。サーバーの準備が
+            // 遅れているだけの可能性が高いので、間を置いて最初からやり直す。
+            self.hover_probe_attempts.remove(&doc);
+            return vec![Effect::ScheduleHoverProbe { doc, delay_ms: 500 }];
         };
         let request = self.next_lsp_request;
         self.next_lsp_request += 1;
@@ -2009,7 +2039,24 @@ impl Editor {
     }
 
     fn request_semantic_tokens(&mut self, doc: DocumentId, version: i32) -> Vec<Effect> {
-        if self.pending_lsp.values().any(|pending| {
+        self.request_semantic_tokens_inner(doc, version, false)
+    }
+
+    fn request_semantic_tokens_force(&mut self, doc: DocumentId, version: i32) -> Vec<Effect> {
+        self.request_semantic_tokens_inner(doc, version, true)
+    }
+
+    fn request_semantic_tokens_inner(
+        &mut self,
+        doc: DocumentId,
+        version: i32,
+        force: bool,
+    ) -> Vec<Effect> {
+        if force {
+            self.pending_lsp.retain(|_, pending| {
+                !matches!(pending, PendingLsp::SemanticTokens { doc: pending_doc, .. } if *pending_doc == doc)
+            });
+        } else if self.pending_lsp.values().any(|pending| {
             matches!(
                 pending,
                 PendingLsp::SemanticTokens {
@@ -2575,7 +2622,6 @@ impl Editor {
         self.lsp_opened_documents.remove(&id);
         self.semantic_ready_versions.remove(&id);
         self.hover_ready_documents.remove(&id);
-        self.hover_probe_successes.remove(&id);
         self.hover_probe_attempts.remove(&id);
         if self.deferred_hover.is_some_and(|(doc, _)| doc == id) {
             self.deferred_hover = None;
@@ -2789,25 +2835,53 @@ impl Editor {
         let Some(pane) = self.layout.active_editor(self.focus) else {
             return Vec::new();
         };
-        let Some(document) = self.documents.get(&pane.view.doc) else {
+        let doc = pane.view.doc;
+        let Some((path, contents, expected, language)) =
+            self.documents.get(&doc).and_then(|document| {
+                let path = match document.path.clone() {
+                    Some(path) => path,
+                    None => {
+                        self.status = Some("無名バッファは保存できません".to_owned());
+                        self.dirty = true;
+                        return None;
+                    }
+                };
+                let Some(editable) = document.editable_opt() else {
+                    self.status = Some("大容量ファイルは読み取り専用です".to_owned());
+                    self.dirty = true;
+                    return None;
+                };
+                Some((
+                    path,
+                    editable.contents_for_save(),
+                    document.disk_state,
+                    document.language.clone(),
+                ))
+            })
+        else {
             return Vec::new();
         };
-        let Some(path) = document.path.clone() else {
-            self.status = Some("無名バッファは保存できません".to_owned());
+        let version = self
+            .document_versions
+            .get(&doc)
+            .copied()
+            .unwrap_or_default();
+        let mut effects = Vec::new();
+        if let Some(language) = language
+            && let Some(document) = self.documents.get_mut(&doc)
+            && let Some(editable) = document.editable_opt_mut()
+        {
+            editable.refresh_highlight(&language);
             self.dirty = true;
-            return Vec::new();
-        };
-        let Some(editable) = document.editable_opt() else {
-            self.status = Some("大容量ファイルは読み取り専用です".to_owned());
-            self.dirty = true;
-            return Vec::new();
-        };
-        vec![Effect::WriteFile {
-            doc: pane.view.doc,
+        }
+        effects.extend(self.request_semantic_tokens_force(doc, version));
+        effects.push(Effect::WriteFile {
+            doc,
             path,
-            contents: editable.contents_for_save(),
-            expected: document.disk_state,
-        }]
+            contents,
+            expected,
+        });
+        effects
     }
 
     fn select_all(&mut self) {
@@ -3515,6 +3589,7 @@ impl Editor {
             document
                 .editable_mut()
                 .insert_fragments(&mut selections, &fragments);
+            self.pending_lsp_sync.insert(id);
         }
         self.status = Some("置換を適用しました".to_owned());
         self.focus = Focus::Editor(Side::Left);
@@ -6598,6 +6673,69 @@ mod tests {
     }
 
     #[test]
+    fn save_refreshes_current_buffer_highlighting_and_semantic_tokens() {
+        let mut editor = Editor::default();
+        let path = PathBuf::from("/tmp/save-test.rs");
+        editor.open_paths([path.clone()]);
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok("fn main() {}\n".to_owned()),
+        }));
+        editor.lsp_servers.insert("rust".to_owned(), 7);
+        editor.lsp_ready.insert(7);
+        editor.lsp_opened_documents.insert(DocumentId(1));
+        editor.document_versions.insert(DocumentId(1), 3);
+        editor.pending_lsp.insert(
+            99,
+            PendingLsp::SemanticTokens {
+                doc: DocumentId(1),
+                version: 3,
+            },
+        );
+        let document = editor.documents.get_mut(&DocumentId(1)).unwrap();
+        let editable = document.editable_mut();
+        editable.semantic_spans = vec![crate::lsp::SemanticSpan {
+            start: CharIdx(0),
+            end: CharIdx(2),
+            token_kind: "comment".to_owned(),
+            token_modifiers: Vec::new(),
+        }];
+        editable.syntax = crate::highlight::IncrementalHighlighter::new("rust", "// stale\n");
+
+        let effects = editor.update(Command::Save.into());
+
+        // 保存で構文ハイライトは全体再パースされる。セマンティックスパンは
+        // 次の応答が届くまで既存の色を保つ(消すとフラットな色に落ちて見える)。
+        assert!(!editor.active_buffer().unwrap().semantic_spans.is_empty());
+        assert_eq!(
+            editor.active_buffer().unwrap().syntax_spans,
+            crate::highlight::highlight("rust", "fn main() {}\n").as_slice()
+        );
+        assert!(!editor.pending_lsp.contains_key(&99));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::LspRequest {
+                    server: 7,
+                    method,
+                    ..
+                } if method == "textDocument/semanticTokens/full"
+            )
+        }));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::WriteFile {
+                    doc: DocumentId(1),
+                    path: written_path,
+                    contents,
+                    ..
+                } if written_path == &path && contents == "fn main() {}\n"
+            )
+        }));
+    }
+
+    #[test]
     fn buffer_search_and_replace_use_overlay_state() {
         let mut editor = Editor::default();
         editor.update(AppEvent::TextPaste("one two one".to_owned()));
@@ -6768,6 +6906,90 @@ mod tests {
     }
 
     #[test]
+    fn reopening_an_open_file_reuses_the_existing_document() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("/tmp/dup.rs")]);
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok("fn main() {}\n".to_owned()),
+        }));
+        editor.update(AppEvent::TextInput('x'));
+        assert!(editor.active_buffer().unwrap().modified);
+
+        let effects = editor.open_paths([PathBuf::from("/tmp/dup.rs")]);
+
+        // 複製バッファを作らず、未保存編集をディスク内容で潰さない。
+        assert_eq!(editor.documents.len(), 1);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ReadFile { .. }))
+        );
+        assert_eq!(
+            editor
+                .layout
+                .active_editor(editor.focus)
+                .map(|pane| pane.view.doc),
+            Some(DocumentId(1))
+        );
+
+        // 保存済みならディスクから同じ文書IDへ再読込する。
+        editor
+            .documents
+            .get_mut(&DocumentId(1))
+            .unwrap()
+            .editable_mut()
+            .mark_saved();
+        let effects = editor.open_paths([PathBuf::from("/tmp/dup.rs")]);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ReadFile {
+                id: DocumentId(1),
+                ..
+            }
+        )));
+        assert_eq!(editor.documents.len(), 1);
+    }
+
+    #[test]
+    fn external_reload_resyncs_full_text_to_lsp_server() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("/tmp/reload.rs")]);
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok("fn before() {}\n".to_owned()),
+        }));
+        editor.update(AppEvent::Lsp(LspEvent::Initialized {
+            server: 1,
+            incremental_sync: true,
+            hover_provider: true,
+            semantic_tokens_legend: None,
+        }));
+        assert!(editor.lsp_opened_documents.contains(&DocumentId(1)));
+        let version_before = editor.document_versions[&DocumentId(1)];
+
+        // 外部ツールがディスク上のファイルを書き換えた後の自動再読込。
+        let effects = editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok("// external\nfn after() {}\n".to_owned()),
+        }));
+
+        let did_change = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::LspSend { server: 1, message }
+                    if message.contains("textDocument/didChange") =>
+                {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .expect("再読込後は全文didChangeでサーバーと同期し直す");
+        assert!(did_change.contains("fn after() {}"));
+        assert_eq!(editor.document_versions[&DocumentId(1)], version_before + 1);
+    }
+
+    #[test]
     fn loading_config_starts_workspace_lsp_before_a_language_file_is_opened() {
         let mut editor = Editor::default();
         editor.set_workspace_root(PathBuf::from("/workspace"));
@@ -6847,45 +7069,13 @@ mod tests {
             editor.active_buffer().unwrap().language_status,
             "<lsp> rust: checking hover"
         );
-        let mut probe_effects = editor.update(AppEvent::Lsp(LspEvent::Response {
+        // hover が一度返った時点で ready(候補を巡回し続けて待たせない)。
+        editor.update(AppEvent::Lsp(LspEvent::Response {
             id: hover_probe,
             result: Ok(serde_json::json!({
                 "contents": {"kind": "markdown", "value": "fn main()"}
             })),
         }));
-        assert_eq!(
-            editor.active_buffer().unwrap().language_status,
-            "<lsp> rust: checking hover"
-        );
-        for _ in 0..20 {
-            if editor.active_buffer().unwrap().language_status == "<lsp> rust: ready" {
-                break;
-            }
-            assert!(probe_effects.iter().any(|effect| matches!(
-                effect,
-                Effect::ScheduleHoverProbe {
-                    doc: DocumentId(1),
-                    ..
-                }
-            )));
-            let request_effects = editor.update(AppEvent::Lsp(LspEvent::HoverProbeDue {
-                doc: DocumentId(1),
-            }));
-            let Some(request) = request_effects.iter().find_map(|effect| match effect {
-                Effect::LspRequest { id, method, .. } if method == "textDocument/hover" => {
-                    Some(*id)
-                }
-                _ => None,
-            }) else {
-                continue;
-            };
-            probe_effects = editor.update(AppEvent::Lsp(LspEvent::Response {
-                id: request,
-                result: Ok(serde_json::json!({
-                    "contents": {"kind": "markdown", "value": "hover"}
-                })),
-            }));
-        }
         assert_eq!(
             editor.active_buffer().unwrap().language_status,
             "<lsp> rust: ready"

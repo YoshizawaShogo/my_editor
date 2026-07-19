@@ -79,8 +79,27 @@ impl Editable {
             crate::highlight::IncrementalHighlighter::new(language, &self.text.to_string());
     }
 
+    pub fn refresh_highlight(&mut self, language: &str) {
+        let text = self.text.to_string();
+        if let Some(syntax) = &mut self.syntax {
+            syntax.reparse(&text, false);
+        } else {
+            self.syntax = crate::highlight::IncrementalHighlighter::new(language, &text);
+        }
+    }
+
     pub fn take_lsp_changes(&mut self) -> Vec<lsp_types::TextDocumentContentChangeEvent> {
         std::mem::take(&mut self.pending_lsp_changes)
+    }
+
+    /// 再読込などでテキストを丸ごと差し替えた後に呼ぶ。差分イベントでは表現できない
+    /// 置き換えなので、全文イベント1件でLSPサーバー側テキストを揃え直す。
+    pub fn record_full_lsp_sync(&mut self) {
+        self.pending_lsp_changes = vec![lsp_types::TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: self.text.to_string(),
+        }];
     }
 
     pub fn insert(&mut self, selections: &mut Selections, inserted: &str) {
