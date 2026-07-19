@@ -15,6 +15,16 @@ use crate::{
 const BG: Color = Color::Rgb(0x16, 0x18, 0x21);
 const FG: Color = Color::Rgb(0xc6, 0xc8, 0xd1);
 const MUTED: Color = Color::Rgb(0x6b, 0x70, 0x89);
+
+// Syntax palette, shared by LSP semantic tokens ([`semantic_color`]) and the
+// tree-sitter fallback ([`highlight_color`]). Both map the same token category
+// to the same colour so a token never flickers when the LSP result arrives to
+// replace (or is replaced by) the tree-sitter guess.
+const CODE_KEYWORD: Color = Color::Rgb(0xe2, 0xa4, 0x78);
+const CODE_FUNCTION: Color = Color::Rgb(0x84, 0xa0, 0xc6);
+const CODE_TYPE: Color = Color::Rgb(0x89, 0xb8, 0xc2);
+const CODE_STRING: Color = Color::Rgb(0xb4, 0xbe, 0x82);
+const CODE_NUMBER: Color = Color::Rgb(0xe2, 0xa4, 0x78);
 const SELECTION: Color = Color::Rgb(0x27, 0x2c, 0x42);
 /// A more prominent selection tint for list rows (pickers), where the subtle
 /// editor selection colour is hard to spot.
@@ -1663,11 +1673,11 @@ fn git_gutter_style(kind: crate::editor::GitLineKind) -> (&'static str, Color) {
 fn semantic_color(token_kind: &str) -> Color {
     match token_kind {
         "namespace" | "type" | "class" | "enum" | "interface" | "struct" | "typeParameter"
-        | "property" | "enumMember" => Color::Rgb(0x89, 0xb8, 0xc2),
-        "function" | "method" | "macro" => Color::Rgb(0x84, 0xa0, 0xc6),
-        "keyword" | "modifier" | "operator" => Color::Rgb(0xe2, 0xa4, 0x78),
-        "string" | "regexp" => Color::Rgb(0xb4, 0xbe, 0x82),
-        "number" => Color::Rgb(0xe2, 0xa4, 0x78),
+        | "property" | "enumMember" => CODE_TYPE,
+        "function" | "method" | "macro" => CODE_FUNCTION,
+        "keyword" | "modifier" | "operator" => CODE_KEYWORD,
+        "string" | "regexp" => CODE_STRING,
+        "number" => CODE_NUMBER,
         "comment" => MUTED,
         "parameter" | "variable" => FG,
         _ => FG,
@@ -1677,19 +1687,18 @@ fn semantic_color(token_kind: &str) -> Color {
 fn highlight_color(kind: Option<&str>) -> Color {
     match kind.unwrap_or_default() {
         kind if kind.contains("comment") => MUTED,
-        kind if kind.contains("string") => Color::Rgb(0xb4, 0xbe, 0x82),
-        kind if kind.contains("number") || kind.contains("constant") => {
-            Color::Rgb(0xe2, 0xa4, 0x78)
-        }
-        kind if kind.contains("keyword") || kind.contains("function") => {
-            Color::Rgb(0x84, 0xa0, 0xc6)
-        }
-        kind if kind.contains("type") || kind.contains("property") => Color::Rgb(0x89, 0xb8, 0xc2),
-        kind if kind.contains("text.title") => Color::Rgb(0x84, 0xa0, 0xc6),
-        kind if kind.contains("text.literal") => Color::Rgb(0xb4, 0xbe, 0x82),
-        kind if kind.contains("text.uri") || kind.contains("text.reference") => {
-            Color::Rgb(0x89, 0xb8, 0xc2)
-        }
+        kind if kind.contains("string") => CODE_STRING,
+        kind if kind.contains("number") || kind.contains("constant") => CODE_NUMBER,
+        // Keep these aligned with `semantic_color`: a keyword the tree-sitter pass
+        // colours must match the colour the LSP semantic pass gives it, or the
+        // token visibly flips (e.g. keywords from blue to orange) when the
+        // debounced semantic-tokens result lands a beat after each keystroke.
+        kind if kind.contains("keyword") || kind.contains("operator") => CODE_KEYWORD,
+        kind if kind.contains("function") => CODE_FUNCTION,
+        kind if kind.contains("type") || kind.contains("property") => CODE_TYPE,
+        kind if kind.contains("text.title") => CODE_FUNCTION,
+        kind if kind.contains("text.literal") => CODE_STRING,
+        kind if kind.contains("text.uri") || kind.contains("text.reference") => CODE_TYPE,
         kind if kind.contains("text.emphasis") || kind.contains("text.strong") => {
             Color::Rgb(0xa0, 0x93, 0xc7)
         }
@@ -2227,10 +2236,8 @@ mod tests {
                 .any(|span| { span.style.fg.is_some_and(|color| color != FG) })
         );
         assert_eq!(lines[3].spans[0].content.as_ref(), "fn");
-        assert_eq!(
-            lines[3].spans[0].style.fg,
-            Some(Color::Rgb(0x84, 0xa0, 0xc6))
-        );
+        // `fn` is a keyword, coloured to match the editor's semantic keyword hue.
+        assert_eq!(lines[3].spans[0].style.fg, Some(CODE_KEYWORD));
     }
 
     #[test]

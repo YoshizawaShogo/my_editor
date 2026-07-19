@@ -1170,44 +1170,44 @@ impl Editor {
                                 .filter_text
                                 .clone()
                                 .unwrap_or_else(|| item.label.clone());
-                            if !prefix.is_empty()
-                                && (filter.eq_ignore_ascii_case(&prefix)
-                                    || item.label.eq_ignore_ascii_case(&prefix))
-                            {
-                                return None;
-                            }
                             let score = if prefix.is_empty() {
                                 0
                             } else {
                                 matcher.fuzzy_match(&filter, &prefix)?
                             };
-                            Some((score, {
-                                let mut insert = item
-                                    .insert_text
-                                    .clone()
-                                    .unwrap_or_else(|| item.label.clone());
-                                let callable = matches!(
-                                    item.kind,
-                                    Some(
-                                        lsp_types::CompletionItemKind::FUNCTION
-                                            | lsp_types::CompletionItemKind::METHOD
-                                    )
-                                );
-                                if callable && add_parentheses && !insert.contains('(') {
-                                    insert.push_str("()");
-                                }
-                                let cursor_back = usize::from(
-                                    callable
-                                        && add_parentheses
-                                        && insert.trim_end().ends_with("()"),
-                                );
+                            let mut insert = item
+                                .insert_text
+                                .clone()
+                                .unwrap_or_else(|| item.label.clone());
+                            let callable = matches!(
+                                item.kind,
+                                Some(
+                                    lsp_types::CompletionItemKind::FUNCTION
+                                        | lsp_types::CompletionItemKind::METHOD
+                                )
+                            );
+                            if callable && add_parentheses && !insert.contains('(') {
+                                insert.push_str("()");
+                            }
+                            // Drop a candidate only when picking it would change
+                            // nothing — its insertion equals what's already typed.
+                            // A method like `push` completing to `push()` still
+                            // edits the buffer, so it stays even beside `push_str`.
+                            if !prefix.is_empty() && insert.eq_ignore_ascii_case(&prefix) {
+                                return None;
+                            }
+                            let cursor_back = usize::from(
+                                callable && add_parentheses && insert.trim_end().ends_with("()"),
+                            );
+                            Some((
+                                score,
                                 CompletionCandidate {
                                     insert,
                                     cursor_back,
                                     label: item.label,
                                     prefix_len: prefix.chars().count(),
-                                }
-                            }))
+                                },
+                            ))
                         })
                         .collect();
                         items.sort_by_key(|right| std::cmp::Reverse(right.0));
@@ -7306,6 +7306,44 @@ mod tests {
         let completion = editor.completion_view().unwrap();
         assert_eq!(completion.items, vec!["collections_mut"]);
         assert_eq!(completion.anchor, CharIdx(4));
+    }
+
+    #[test]
+    fn method_matching_the_prefix_stays_because_it_completes_to_a_call() {
+        let mut editor = Editor::default();
+        let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
+        document.path = Some(PathBuf::from("main.rs"));
+        document.language = Some("rust".to_owned());
+        let server = editor.test_register_server("rust", 1);
+        server.spawned = true;
+        server.ready = true;
+        editor.test_open_doc(DocumentId(0), 1);
+
+        editor.update(AppEvent::TextPaste("s.push".to_owned()));
+        let request = editor
+            .request_completion(true)
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::LspRequest { id, .. } => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        editor.update(AppEvent::Lsp(LspEvent::Response {
+            id: request,
+            // Both are methods; `push` equals the prefix but completes to `push()`.
+            result: Ok(serde_json::json!([
+                {"label": "push", "kind": 2},
+                {"label": "push_str", "kind": 2}
+            ])),
+        }));
+
+        let completion = editor.completion_view().unwrap();
+        assert!(
+            completion.items.contains(&"push".to_owned()),
+            "push was dropped: {:?}",
+            completion.items
+        );
+        assert!(completion.items.contains(&"push_str".to_owned()));
     }
 
     #[test]
