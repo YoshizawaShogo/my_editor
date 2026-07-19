@@ -121,7 +121,7 @@ impl TerminalSession {
             EnterAlternateScreen,
             EnableBracketedPaste,
             EnableMouseCapture,
-            SetCursorStyle::SteadyBar,
+            SetCursorStyle::BlinkingBar,
             Hide
         ) {
             let _ = disable_raw_mode();

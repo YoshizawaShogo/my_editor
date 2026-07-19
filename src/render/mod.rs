@@ -19,12 +19,16 @@ const MUTED: Color = Color::Rgb(0x6b, 0x70, 0x89);
 // Syntax palette, shared by LSP semantic tokens ([`semantic_color`]) and the
 // tree-sitter fallback ([`highlight_color`]). Both map the same token category
 // to the same colour so a token never flickers when the LSP result arrives to
-// replace (or is replaced by) the tree-sitter guess.
-const CODE_KEYWORD: Color = Color::Rgb(0xe2, 0xa4, 0x78);
-const CODE_FUNCTION: Color = Color::Rgb(0x84, 0xa0, 0xc6);
-const CODE_TYPE: Color = Color::Rgb(0x89, 0xb8, 0xc2);
-const CODE_STRING: Color = Color::Rgb(0xb4, 0xbe, 0x82);
-const CODE_NUMBER: Color = Color::Rgb(0xe2, 0xa4, 0x78);
+// replace (or is replaced by) the tree-sitter guess. Keywords, operators and
+// numbers are deliberately three distinct hues — folding them together (e.g.
+// `fn`, `%` and `2` all orange) makes a line hard to read at a glance.
+const CODE_KEYWORD: Color = Color::Rgb(0xa0, 0x93, 0xc7); // purple: fn, if, let, return, mut
+const CODE_OPERATOR: Color = Color::Rgb(0xe2, 0xa4, 0x78); // orange: %, ==, &, +
+const CODE_FUNCTION: Color = Color::Rgb(0x84, 0xa0, 0xc6); // blue: solve, println, new
+const CODE_TYPE: Color = Color::Rgb(0x89, 0xb8, 0xc2); // cyan: String, usize, bool
+const CODE_STRING: Color = Color::Rgb(0xb4, 0xbe, 0x82); // green: "text", 'c'
+const CODE_NUMBER: Color = Color::Rgb(0xd7, 0xb8, 0x7a); // amber: 0, 1, 2, true
+const CODE_BUILTIN: Color = Color::Rgb(0xc6, 0x8b, 0xa5); // dusty rose: macros, lifetimes
 const SELECTION: Color = Color::Rgb(0x27, 0x2c, 0x42);
 /// A more prominent selection tint for list rows (pickers), where the subtle
 /// editor selection colour is hard to spot.
@@ -34,7 +38,7 @@ const ADDED_BG: Color = Color::Rgb(0x24, 0x30, 0x25);
 const REMOVED_BG: Color = Color::Rgb(0x38, 0x22, 0x28);
 const CHANGED_BG: Color = Color::Rgb(0x38, 0x30, 0x22);
 const POPUP_BG: Color = Color::Rgb(0x1e, 0x21, 0x32);
-const OCCURRENCE_BG: Color = Color::Rgb(0x22, 0x27, 0x35);
+const OCCURRENCE_BG: Color = Color::Rgb(0x3d, 0x44, 0x60);
 const MATCHING_BRACKET_BG: Color = Color::Rgb(0x4a, 0x50, 0x68);
 
 pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
@@ -152,14 +156,16 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
     if let Some(completion) = editor.completion_view() {
         draw_completion(frame, editor, &completion);
     }
-    if let Some(rename) = editor.rename_view() {
-        draw_rename(frame, rename);
-    }
     if let Some(confirm) = editor.confirm_view() {
         draw_confirm(frame, confirm);
     }
     if let Some(hover) = editor.hover_view() {
         draw_hover(frame, editor, hover);
+    }
+    // The rename prompt is modal, so it draws last — on top of any hover or
+    // diagnostic popup that would otherwise sit over it.
+    if let Some(rename) = editor.rename_view() {
+        draw_rename(frame, rename);
     }
 }
 
@@ -1672,14 +1678,28 @@ fn git_gutter_style(kind: crate::editor::GitLineKind) -> (&'static str, Color) {
 
 fn semantic_color(token_kind: &str) -> Color {
     match token_kind {
+        // Every type-category token rust-analyzer may emit. `builtinType` in
+        // particular is what it reports for `usize`, `u8`, `bool`, `str`, … —
+        // omitting it left builtin types uncoloured (falling through to FG) once
+        // the semantic result replaced the tree-sitter guess, so a signature's
+        // `String` stayed cyan while its `usize`s reverted to plain foreground.
         "namespace" | "type" | "class" | "enum" | "interface" | "struct" | "typeParameter"
-        | "property" | "enumMember" => CODE_TYPE,
-        "function" | "method" | "macro" => CODE_FUNCTION,
-        "keyword" | "modifier" | "operator" => CODE_KEYWORD,
-        "string" | "regexp" => CODE_STRING,
-        "number" => CODE_NUMBER,
+        | "property" | "enumMember" | "builtinType" | "typeAlias" | "union" | "selfTypeKeyword" => {
+            CODE_TYPE
+        }
+        "function" | "method" => CODE_FUNCTION,
+        // Macros and lifetimes get their own accent so `println!`/`vec!` and
+        // `'a` don't read as ordinary calls or punctuation.
+        "macro" | "lifetime" | "label" => CODE_BUILTIN,
+        "keyword" | "modifier" | "selfKeyword" => CODE_KEYWORD,
+        // rust-analyzer emits the plain `operator`, but also finer arithmetic/
+        // bitwise/comparison/logical variants when negotiated; colour them all
+        // as operators so `%`, `==`, `&` stand apart from keywords and numbers.
+        "operator" | "arithmetic" | "bitwise" | "comparison" | "logical" => CODE_OPERATOR,
+        "string" | "regexp" | "character" | "escapeSequence" => CODE_STRING,
+        "number" | "boolean" => CODE_NUMBER,
         "comment" => MUTED,
-        "parameter" | "variable" => FG,
+        "parameter" | "variable" | "const" | "static" | "constParameter" => FG,
         _ => FG,
     }
 }
@@ -1687,13 +1707,16 @@ fn semantic_color(token_kind: &str) -> Color {
 fn highlight_color(kind: Option<&str>) -> Color {
     match kind.unwrap_or_default() {
         kind if kind.contains("comment") => MUTED,
-        kind if kind.contains("string") => CODE_STRING,
+        kind if kind.contains("string") || kind.contains("character") => CODE_STRING,
+        kind if kind.contains("boolean") => CODE_NUMBER,
         kind if kind.contains("number") || kind.contains("constant") => CODE_NUMBER,
-        // Keep these aligned with `semantic_color`: a keyword the tree-sitter pass
-        // colours must match the colour the LSP semantic pass gives it, or the
-        // token visibly flips (e.g. keywords from blue to orange) when the
-        // debounced semantic-tokens result lands a beat after each keystroke.
-        kind if kind.contains("keyword") || kind.contains("operator") => CODE_KEYWORD,
+        // Keep these aligned with `semantic_color`: a token the tree-sitter pass
+        // colours must match the colour the LSP semantic pass gives it, or it
+        // visibly flips (e.g. a keyword changing hue) when the debounced
+        // semantic-tokens result lands a beat after each keystroke.
+        kind if kind.contains("keyword") => CODE_KEYWORD,
+        kind if kind.contains("operator") => CODE_OPERATOR,
+        kind if kind.contains("macro") || kind.contains("lifetime") => CODE_BUILTIN,
         kind if kind.contains("function") => CODE_FUNCTION,
         kind if kind.contains("type") || kind.contains("property") => CODE_TYPE,
         kind if kind.contains("text.title") => CODE_FUNCTION,
@@ -1888,6 +1911,31 @@ mod tests {
     fn semantic_color_fallback_stays_readable() {
         assert_eq!(semantic_color("unresolvedReference"), FG);
         assert_eq!(semantic_color("unknown"), FG);
+    }
+
+    #[test]
+    fn builtin_types_are_coloured_like_other_types() {
+        // rust-analyzer reports `usize`/`u8`/`bool`/`str` as `builtinType`; it must
+        // read as a type, not fall through to plain foreground.
+        assert_eq!(semantic_color("builtinType"), CODE_TYPE);
+        assert_eq!(semantic_color("struct"), CODE_TYPE);
+        assert_eq!(semantic_color("builtinType"), semantic_color("struct"));
+    }
+
+    #[test]
+    fn keywords_operators_and_numbers_are_distinct_hues() {
+        // `fn`, `%` and `2` sharing one colour was the readability complaint; the
+        // three categories must stay visually separable in both highlight passes.
+        let keyword = semantic_color("keyword");
+        let operator = semantic_color("operator");
+        let number = semantic_color("number");
+        assert_ne!(keyword, operator);
+        assert_ne!(operator, number);
+        assert_ne!(keyword, number);
+        // The tree-sitter fallback must agree so nothing flickers between passes.
+        assert_eq!(highlight_color(Some("keyword")), keyword);
+        assert_eq!(highlight_color(Some("operator")), operator);
+        assert_eq!(highlight_color(Some("number")), number);
     }
 
     #[test]

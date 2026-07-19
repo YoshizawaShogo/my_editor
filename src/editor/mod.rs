@@ -587,7 +587,7 @@ impl Editor {
             }
         }
         if caret.is_some() {
-            self.ensure_cursor_visible();
+            self.reveal_caret_with_context();
         }
     }
 
@@ -1263,9 +1263,10 @@ impl Editor {
                                     view.selections.set_single(Selection::caret(index));
                                 }
                                 self.layout = Layout::EditorFull(EditorPane { view });
-                                // The new view starts scrolled to the top; follow the
-                                // caret so the definition is on screen, not line 1.
-                                self.ensure_cursor_visible();
+                                // The new view starts scrolled to the top; reveal the
+                                // definition with context so its body isn't pushed
+                                // just past the bottom edge.
+                                self.reveal_caret_with_context();
                             } else {
                                 // The file is not open yet, so its text is not loaded.
                                 // Remember where to land and apply it once the read
@@ -1523,7 +1524,7 @@ impl Editor {
             }
             pane.view.selections.set_single(Selection::caret(clamped));
         }
-        self.ensure_cursor_visible();
+        self.reveal_caret_with_context();
         self.dirty = true;
     }
 
@@ -2554,6 +2555,11 @@ impl Editor {
             Command::ToggleCompletion => return self.toggle_completion(),
             Command::Rename => {
                 if self.active_lsp_context().is_some() {
+                    // Clear the hover/diagnostic popup and completion so they don't
+                    // linger beside or under the modal rename prompt.
+                    self.hover = None;
+                    self.deferred_hover = None;
+                    self.completion = None;
                     self.rename_input = Some(String::new());
                     self.focus = Focus::Overlay;
                     self.dirty = true;
@@ -3580,8 +3586,9 @@ impl Editor {
                     head: CharIdx(range.end),
                 });
                 self.layout = Layout::EditorFull(EditorPane { view });
-                // The fresh view is scrolled to the top; follow the match.
-                self.ensure_cursor_visible();
+                // The fresh view is scrolled to the top; reveal the match with
+                // surrounding context rather than pinning it to the bottom edge.
+                self.reveal_caret_with_context();
                 Vec::new()
             }
             SearchHit::Disk(hit) => {
@@ -4621,6 +4628,38 @@ impl Editor {
         pane.view.selections.replace_all(moved);
         self.ensure_cursor_visible();
         self.dirty = true;
+    }
+
+    /// Reveal the caret with room above and below, for jumps (definition,
+    /// navigation, search hit) where the content you jumped to — a definition
+    /// body, the lines around a match — sits *below* the caret. Plain
+    /// [`Self::ensure_cursor_visible`] only guarantees the caret line itself, so on
+    /// a downward jump it pins that line to the bottom edge and leaves the body
+    /// off screen. This first parks the caret about a third of the way down, then
+    /// defers to `ensure_cursor_visible` to clamp and finalise the wrapped offset.
+    fn reveal_caret_with_context(&mut self) {
+        if self.terminal_size.1 != 0 {
+            let rows = usize::from(self.terminal_size.1.saturating_sub(1)).max(1);
+            let focus = self.focus;
+            let (documents, layout) = (&self.documents, &mut self.layout);
+            if let Some(pane) = layout.active_editor_mut(focus)
+                && let Some(editable) = documents
+                    .get(&pane.view.doc)
+                    .and_then(Document::editable_opt)
+            {
+                let head = pane
+                    .view
+                    .selections
+                    .primary()
+                    .head
+                    .0
+                    .min(editable.text().len_chars());
+                let line = editable.text().char_to_line(head);
+                pane.view.scroll.top_line = line.saturating_sub(rows / 3);
+                pane.view.scroll.wrapped_row_offset = 0;
+            }
+        }
+        self.ensure_cursor_visible();
     }
 
     fn ensure_cursor_visible(&mut self) {
@@ -6237,8 +6276,11 @@ mod tests {
             result: Ok(body),
         }));
 
-        // The definition sits on line 30, far below a 10-row viewport, so the
-        // view must scroll instead of leaving line 1 on screen.
+        // The definition sits on line 30, far below the 9-row text area (10 rows
+        // minus the status bar). The view must scroll it into sight AND leave the
+        // definition body below it visible. Bottom-pinning would give top_line
+        // 30 + 1 - 9 = 22 (target on the last row, nothing below); revealing with
+        // context means a larger top_line, so the target sits higher on screen.
         let scroll = editor
             .layout
             .active_editor(editor.focus)
@@ -6247,6 +6289,10 @@ mod tests {
             .scroll
             .top_line;
         assert!(scroll > 0, "expected the view to scroll, got {scroll}");
+        assert!(
+            scroll > 22,
+            "target pinned to the bottom edge with no context below: {scroll}"
+        );
         assert!(scroll <= 30);
     }
 
@@ -7344,6 +7390,27 @@ mod tests {
             completion.items
         );
         assert!(completion.items.contains(&"push_str".to_owned()));
+    }
+
+    #[test]
+    fn starting_rename_dismisses_the_hover_and_completion_popups() {
+        let mut editor = Editor::default();
+        let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
+        document.path = Some(PathBuf::from("main.rs"));
+        document.language = Some("rust".to_owned());
+        editor.test_register_server("rust", 1).ready = true;
+        editor.test_open_doc(DocumentId(0), 1);
+        editor.update(AppEvent::TextPaste("value".to_owned()));
+        editor.hover = Some("診断: unused variable".to_owned());
+
+        editor.update(Command::Rename.into());
+
+        assert!(editor.rename_view().is_some(), "rename prompt should open");
+        assert!(
+            editor.hover_view().is_none(),
+            "the hover/diagnostic popup should be cleared so it can't overlap rename"
+        );
+        assert!(editor.completion_view().is_none());
     }
 
     #[test]
