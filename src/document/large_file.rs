@@ -25,8 +25,7 @@ impl LargeFile {
     }
 
     pub fn validate_text(&self) -> bool {
-        let sample = &self.mmap[..self.mmap.len().min(8192)];
-        !sample.contains(&0) && std::str::from_utf8(sample).is_ok()
+        super::looks_like_text(&self.mmap)
     }
 
     pub fn line(&self, line: usize) -> Option<String> {

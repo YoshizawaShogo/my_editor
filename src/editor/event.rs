@@ -58,10 +58,21 @@ pub enum GitLineKind {
     Deleted,
 }
 
+/// Output from one shell session. `token` names the session that produced it:
+/// spawning a shell kills its predecessor, whose reader thread then reports an
+/// exit that must not be mistaken for the new session's.
 #[derive(Debug, Eq, PartialEq)]
 pub enum TerminalEvent {
-    Output(Vec<u8>),
-    Exited(Option<String>),
+    Output { token: u64, bytes: Vec<u8> },
+    Exited { token: u64, error: Option<String> },
+}
+
+impl TerminalEvent {
+    pub fn token(&self) -> u64 {
+        match self {
+            Self::Output { token, .. } | Self::Exited { token, .. } => *token,
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -81,6 +92,13 @@ pub struct GrepHit {
 #[derive(Debug, Eq, PartialEq)]
 pub enum FileScanEvent {
     Batch {
+        token: u64,
+        paths: Vec<std::path::PathBuf>,
+    },
+    /// The answer to one [`crate::editor::Effect::ListPathCompletions`].
+    /// Unlike [`Self::Batch`] it replaces the candidate list: it is the whole
+    /// answer for the path typed so far, not one instalment of a walk.
+    PathCompletions {
         token: u64,
         paths: Vec<std::path::PathBuf>,
     },

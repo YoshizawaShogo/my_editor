@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::{
+    diff::{DiffKind, Segment, aligned, rope_lines, word_segments},
     editor::{ActiveBuffer, Editor},
     position::{char_idx_to_display_pos, display_col_after},
     view::is_word,
@@ -15,6 +16,10 @@ use crate::{
 const BG: Color = Color::Rgb(0x16, 0x18, 0x21);
 const FG: Color = Color::Rgb(0xc6, 0xc8, 0xd1);
 const MUTED: Color = Color::Rgb(0x6b, 0x70, 0x89);
+/// The caret's own line number, drawn white against the muted rest of the
+/// gutter so the cursor row is findable at a glance — including while focus is
+/// in the find pane or the shell, where the terminal cursor sits elsewhere.
+const CURRENT_LINE_NUMBER: Color = Color::Rgb(0xff, 0xff, 0xff);
 
 // Syntax palette, shared by LSP semantic tokens ([`semantic_color`]) and the
 // tree-sitter fallback ([`highlight_color`]). Both map the same token category
@@ -37,6 +42,10 @@ const STATUS_BG: Color = Color::Rgb(0x0f, 0x11, 0x17);
 const ADDED_BG: Color = Color::Rgb(0x24, 0x30, 0x25);
 const REMOVED_BG: Color = Color::Rgb(0x38, 0x22, 0x28);
 const CHANGED_BG: Color = Color::Rgb(0x38, 0x30, 0x22);
+/// The part of a changed line that actually differs, tinted above the row's own
+/// background so the eye lands on the edit rather than the whole line.
+const WORD_ADDED_BG: Color = Color::Rgb(0x3f, 0x5c, 0x3f);
+const WORD_REMOVED_BG: Color = Color::Rgb(0x63, 0x36, 0x40);
 const POPUP_BG: Color = Color::Rgb(0x1e, 0x21, 0x32);
 const OCCURRENCE_BG: Color = Color::Rgb(0x3d, 0x44, 0x60);
 const MATCHING_BRACKET_BG: Color = Color::Rgb(0x4a, 0x50, 0x68);
@@ -94,7 +103,11 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
             right_area,
             &left,
             &right,
-            editor.focused_side(),
+            DiffViewport {
+                focused: editor.focused_side(),
+                top_row: editor.diff_top_row(),
+                hunks: editor.diff_hunk_position(),
+            },
         );
         draw_split_divider(frame, divider);
         draw_status(
@@ -545,7 +558,7 @@ fn completion_anchor_position(
 ) -> Option<(u16, u16)> {
     let buffer = editor.active_buffer()?;
     let mut pane = viewport;
-    if editor.shell_visible() || editor.split_buffers().is_some() {
+    if editor.is_split() {
         let (left, _, right) = split_panes(viewport);
         pane = if editor.focused_side() == crate::editor::Side::Right {
             right
@@ -1004,17 +1017,30 @@ fn picker_item_line(
     Line::from(spans)
 }
 
+/// Where the diff view is looking: which side has the caret, the first visible
+/// aligned row, and `(current, total)` for the hunk navigator.
+struct DiffViewport {
+    focused: crate::editor::Side,
+    top_row: usize,
+    hunks: Option<(usize, usize)>,
+}
+
 fn draw_diff(
     frame: &mut Frame<'_>,
     left_area: Rect,
     right_area: Rect,
     left: &ActiveBuffer<'_>,
     right: &ActiveBuffer<'_>,
-    focused: crate::editor::Side,
+    viewport: DiffViewport,
 ) {
+    let DiffViewport {
+        focused,
+        top_row,
+        hunks,
+    } = viewport;
     let left_lines = rope_lines(left.text);
     let right_lines = rope_lines(right.text);
-    let rows = aligned_diff(&left_lines, &right_lines);
+    let rows = aligned(&left_lines, &right_lines);
     let height = usize::from(left_area.height.min(right_area.height));
     let focused_line = match focused {
         crate::editor::Side::Left => {
@@ -1044,10 +1070,10 @@ fn draw_diff(
             .as_ref()
             .is_some_and(|(line, _)| *line == focused_line),
     });
-    let start = cursor_row
-        .map(|row| row.saturating_sub(height.saturating_sub(1) / 2))
-        .unwrap_or(0)
-        .min(rows.len().saturating_sub(height));
+    // The view scrolls by aligned row. `top_row` is an upper-bounded guess made
+    // without the alignment (see `Editor::scroll_diff`), so the last screenful
+    // is clamped here, where the real row count is known.
+    let start = top_row.min(rows.len().saturating_sub(height));
     let mut rendered_left = Vec::new();
     let mut rendered_right = Vec::new();
     for row in rows.iter().skip(start).take(height) {
@@ -1057,8 +1083,29 @@ fn draw_diff(
             DiffKind::Removed => (REMOVED_BG, "-"),
             DiffKind::Changed => (CHANGED_BG, "~"),
         };
-        rendered_left.push(diff_line(row.left.clone(), marker, background));
-        rendered_right.push(diff_line(row.right.clone(), marker, background));
+        // Only a changed row has both sides to compare within; added and
+        // removed rows have no counterpart, so the whole line is the change.
+        let (left_words, right_words) = match (row.kind, &row.left, &row.right) {
+            (DiffKind::Changed, Some((_, before)), Some((_, after))) => {
+                let (before, after) = word_segments(before, after);
+                (Some(before), Some(after))
+            }
+            _ => (None, None),
+        };
+        rendered_left.push(diff_line(
+            row.left.clone(),
+            marker,
+            background,
+            left_words,
+            WORD_REMOVED_BG,
+        ));
+        rendered_right.push(diff_line(
+            row.right.clone(),
+            marker,
+            background,
+            right_words,
+            WORD_ADDED_BG,
+        ));
     }
     frame.render_widget(
         Paragraph::new(rendered_left).style(Style::default().fg(FG).bg(BG)),
@@ -1068,6 +1115,9 @@ fn draw_diff(
         Paragraph::new(rendered_right).style(Style::default().fg(FG).bg(BG)),
         right_area,
     );
+    if let Some((current, total)) = hunks {
+        draw_diff_navigator(frame, right_area, current, total);
+    }
     if let Some(row) = cursor_row.filter(|row| *row >= start && *row < start + height) {
         let (area, buffer) = match focused {
             crate::editor::Side::Left => (left_area, left),
@@ -1078,128 +1128,123 @@ fn draw_diff(
             buffer.view.selections.primary().head,
             buffer.tab_size,
         );
-        let column = 6usize.saturating_add(position.col);
+        let column = usize::from(crate::diff::GUTTER_WIDTH).saturating_add(position.col);
         if column < usize::from(area.width) {
             frame.set_cursor_position((area.x + column as u16, area.y + (row - start) as u16));
         }
     }
 }
 
-fn diff_line(line: Option<(usize, String)>, marker: &str, background: Color) -> Line<'static> {
-    match line {
-        Some((number, text)) => Line::styled(
-            format!("{marker}{:>4} {text}", number + 1),
-            Style::default().fg(FG).bg(background),
-        ),
-        None => Line::styled(
-            format!("{marker}     "),
+/// `▲ ▼ 3/12` pinned to the top-right of the diff pane. The arrows are click
+/// targets; [`diff_navigator_hit`] maps a click back to a direction using the
+/// same geometry.
+fn draw_diff_navigator(frame: &mut Frame<'_>, pane: Rect, current: usize, total: usize) {
+    let width = diff_navigator_label_width(current, total);
+    if pane.width <= width || pane.height == 0 {
+        return;
+    }
+    let area = Rect::new(pane.right() - width, pane.y, width, 1);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                DIFF_NAV_PREV,
+                Style::default().fg(if total == 0 { MUTED } else { FG }),
+            ),
+            Span::styled(
+                DIFF_NAV_NEXT,
+                Style::default().fg(if total == 0 { MUTED } else { FG }),
+            ),
+            Span::styled(format!(" {current}/{total} "), Style::default().fg(MUTED)),
+        ]))
+        .style(Style::default().bg(POPUP_BG)),
+        area,
+    );
+}
+
+const DIFF_NAV_PREV: &str = " ▲ ";
+const DIFF_NAV_NEXT: &str = " ▼ ";
+
+fn diff_navigator_label(current: usize, total: usize) -> String {
+    format!("{DIFF_NAV_PREV}{DIFF_NAV_NEXT} {current}/{total} ")
+}
+
+pub fn diff_navigator_label_width(current: usize, total: usize) -> u16 {
+    diff_navigator_label(current, total).chars().count() as u16
+}
+
+/// Which arrow a click landed on: `Some(true)` for next, `Some(false)` for
+/// previous, `None` for anywhere else. Takes the pane geometry as plain columns
+/// so the editor can hit-test without depending on ratatui's `Rect`.
+pub fn diff_navigator_hit(
+    pane_x: u16,
+    pane_width: u16,
+    current: usize,
+    total: usize,
+    column: u16,
+    row: u16,
+) -> Option<bool> {
+    let width = diff_navigator_label_width(current, total);
+    if pane_width <= width || row != 0 {
+        return None;
+    }
+    let x = pane_x + pane_width - width;
+    let prev_width = DIFF_NAV_PREV.chars().count() as u16;
+    let next_width = DIFF_NAV_NEXT.chars().count() as u16;
+    if column >= x && column < x + prev_width {
+        return Some(false);
+    }
+    if column >= x + prev_width && column < x + prev_width + next_width {
+        return Some(true);
+    }
+    None
+}
+
+/// One rendered diff row. `words` splits the text so the differing runs can be
+/// tinted with `word_background`; without it the line is drawn in one piece.
+fn diff_line(
+    line: Option<(usize, String)>,
+    marker: &str,
+    background: Color,
+    words: Option<Vec<Segment>>,
+    word_background: Color,
+) -> Line<'static> {
+    let Some((number, text)) = line else {
+        return Line::styled(
+            format!(
+                "{marker}{:width$}",
+                "",
+                width = crate::diff::LINE_NUMBER_WIDTH + 1
+            ),
             Style::default().fg(MUTED).bg(background),
+        );
+    };
+    let gutter = Span::styled(
+        format!(
+            "{marker}{:>width$} ",
+            number + 1,
+            width = crate::diff::LINE_NUMBER_WIDTH
         ),
-    }
-}
-
-fn rope_lines(text: &ropey::Rope) -> Vec<String> {
-    text.lines()
-        .map(|line| line.to_string().trim_end_matches(['\r', '\n']).to_owned())
-        .collect()
-}
-
-#[derive(Clone, Copy)]
-enum DiffKind {
-    Equal,
-    Added,
-    Removed,
-    Changed,
-}
-
-struct DiffRow {
-    left: Option<(usize, String)>,
-    right: Option<(usize, String)>,
-    kind: DiffKind,
-}
-
-fn aligned_diff(left: &[String], right: &[String]) -> Vec<DiffRow> {
-    if left.len().saturating_mul(right.len()) > 1_000_000 {
-        return index_diff(left, right);
-    }
-    let width = right.len() + 1;
-    let mut lcs = vec![0usize; (left.len() + 1) * width];
-    for i in (0..left.len()).rev() {
-        for j in (0..right.len()).rev() {
-            lcs[i * width + j] = if left[i] == right[j] {
-                lcs[(i + 1) * width + j + 1] + 1
+        Style::default().fg(FG).bg(background),
+    );
+    let Some(words) = words else {
+        return Line::from(vec![
+            gutter,
+            Span::styled(text, Style::default().fg(FG).bg(background)),
+        ]);
+    };
+    let mut spans = vec![gutter];
+    spans.extend(words.into_iter().map(|segment| {
+        Span::styled(
+            segment.text,
+            Style::default().fg(FG).bg(if segment.changed {
+                word_background
             } else {
-                lcs[(i + 1) * width + j].max(lcs[i * width + j + 1])
-            };
-        }
-    }
-    let mut rows = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < left.len() || j < right.len() {
-        if i < left.len() && j < right.len() && left[i] == right[j] {
-            rows.push(DiffRow {
-                left: Some((i, left[i].clone())),
-                right: Some((j, right[j].clone())),
-                kind: DiffKind::Equal,
-            });
-            i += 1;
-            j += 1;
-            continue;
-        }
-        let mut removed = Vec::new();
-        let mut added = Vec::new();
-        while i < left.len() || j < right.len() {
-            if i < left.len() && j < right.len() && left[i] == right[j] {
-                break;
-            }
-            if j == right.len()
-                || (i < left.len() && lcs[(i + 1) * width + j] >= lcs[i * width + j + 1])
-            {
-                removed.push((i, left[i].clone()));
-                i += 1;
-            } else {
-                added.push((j, right[j].clone()));
-                j += 1;
-            }
-        }
-        let count = removed.len().max(added.len());
-        for index in 0..count {
-            let left_row = removed.get(index).cloned();
-            let right_row = added.get(index).cloned();
-            rows.push(DiffRow {
-                kind: match (left_row.is_some(), right_row.is_some()) {
-                    (true, true) => DiffKind::Changed,
-                    (true, false) => DiffKind::Removed,
-                    (false, true) => DiffKind::Added,
-                    (false, false) => unreachable!(),
-                },
-                left: left_row,
-                right: right_row,
-            });
-        }
-    }
-    rows
-}
-
-fn index_diff(left: &[String], right: &[String]) -> Vec<DiffRow> {
-    (0..left.len().max(right.len()))
-        .map(|index| {
-            let left_row = left.get(index).cloned().map(|line| (index, line));
-            let right_row = right.get(index).cloned().map(|line| (index, line));
-            let kind = match (&left_row, &right_row) {
-                (Some((_, left)), Some((_, right))) if left == right => DiffKind::Equal,
-                (Some(_), Some(_)) => DiffKind::Changed,
-                (Some(_), None) => DiffKind::Removed,
-                (None, Some(_)) => DiffKind::Added,
-                (None, None) => unreachable!(),
-            };
-            DiffRow {
-                left: left_row,
-                right: right_row,
-                kind,
-            }
-        })
-        .collect()
+                background
+            }),
+        )
+    }));
+    Line::from(spans)
 }
 
 fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, focused: bool) {
@@ -1230,6 +1275,15 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
     );
     let matching_brackets =
         matching_bracket_indices(buffer.text, buffer.view.selections.primary().head.0);
+    let caret_line = buffer.text.char_to_line(
+        buffer
+            .view
+            .selections
+            .primary()
+            .head
+            .0
+            .min(buffer.text.len_chars()),
+    );
     // Diagnostics already carry char-index ranges kept in sync with edits, so no
     // per-frame position conversion is needed.
     let diagnostic_ranges = buffer
@@ -1276,7 +1330,13 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
             Span::styled(marker, Style::default().fg(marker_color).bg(BG)),
             Span::styled(
                 format!("{:>digits$} ", line_index + 1),
-                Style::default().fg(MUTED).bg(BG),
+                Style::default()
+                    .fg(if line_index == caret_line {
+                        CURRENT_LINE_NUMBER
+                    } else {
+                        MUTED
+                    })
+                    .bg(BG),
             ),
         ];
         // Wrap the line into fixed-width visual rows ourselves so the rendered
@@ -1809,26 +1869,6 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
-    fn diff_aligns_insertions_and_changed_lines() {
-        let left = vec!["same".to_owned(), "old".to_owned(), "tail".to_owned()];
-        let right = vec![
-            "same".to_owned(),
-            "new".to_owned(),
-            "added".to_owned(),
-            "tail".to_owned(),
-        ];
-
-        let rows = aligned_diff(&left, &right);
-
-        assert_eq!(rows.len(), 4);
-        assert!(matches!(rows[0].kind, DiffKind::Equal));
-        assert!(matches!(rows[1].kind, DiffKind::Changed));
-        assert!(matches!(rows[2].kind, DiffKind::Added));
-        assert!(rows[2].left.is_none());
-        assert_eq!(rows[2].right.as_ref().unwrap().1, "added");
-    }
-
-    #[test]
     fn terminal_cells_preserve_ansi_colors_and_attributes() {
         let mut parser = vt100::Parser::new(2, 10, 0);
         parser.process(b"\x1b[31;44;1mR\x1b[0mN");
@@ -2185,6 +2225,52 @@ mod tests {
 
         let above = completion_popup_area(viewport, (20, 18), 12).unwrap();
         assert!(above.bottom() <= 18);
+    }
+
+    #[test]
+    fn only_the_differing_run_of_a_changed_line_is_tinted() {
+        let backend = TestBackend::new(80, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 80, rows: 4 });
+        editor.open_paths([
+            std::path::PathBuf::from("a.txt"),
+            std::path::PathBuf::from("b.txt"),
+        ]);
+        editor.update(crate::editor::AppEvent::Io(
+            crate::editor::IoEvent::FileLoaded {
+                id: crate::document::DocumentId(1),
+                result: Ok("let total = 1;".to_owned()),
+            },
+        ));
+        editor.update(crate::editor::AppEvent::Io(
+            crate::editor::IoEvent::FileLoaded {
+                id: crate::document::DocumentId(2),
+                result: Ok("let total = 2;".to_owned()),
+            },
+        ));
+        editor.update(crate::editor::Command::OpenDiffPicker.into());
+        editor.update(crate::editor::Command::PickerConfirm.into());
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        // Both panes draw "~   1 let total = N;". Only the digit that differs
+        // may carry the strong tint; everything else keeps the row background.
+        let buffer = terminal.backend().buffer();
+        let tinted = |columns: std::ops::Range<u16>, background: Color| -> Vec<String> {
+            columns
+                .filter(|column| buffer[(*column, 0)].bg == background)
+                .map(|column| buffer[(column, 0)].symbol().to_owned())
+                .collect()
+        };
+
+        assert_eq!(tinted(0..39, WORD_REMOVED_BG), vec!["2"]);
+        assert_eq!(tinted(41..68, WORD_ADDED_BG), vec!["1"]);
+        // The unchanged remainder is still marked as a changed row.
+        assert!(
+            (0..39).any(|column| buffer[(column, 0)].symbol() == "l"
+                && buffer[(column, 0)].bg == CHANGED_BG)
+        );
     }
 
     #[test]

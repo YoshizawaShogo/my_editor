@@ -49,6 +49,12 @@ pub fn translate(raw: RawInput, _focus: &Focus, pending: &mut KeyChordState) -> 
         RawInput::Key { event: key, .. } if key.code == KeyCode::F(6) => {
             Some(Command::OpenDiffPicker.into())
         }
+        RawInput::Key { event: key, .. } if key.code == KeyCode::F(7) => {
+            Some(Command::DiffPrevHunk.into())
+        }
+        RawInput::Key { event: key, .. } if key.code == KeyCode::F(8) => {
+            Some(Command::DiffNextHunk.into())
+        }
         RawInput::Key { event: key, at } => translate_key(key, at, _focus),
         RawInput::Paste(text) => Some(AppEvent::TextPaste(text)),
         RawInput::Mouse { event, at } => {

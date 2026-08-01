@@ -433,6 +433,15 @@ impl Runtime {
                     }
                 });
             }
+            Effect::ListPathCompletions { input, root, token } => {
+                let tx = self.tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = tx.send(AppEvent::FileScan(FileScanEvent::PathCompletions {
+                        token,
+                        paths: list_path_completions(&input, &root),
+                    }));
+                });
+            }
             Effect::ResolveDirectPath { input, root } => {
                 let tx = self.tx.clone();
                 tokio::task::spawn_blocking(move || {
@@ -466,7 +475,12 @@ impl Runtime {
                     }));
                 });
             }
-            Effect::SpawnShell { cols, rows, shell } => self.spawn_shell(cols, rows, shell),
+            Effect::SpawnShell {
+                token,
+                cols,
+                rows,
+                shell,
+            } => self.spawn_shell(token, cols, rows, shell),
             Effect::TerminalInput(bytes) => {
                 if let Some(shell) = &mut self.shell {
                     shell.writer.write_all(&bytes)?;
@@ -639,7 +653,7 @@ impl Runtime {
         }));
     }
 
-    fn spawn_shell(&mut self, cols: u16, rows: u16, configured_shell: Option<String>) {
+    fn spawn_shell(&mut self, token: u64, cols: u16, rows: u16, configured_shell: Option<String>) {
         if let Some(mut existing) = self.shell.take() {
             let _ = existing.child.kill();
             let _ = existing.child.wait();
@@ -653,11 +667,10 @@ impl Runtime {
         let pty = match openpty(&size, None) {
             Ok(pty) => pty,
             Err(error) => {
-                let _ = self
-                    .tx
-                    .send(AppEvent::Terminal(TerminalEvent::Exited(Some(format!(
-                        "PTYを作成できません: {error}"
-                    )))));
+                let _ = self.tx.send(AppEvent::Terminal(TerminalEvent::Exited {
+                    token,
+                    error: Some(format!("PTYを作成できません: {error}")),
+                }));
                 return;
             }
         };
@@ -691,11 +704,10 @@ impl Runtime {
         let child = match shell_command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                let _ = self
-                    .tx
-                    .send(AppEvent::Terminal(TerminalEvent::Exited(Some(format!(
-                        "シェルを起動できません: {error}"
-                    )))));
+                let _ = self.tx.send(AppEvent::Terminal(TerminalEvent::Exited {
+                    token,
+                    error: Some(format!("シェルを起動できません: {error}")),
+                }));
                 return;
             }
         };
@@ -710,36 +722,48 @@ impl Runtime {
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => {
-                        let _ = tx.send(AppEvent::Terminal(TerminalEvent::Exited(None)));
+                        let _ = tx.send(AppEvent::Terminal(TerminalEvent::Exited {
+                            token,
+                            error: None,
+                        }));
                         break;
                     }
                     Ok(read) => {
-                        let _ = tx.send(AppEvent::Terminal(TerminalEvent::Output(
-                            buffer[..read].to_vec(),
-                        )));
+                        let _ = tx.send(AppEvent::Terminal(TerminalEvent::Output {
+                            token,
+                            bytes: buffer[..read].to_vec(),
+                        }));
                     }
                     Err(error) if error.raw_os_error() == Some(nix::libc::EIO) => {
-                        let _ = tx.send(AppEvent::Terminal(TerminalEvent::Exited(None)));
+                        let _ = tx.send(AppEvent::Terminal(TerminalEvent::Exited {
+                            token,
+                            error: None,
+                        }));
                         break;
                     }
                     Err(error) => {
-                        let _ = tx.send(AppEvent::Terminal(TerminalEvent::Exited(Some(format!(
-                            "PTY read error: {error}"
-                        )))));
+                        let _ = tx.send(AppEvent::Terminal(TerminalEvent::Exited {
+                            token,
+                            error: Some(format!("PTY read error: {error}")),
+                        }));
                         break;
                     }
                 }
             }
         });
         self.shell = Some(ShellHandle {
+            token,
             writer: master,
             child,
         });
     }
 
+    /// Reap the shell once its own reader reports it gone. A stale exit — from
+    /// a session already replaced by [`Self::spawn_shell`] — must not tear down
+    /// the handle that succeeded it.
     fn observe_runtime_event(&mut self, event: &AppEvent) {
-        if matches!(event, AppEvent::Terminal(TerminalEvent::Exited(_)))
-            && let Some(mut shell) = self.shell.take()
+        if let AppEvent::Terminal(TerminalEvent::Exited { token, .. }) = event
+            && let Some(mut shell) = self.shell.take_if(|shell| shell.token == *token)
         {
             let _ = shell.child.wait();
         }
@@ -765,6 +789,7 @@ struct LspHandle {
 }
 
 struct ShellHandle {
+    token: u64,
     writer: File,
     child: Child,
 }
@@ -994,16 +1019,76 @@ fn name_glob_match(pattern: &str, name: &str) -> bool {
     )
 }
 
+/// `ls <typed-path>*`: the entries of the directory the input points at whose
+/// names start with the part of the final component typed so far.
+///
+/// Capped because a completion list nobody can read is not worth building, and
+/// directories like `/usr/bin` run to thousands of entries.
+const MAX_PATH_COMPLETIONS: usize = 200;
+
+fn list_path_completions(input: &str, root: &Path) -> Vec<PathBuf> {
+    let expanded = expand_path_input(input, root);
+    // A trailing separator means the directory itself was named, so list all of
+    // it; otherwise the last component is a prefix to filter by.
+    let (directory, prefix) = if input.ends_with('/') {
+        (expanded, String::new())
+    } else {
+        let prefix = expanded
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        (
+            expanded.parent().map(Path::to_path_buf).unwrap_or_default(),
+            prefix,
+        )
+    };
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<_> = entries
+        .flatten()
+        .filter(|entry| {
+            prefix.is_empty()
+                || entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(prefix.as_str())
+        })
+        .map(|entry| entry.path())
+        .collect();
+    paths.sort();
+    paths.truncate(MAX_PATH_COMPLETIONS);
+    paths
+}
+
+/// Resolve `~/`, absolute and workspace-relative inputs the same way
+/// [`Effect::ResolveDirectPath`] does, so completion and confirmation agree on
+/// what a typed path means.
+fn expand_path_input(input: &str, root: &Path) -> PathBuf {
+    if let Some(rest) = input.strip_prefix("~/") {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.to_path_buf())
+            .join(rest);
+    }
+    let path = PathBuf::from(input);
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
 fn read_utf8_file(path: &std::path::Path) -> std::result::Result<String, String> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("ファイルを開けません {}: {error}", path.display()))?;
-    let sample = &bytes[..bytes.len().min(8192)];
-    if sample.contains(&0) || std::str::from_utf8(sample).is_err() {
+    if !crate::document::looks_like_text(&bytes) {
         return Err(format!(
             "バイナリ/非UTF-8のため開けません: {}",
             path.display()
         ));
     }
+    // The sample only rules the file out early; this validates all of it.
     String::from_utf8(bytes)
         .map_err(|_| format!("バイナリ/非UTF-8のため開けません: {}", path.display()))
 }
@@ -1271,6 +1356,50 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::result::Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_completions_list_the_named_directory_filtered_by_the_typed_prefix() {
+        let root = std::env::temp_dir().join(format!("my_editor_paths_{}", std::process::id()));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        for name in ["alpha.rs", "album.rs", "beta.rs"] {
+            fs::write(nested.join(name), "").unwrap();
+        }
+
+        let absolute = format!("{}/al", nested.display());
+        let names = |paths: Vec<PathBuf>| -> Vec<String> {
+            paths
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // A prefix keeps only the entries that start with it, sorted.
+        assert_eq!(
+            names(list_path_completions(&absolute, Path::new("/"))),
+            vec!["album.rs".to_owned(), "alpha.rs".to_owned()]
+        );
+        // A trailing separator names the directory itself, so everything shows.
+        assert_eq!(
+            names(list_path_completions(
+                &format!("{}/", nested.display()),
+                Path::new("/")
+            )),
+            vec![
+                "album.rs".to_owned(),
+                "alpha.rs".to_owned(),
+                "beta.rs".to_owned()
+            ]
+        );
+        // A relative input resolves against the workspace root, not the cwd.
+        assert_eq!(
+            names(list_path_completions("nested/be", &root)),
+            vec!["beta.rs".to_owned()]
+        );
+        assert!(list_path_completions("/no/such/directory/x", &root).is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn name_glob_matches_like_find_dash_name() {

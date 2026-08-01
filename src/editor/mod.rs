@@ -11,6 +11,7 @@ pub use event::{
     MouseInput, TerminalEvent,
 };
 pub use focus::{Focus, Side};
+use layout::{DiffPane, RightPane};
 pub use layout::{EditorPane, Layout};
 
 use std::{
@@ -92,8 +93,8 @@ pub struct Editor {
     config: Config,
     workspace_root: PathBuf,
     next_scan_token: u64,
-    search: Option<SearchState>,
     next_grep_token: u64,
+    next_shell_token: u64,
     /// Language name → server id; the index into `servers`.
     lsp_servers: HashMap<String, u64>,
     servers: HashMap<u64, LspServer>,
@@ -112,8 +113,10 @@ pub struct Editor {
     /// used by jumps that open a file whose text is not in memory yet.
     pending_caret_jumps: HashMap<DocumentId, lsp_types::Position>,
     pending_self_disk_updates: HashMap<DocumentId, usize>,
-    terminal: Option<vt100::Parser>,
-    terminal_selection: Option<TerminalSelection>,
+    /// The shell, alive from the first Ctrl+O until it exits. Independent of
+    /// [`RightPane::Shell`], which only says whether it is currently on screen:
+    /// hiding the pane has to keep the session so reopening resumes it.
+    shell: Option<ShellSession>,
     terminal_size: (u16, u16),
     status: Option<String>,
     notifications: Vec<Toast>,
@@ -129,9 +132,7 @@ impl Default for Editor {
         Self {
             documents,
             next_doc_id: 1,
-            layout: Layout::EditorFull(EditorPane {
-                view: View::new(id),
-            }),
+            layout: Layout::new(View::new(id)),
             focus: Focus::Editor(Side::Left),
             clipboard: Register::default(),
             drag_anchor: None,
@@ -139,8 +140,8 @@ impl Default for Editor {
             config: Config::default(),
             workspace_root: PathBuf::from("."),
             next_scan_token: 1,
-            search: None,
             next_grep_token: 1,
+            next_shell_token: 1,
             lsp_servers: HashMap::new(),
             servers: HashMap::new(),
             next_server_id: 1,
@@ -156,8 +157,7 @@ impl Default for Editor {
             nav_forward: Vec::new(),
             pending_caret_jumps: HashMap::new(),
             pending_self_disk_updates: HashMap::new(),
-            terminal: None,
-            terminal_selection: None,
+            shell: None,
             terminal_size: (0, 0),
             status: None,
             notifications: Vec::new(),
@@ -189,15 +189,15 @@ impl Editor {
             }
             AppEvent::TextPaste(text) => {
                 if self.focus == Focus::Shell {
-                    if let Some(parser) = &mut self.terminal {
-                        let bracketed = parser.screen().bracketed_paste();
-                        parser.set_scrollback(0);
+                    if let Some(shell) = self.shell.as_mut() {
+                        let bracketed = shell.parser.screen().bracketed_paste();
+                        shell.parser.set_scrollback(0);
                         let mut bytes = text.into_bytes();
                         if bracketed {
                             bytes.splice(0..0, b"\x1b[200~".iter().copied());
                             bytes.extend_from_slice(b"\x1b[201~");
                         }
-                        self.terminal_selection = None;
+                        shell.selection = None;
                         self.dirty = true;
                         return vec![Effect::TerminalInput(bytes)];
                     }
@@ -219,10 +219,10 @@ impl Editor {
             AppEvent::Resize { cols, rows } => {
                 self.terminal_size = (cols, rows);
                 let mut effects = Vec::new();
-                if let Some(parser) = &mut self.terminal {
+                if let Some(shell) = self.shell.as_mut() {
                     let shell_cols = split_right_width(cols).max(1);
                     let shell_rows = rows.saturating_sub(1).max(1);
-                    parser.set_size(shell_rows, shell_cols);
+                    shell.parser.set_size(shell_rows, shell_cols);
                     effects.push(Effect::TerminalResize {
                         cols: shell_cols,
                         rows: shell_rows,
@@ -241,7 +241,7 @@ impl Editor {
                     }
                     return Vec::new();
                 }
-                if self.search.is_some() {
+                if self.search().is_some() {
                     let (pane_x, _, pane_width, _) = self.search_pane_rect();
                     let over_pane =
                         mouse.event.column >= pane_x && mouse.event.column < pane_x + pane_width;
@@ -264,7 +264,7 @@ impl Editor {
                         _ => {}
                     }
                 }
-                let over_terminal = matches!(self.layout, Layout::EditorAndShell { .. })
+                let over_terminal = self.layout.is_shell()
                     && mouse.event.column > split_left_width(self.terminal_size.0);
                 if over_terminal {
                     match mouse.event.kind {
@@ -279,18 +279,25 @@ impl Editor {
                         _ => {}
                     }
                 }
-                let on_split_divider = matches!(
-                    self.layout,
-                    Layout::EditorAndEditor { .. } | Layout::EditorAndShell { .. }
-                ) && mouse.event.column
-                    == split_left_width(self.terminal_size.0);
+                if matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left))
+                    && let Some(forward) =
+                        self.diff_navigator_click(mouse.event.column, mouse.event.row)
+                {
+                    self.jump_diff_hunk(forward);
+                    return Vec::new();
+                }
+                let on_split_divider = self.layout.right.is_some()
+                    && mouse.event.column == split_left_width(self.terminal_size.0);
+                // The diff is a comparison view, not a place to interrogate code:
+                // clicking there must not fire hover or go-to-definition.
+                let lsp_clickable = !on_split_divider && !self.layout.is_diff();
                 let definition =
                     matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left))
                         && mouse.event.modifiers.contains(KeyModifiers::CONTROL)
-                        && !on_split_divider;
+                        && lsp_clickable;
                 let hover = matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left))
                     && !definition
-                    && !on_split_divider;
+                    && lsp_clickable;
                 let copy_shell_selection = self.focus == Focus::Shell
                     && matches!(mouse.event.kind, MouseEventKind::Up(MouseButton::Left));
                 if matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -355,9 +362,9 @@ impl Editor {
                 Vec::new()
             }
             AppEvent::TerminalInput(bytes) => {
-                self.terminal_selection = None;
-                if let Some(parser) = &mut self.terminal {
-                    parser.set_scrollback(0);
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.selection = None;
+                    shell.parser.set_scrollback(0);
                 }
                 self.dirty = true;
                 vec![Effect::TerminalInput(bytes)]
@@ -497,44 +504,53 @@ impl Editor {
         }
         let mut effects = Vec::new();
         for path in paths {
-            // 既に開いているファイルはそのバッファへ切り替える。複製すると同じ
-            // URIを指す文書が増え、古い方を編集したときにLSPサーバーのテキスト
-            // と食い違ってハイライトや診断がズレる。
-            let existing = self
-                .documents
-                .iter()
-                .find_map(|(id, document)| (document.path.as_ref() == Some(&path)).then_some(*id));
-            let id = existing.unwrap_or_else(|| {
-                let id = DocumentId(self.next_doc_id);
-                self.next_doc_id += 1;
-                let mut document = Document::scratch();
-                document.path = Some(path.clone());
-                document.language = self
-                    .config
-                    .language_for_path(&path)
-                    .map(|language| language.name.clone());
-                self.documents.insert(id, document);
-                id
-            });
-            if matches!(self.layout, Layout::EditorAndEditor { diff: true, .. }) {
-                self.layout = Layout::EditorFull(EditorPane {
-                    view: View::new(id),
-                });
+            let (id, load) = self.document_for_path(path);
+            if self.layout.is_diff() {
+                self.show_only(View::new(id));
                 self.focus = Focus::Editor(Side::Left);
             } else if let Some(pane) = self.layout.active_editor_mut(self.focus) {
                 pane.view = View::new(id);
             }
-            let unsaved_edits = existing.is_some_and(|id| {
-                self.documents
-                    .get(&id)
-                    .and_then(crate::document::Document::editable_opt)
-                    .is_some_and(|editable| editable.modified)
-            });
-            if !unsaved_edits {
-                effects.push(Effect::ReadFile { id, path });
-            }
+            effects.extend(load);
         }
         effects
+    }
+
+    /// The document for `path` and the effect that loads its text, without
+    /// touching the layout — callers that place it somewhere other than the
+    /// active pane (the diff picker) need the id without the side effect.
+    fn document_for_path(&mut self, path: PathBuf) -> (DocumentId, Vec<Effect>) {
+        // 既に開いているファイルはそのバッファへ切り替える。複製すると同じ
+        // URIを指す文書が増え、古い方を編集したときにLSPサーバーのテキスト
+        // と食い違ってハイライトや診断がズレる。
+        let existing = self
+            .documents
+            .iter()
+            .find_map(|(id, document)| (document.path.as_ref() == Some(&path)).then_some(*id));
+        let id = existing.unwrap_or_else(|| {
+            let id = DocumentId(self.next_doc_id);
+            self.next_doc_id += 1;
+            let mut document = Document::scratch();
+            document.path = Some(path.clone());
+            document.language = self
+                .config
+                .language_for_path(&path)
+                .map(|language| language.name.clone());
+            self.documents.insert(id, document);
+            id
+        });
+        let unsaved_edits = existing.is_some_and(|id| {
+            self.documents
+                .get(&id)
+                .and_then(crate::document::Document::editable_opt)
+                .is_some_and(|editable| editable.modified)
+        });
+        let effects = if unsaved_edits {
+            Vec::new()
+        } else {
+            vec![Effect::ReadFile { id, path }]
+        };
+        (id, effects)
     }
 
     /// Open a single file and place the caret at `position` once its text loads.
@@ -593,6 +609,62 @@ impl Editor {
 
     pub fn set_workspace_root(&mut self, root: PathBuf) {
         self.workspace_root = root;
+    }
+
+    /// Install `right` as the right pane, dropping whatever it displaced.
+    ///
+    /// Every path that opens a right pane goes through here, so the pane being
+    /// replaced releases its state as a matter of course — the find pane's
+    /// running grep in particular, which would otherwise keep reporting
+    /// progress for a pane that is no longer on screen.
+    fn set_right_pane(&mut self, right: Option<RightPane>) {
+        if let Some(RightPane::Search(_)) = std::mem::replace(&mut self.layout.right, right) {
+            self.finish_progress("grep");
+        }
+        self.dirty = true;
+    }
+
+    /// Show `view` in the left pane on its own, closing the right pane.
+    fn show_only(&mut self, view: View) {
+        self.layout.left = EditorPane { view };
+        self.set_right_pane(None);
+    }
+
+    /// Take the find pane's state, leaving any other kind of right pane alone.
+    fn take_search(&mut self) -> Option<SearchState> {
+        let RightPane::Search(search) = self
+            .layout
+            .right
+            .take_if(|right| matches!(right, RightPane::Search(_)))?
+        else {
+            return None;
+        };
+        self.finish_progress("grep");
+        self.dirty = true;
+        Some(search)
+    }
+
+    /// Columns available to the focused file pane. Only a second file pane can
+    /// hold the caret, so every other kind of right pane leaves the editor on
+    /// the left half.
+    fn active_pane_width(&self) -> u16 {
+        let total = self.terminal_size.0;
+        if self.layout.right.is_none() {
+            return total;
+        }
+        if self.layout.right_editor().is_some() && matches!(self.focus, Focus::Editor(Side::Right))
+        {
+            return split_right_width(total);
+        }
+        split_left_width(total)
+    }
+
+    fn search(&self) -> Option<&SearchState> {
+        self.layout.search()
+    }
+
+    fn search_mut(&mut self) -> Option<&mut SearchState> {
+        self.layout.search_mut()
     }
 
     pub fn split_buffers(&self) -> Option<(ActiveBuffer<'_>, ActiveBuffer<'_>, bool)> {
@@ -683,9 +755,9 @@ impl Editor {
             .collect();
         Some(PickerView {
             title: match picker.mode {
-                PickerMode::Directory => "Open file",
+                PickerMode::Directory => "Open file · / ~ ../ でパス補完",
                 PickerMode::Buffer => "Open buffer",
-                PickerMode::Diff => "Compare with buffer",
+                PickerMode::Diff => "Compare with · buffer or file · / ~ ../ でパス補完",
                 PickerMode::Command => "Command Palette · key / command / description",
             },
             query: picker.query.clone(),
@@ -698,7 +770,7 @@ impl Editor {
     }
 
     pub fn search_view(&self) -> Option<SearchView> {
-        let search = self.search.as_ref()?;
+        let search = self.search()?;
         let items = search
             .hits
             .iter()
@@ -792,20 +864,23 @@ impl Editor {
     }
 
     pub fn terminal_contents(&self) -> Option<String> {
-        self.terminal
+        self.shell
             .as_ref()
-            .map(|parser| parser.screen().contents())
+            .map(|shell| shell.parser.screen().contents())
     }
 
     pub fn terminal_screen(&self) -> Option<&vt100::Screen> {
-        self.terminal_selection
-            .as_ref()
-            .map(|selection| &selection.snapshot)
-            .or_else(|| self.terminal.as_ref().map(vt100::Parser::screen))
+        let shell = self.shell.as_ref()?;
+        Some(
+            shell
+                .selection
+                .as_ref()
+                .map_or_else(|| shell.parser.screen(), |selection| &selection.snapshot),
+        )
     }
 
     pub fn terminal_selection_view(&self) -> Option<TerminalSelectionView> {
-        let selection = self.terminal_selection.as_ref()?;
+        let selection = self.shell.as_ref()?.selection.as_ref()?;
         (selection.anchor != selection.head).then(|| {
             let (start, end) = ordered_terminal_points(selection.anchor, selection.head);
             TerminalSelectionView { start, end }
@@ -816,12 +891,18 @@ impl Editor {
         self.focus == Focus::Shell
     }
 
+    /// Whether anything occupies the right half, whatever kind of pane it is.
+    /// The editor gets the left half in that case.
+    pub fn is_split(&self) -> bool {
+        self.layout.right.is_some()
+    }
+
     pub fn shell_visible(&self) -> bool {
-        matches!(self.layout, Layout::EditorAndShell { .. })
+        self.layout.is_shell()
     }
 
     pub fn search_pane_visible(&self) -> bool {
-        self.search.is_some()
+        self.layout.search().is_some()
     }
 
     pub fn focused_side(&self) -> Side {
@@ -1045,9 +1126,7 @@ impl Editor {
                         .language_for_path(&path)
                         .map(|language| language.name.clone());
                     self.documents.insert(id, document);
-                    self.layout = Layout::EditorFull(EditorPane {
-                        view: View::new(id),
-                    });
+                    self.show_only(View::new(id));
                     self.status = Some(format!("新規ファイル: {}", path.display()));
                     effects.extend(self.start_or_open_lsp(id));
                 } else if inside_root {
@@ -1262,7 +1341,7 @@ impl Editor {
                                     );
                                     view.selections.set_single(Selection::caret(index));
                                 }
-                                self.layout = Layout::EditorFull(EditorPane { view });
+                                self.show_only(view);
                                 // The new view starts scrolled to the top; reveal the
                                 // definition with context so its body isn't pushed
                                 // just past the bottom edge.
@@ -2214,9 +2293,7 @@ impl Editor {
             self.apply_text_edits(doc, edits);
         }
         if self.documents.contains_key(&preferred_doc) {
-            self.layout = Layout::EditorFull(EditorPane {
-                view: View::new(preferred_doc),
-            });
+            self.show_only(View::new(preferred_doc));
         }
         if !external_edits.is_empty() {
             self.notify(
@@ -2423,7 +2500,16 @@ impl Editor {
                 extend,
             } => self.move_active(direction, unit, extend),
             Command::SelectAll => self.select_all(),
-            Command::CollapseSelections => self.collapse_selections(),
+            Command::CollapseSelections => {
+                // The diff is display-only, so Esc backs out of it. Selections
+                // there exist only for copying, and are not what you are trying
+                // to escape from.
+                if self.layout.is_diff() {
+                    self.close_diff();
+                } else {
+                    self.collapse_selections();
+                }
+            }
             Command::AddCursor { direction } => self.add_cursor(direction),
             Command::SelectNextOccurrence => self.select_next_occurrence(),
             Command::Copy => return self.copy_active(true),
@@ -2463,8 +2549,16 @@ impl Editor {
             }
             Command::Save => return self.save_active(),
             Command::OpenDirectoryPicker => return self.open_directory_picker(),
-            Command::OpenBufferPicker => self.open_picker(PickerMode::Buffer),
-            Command::OpenDiffPicker => self.open_picker(PickerMode::Diff),
+            Command::OpenBufferPicker => return self.open_picker(PickerMode::Buffer),
+            Command::OpenDiffPicker => {
+                // F6 over an open diff closes it instead of starting another
+                // comparison, so the key that opens it also puts it away.
+                if self.layout.is_diff() {
+                    self.close_diff();
+                } else {
+                    return self.open_picker(PickerMode::Diff);
+                }
+            }
             Command::OpenCommandPalette => self.open_command_palette(),
             Command::OpenSearch => return self.open_search(false, SearchScope::CurrentBuffer),
             Command::OpenReplace => return self.open_search(true, SearchScope::CurrentBuffer),
@@ -2480,18 +2574,18 @@ impl Editor {
                 if let Some(rename) = &mut self.rename_input {
                     rename.pop();
                     self.dirty = true;
-                } else if self.search.is_some() {
+                } else if self.search().is_some() {
                     self.backspace_search_char();
                     return self.refresh_search();
                 } else if let Some(picker) = &mut self.picker {
                     picker.query.pop();
-                    self.refresh_picker();
+                    return self.picker_query_changed();
                 }
             }
             Command::PickerConfirm => return self.confirm_picker(),
             Command::PickerCancel => self.close_picker(),
             Command::Cancel => {
-                if self.search.is_none() {
+                if self.search().is_none() {
                     self.close_picker();
                 }
             }
@@ -2499,7 +2593,7 @@ impl Editor {
                 if self.completion.is_some() {
                     return self.confirm_picker();
                 }
-                if let Some(search) = &mut self.search {
+                if let Some(search) = self.search_mut() {
                     match search.editing_filter {
                         Some(SearchFilterField::Include) => {
                             search.editing_filter = Some(SearchFilterField::Exclude);
@@ -2541,13 +2635,13 @@ impl Editor {
                 });
             }
             Command::SearchToggleIgnore => {
-                if let Some(search) = &mut self.search {
+                if let Some(search) = self.search_mut() {
                     search.filters.respect_ignore_files = !search.filters.respect_ignore_files;
                     return self.refresh_search();
                 }
             }
             Command::SearchToggleHidden => {
-                if let Some(search) = &mut self.search {
+                if let Some(search) = self.search_mut() {
                     search.filters.include_hidden = !search.filters.include_hidden;
                     return self.refresh_search();
                 }
@@ -2570,6 +2664,8 @@ impl Editor {
             Command::Format => return self.request_formatting(),
             Command::ToggleShell => return self.toggle_shell(),
             Command::ToggleSplit => self.toggle_split(),
+            Command::DiffNextHunk => self.jump_diff_hunk(true),
+            Command::DiffPrevHunk => self.jump_diff_hunk(false),
             Command::CloseBuffer => return self.close_active_buffer(),
             Command::Indent => self.indent_selected_lines(false),
             Command::Outdent => self.indent_selected_lines(true),
@@ -2604,72 +2700,62 @@ impl Editor {
     }
 
     fn toggle_shell(&mut self) -> Vec<Effect> {
-        match &self.layout {
-            Layout::EditorAndShell { editor } => {
-                self.layout = Layout::EditorFull(EditorPane {
-                    view: editor.view.clone(),
-                });
-                self.focus = Focus::Editor(Side::Left);
-                self.terminal_selection = None;
-                self.dirty = true;
-                Vec::new()
-            }
-            _ => {
-                let Some(view) = self
-                    .layout
-                    .active_editor(self.focus)
-                    .map(|pane| pane.view.clone())
-                else {
-                    return Vec::new();
-                };
-                self.layout = Layout::EditorAndShell {
-                    editor: EditorPane { view },
-                };
-                self.focus = Focus::Shell;
-                self.dismiss_hover();
-                self.dirty = true;
-                if self.terminal.is_some() {
-                    return Vec::new();
-                }
-                self.terminal = Some(vt100::Parser::new(
-                    self.terminal_size.1.saturating_sub(1),
-                    split_right_width(self.terminal_size.0),
-                    TERMINAL_SCROLLBACK_LINES,
-                ));
-                vec![Effect::SpawnShell {
-                    cols: split_right_width(self.terminal_size.0).max(1),
-                    rows: self.terminal_size.1.saturating_sub(1).max(1),
-                    shell: self.config.editor.shell.clone(),
-                }]
-            }
+        if self.layout.is_shell() {
+            // Hide the pane only. The session keeps running so that reopening
+            // comes back to the same shell with its scrollback intact.
+            self.set_right_pane(None);
+            self.focus = Focus::Editor(Side::Left);
+            return Vec::new();
         }
+        self.set_right_pane(Some(RightPane::Shell));
+        self.focus = Focus::Shell;
+        self.dismiss_hover();
+        if self.shell.is_some() {
+            return Vec::new();
+        }
+        // Nothing to resume — either this is the first Ctrl+O or the last shell
+        // exited, which drops the session precisely so this spawns a new one.
+        //
+        // A zero-sized grid panics inside vt100, and the size is still (0, 0)
+        // until the first resize arrives.
+        let rows = self.terminal_size.1.saturating_sub(1).max(1);
+        let cols = split_right_width(self.terminal_size.0).max(1);
+        let token = self.next_shell_token;
+        self.next_shell_token += 1;
+        self.shell = Some(ShellSession {
+            token,
+            parser: vt100::Parser::new(rows, cols, TERMINAL_SCROLLBACK_LINES),
+            selection: None,
+        });
+        vec![Effect::SpawnShell {
+            token,
+            cols,
+            rows,
+            shell: self.config.editor.shell.clone(),
+        }]
+    }
+
+    /// Leave the diff, back to the file that was on the left.
+    fn close_diff(&mut self) {
+        if !self.layout.is_diff() {
+            return;
+        }
+        self.set_right_pane(None);
+        self.focus = Focus::Editor(Side::Left);
     }
 
     fn toggle_split(&mut self) {
-        match &self.layout {
-            Layout::EditorAndEditor { left, .. } => {
-                self.layout = Layout::EditorFull(EditorPane {
-                    view: left.view.clone(),
-                });
-                self.focus = Focus::Editor(Side::Left);
-            }
-            _ => {
-                let Some(view) = self
-                    .layout
-                    .active_editor(self.focus)
-                    .map(|pane| pane.view.clone())
-                else {
-                    return;
-                };
-                self.layout = Layout::EditorAndEditor {
-                    left: EditorPane { view: view.clone() },
-                    right: EditorPane { view },
-                    diff: false,
-                };
-                self.focus = Focus::Editor(Side::Right);
-            }
+        if self.layout.is_editor_split() {
+            self.set_right_pane(None);
+            self.focus = Focus::Editor(Side::Left);
+            return;
         }
-        self.dirty = true;
+        // Over any other right pane — the diff, find, the shell — this takes the
+        // half over rather than merely dismissing it, the same way Ctrl+O and
+        // Ctrl+F do. The diff has Esc and F6 for closing.
+        let view = self.layout.left.view.clone();
+        self.set_right_pane(Some(RightPane::Editor(EditorPane { view })));
+        self.focus = Focus::Editor(Side::Right);
     }
 
     fn close_active_buffer(&mut self) -> Vec<Effect> {
@@ -2719,16 +2805,12 @@ impl Editor {
         }
         self.pending_self_disk_updates.remove(&id);
         if let Some(next) = self.documents.keys().next().copied() {
-            self.layout = Layout::EditorFull(EditorPane {
-                view: View::new(next),
-            });
+            self.show_only(View::new(next));
         } else {
             let id = DocumentId(self.next_doc_id);
             self.next_doc_id += 1;
             self.documents.insert(id, Document::scratch());
-            self.layout = Layout::EditorFull(EditorPane {
-                view: View::new(id),
-            });
+            self.show_only(View::new(id));
         }
         self.focus = Focus::Editor(Side::Left);
         self.dirty = true;
@@ -2898,26 +2980,34 @@ impl Editor {
     }
 
     fn apply_terminal(&mut self, event: TerminalEvent) {
-        let mut dirty = true;
-        match event {
-            TerminalEvent::Output(bytes) => {
-                if let Some(parser) = &mut self.terminal {
-                    parser.process(&bytes);
-                }
-                dirty = self.terminal_selection.is_none();
-            }
-            TerminalEvent::Exited(error) => {
-                if let Layout::EditorAndShell { editor } = &self.layout {
-                    self.layout = Layout::EditorFull(EditorPane {
-                        view: editor.view.clone(),
-                    });
-                }
-                self.focus = Focus::Editor(Side::Left);
-                self.terminal = None;
-                self.terminal_selection = None;
-                self.status = error;
-            }
+        // A replaced shell's reader thread reports its exit only after the
+        // successor is already running, so events name the session they came
+        // from and anything but the current one is ignored.
+        if self
+            .shell
+            .as_ref()
+            .is_none_or(|shell| shell.token != event.token())
+        {
+            return;
         }
+        let dirty = match event {
+            TerminalEvent::Output { bytes, .. } => {
+                let shell = self.shell.as_mut().expect("checked above");
+                shell.parser.process(&bytes);
+                shell.selection.is_none()
+            }
+            TerminalEvent::Exited { error, .. } => {
+                // Drop the session so the next Ctrl+O starts a new shell rather
+                // than reopening a dead one.
+                self.shell = None;
+                if self.layout.is_shell() {
+                    self.set_right_pane(None);
+                    self.focus = Focus::Editor(Side::Left);
+                }
+                self.status = error;
+                true
+            }
+        };
         self.dirty |= dirty;
     }
 
@@ -3163,7 +3253,11 @@ impl Editor {
     }
 
     fn copy_shell_selection(&self, send_interrupt_if_empty: bool) -> Vec<Effect> {
-        let Some(selection) = &self.terminal_selection else {
+        let Some(selection) = self
+            .shell
+            .as_ref()
+            .and_then(|shell| shell.selection.as_ref())
+        else {
             return if self.focus == Focus::Shell && send_interrupt_if_empty {
                 vec![Effect::TerminalInput(vec![3])]
             } else {
@@ -3188,11 +3282,11 @@ impl Editor {
     }
 
     fn terminal_mouse_position(&self, column: u16, row: u16) -> Option<(u16, u16)> {
-        if !matches!(self.layout, Layout::EditorAndShell { .. }) {
+        if !self.layout.is_shell() {
             return None;
         }
         let start = split_left_width(self.terminal_size.0).saturating_add(1);
-        let screen = self.terminal.as_ref()?.screen();
+        let screen = self.shell.as_ref()?.parser.screen();
         let (rows, cols) = screen.size();
         if column < start || row >= rows || cols == 0 {
             return None;
@@ -3207,39 +3301,33 @@ impl Editor {
             MouseEventKind::ScrollDown => self.scroll_active(3),
             MouseEventKind::Down(MouseButton::Left) => {
                 let divider = split_left_width(self.terminal_size.0);
-                if matches!(
-                    self.layout,
-                    Layout::EditorAndEditor { .. } | Layout::EditorAndShell { .. }
-                ) && mouse.column == divider
-                {
+                if self.layout.right.is_some() && mouse.column == divider {
                     return;
                 }
                 let right_half = mouse.column > divider;
-                match &self.layout {
-                    Layout::EditorAndEditor { .. } => {
-                        self.focus =
-                            Focus::Editor(if right_half { Side::Right } else { Side::Left });
-                    }
-                    Layout::EditorAndShell { .. } if right_half => {
+                if self.layout.right_editor().is_some() {
+                    self.focus = Focus::Editor(if right_half { Side::Right } else { Side::Left });
+                } else if self.layout.is_shell() {
+                    if right_half {
                         self.focus = Focus::Shell;
                         self.dismiss_hover();
-                        if let Some(point) = self.terminal_mouse_position(mouse.column, mouse.row)
-                            && let Some(parser) = &self.terminal
+                        let point = self.terminal_mouse_position(mouse.column, mouse.row);
+                        if let Some(shell) = self.shell.as_mut()
+                            && let Some(point) = point
                         {
-                            self.terminal_selection = Some(TerminalSelection {
+                            shell.selection = Some(TerminalSelection {
                                 anchor: point,
                                 head: point,
-                                snapshot: parser.screen().clone(),
+                                snapshot: shell.parser.screen().clone(),
                             });
                         }
                         self.dirty = true;
                         return;
                     }
-                    Layout::EditorAndShell { .. } => {
-                        self.focus = Focus::Editor(Side::Left);
-                        self.terminal_selection = None;
+                    self.focus = Focus::Editor(Side::Left);
+                    if let Some(shell) = self.shell.as_mut() {
+                        shell.selection = None;
                     }
-                    Layout::EditorFull(_) => {}
                 }
                 let Some(index) = self.mouse_position(mouse.column, mouse.row) else {
                     return;
@@ -3289,8 +3377,12 @@ impl Editor {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.focus == Focus::Shell {
-                    if let Some(point) = self.terminal_mouse_position(mouse.column, mouse.row)
-                        && let Some(selection) = &mut self.terminal_selection
+                    let point = self.terminal_mouse_position(mouse.column, mouse.row);
+                    if let Some(point) = point
+                        && let Some(selection) = self
+                            .shell
+                            .as_mut()
+                            .and_then(|shell| shell.selection.as_mut())
                     {
                         selection.head = point;
                         self.dirty = true;
@@ -3313,12 +3405,13 @@ impl Editor {
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag_anchor = None;
                 if self.focus == Focus::Shell
-                    && self
-                        .terminal_selection
+                    && let Some(shell) = self.shell.as_mut()
+                    && shell
+                        .selection
                         .as_ref()
                         .is_some_and(|selection| selection.anchor == selection.head)
                 {
-                    self.terminal_selection = None;
+                    shell.selection = None;
                     self.dirty = true;
                 }
             }
@@ -3326,15 +3419,14 @@ impl Editor {
         }
     }
 
-    fn open_picker(&mut self, mode: PickerMode) {
-        if mode == PickerMode::Buffer
-            && self
-                .picker
-                .as_ref()
-                .is_some_and(|picker| picker.mode == PickerMode::Buffer)
+    fn open_picker(&mut self, mode: PickerMode) -> Vec<Effect> {
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.mode == mode)
         {
             self.close_picker();
-            return;
+            return Vec::new();
         }
         if self.picker.is_some() {
             self.close_picker();
@@ -3345,7 +3437,7 @@ impl Editor {
             .active_editor(self.focus)
             .map(|pane| pane.view.doc)
         else {
-            return;
+            return Vec::new();
         };
         let base_path = self
             .documents
@@ -3363,15 +3455,18 @@ impl Editor {
             .map(|(id, _)| *id)
             .map(PickerCandidate::Document)
             .collect();
-        if candidates.is_empty() {
-            self.status = Some(match mode {
-                PickerMode::Buffer => "他に開いているバッファがありません".to_owned(),
-                PickerMode::Diff => "比較できる別のバッファがありません".to_owned(),
-                PickerMode::Directory | PickerMode::Command => unreachable!(),
-            });
+        // Diff also offers files that are not open yet, so an empty buffer list
+        // is not a dead end there.
+        if candidates.is_empty() && mode != PickerMode::Diff {
+            self.status = Some("他に開いているバッファがありません".to_owned());
             self.dirty = true;
-            return;
+            return Vec::new();
         }
+        let scan_token = (mode == PickerMode::Diff).then(|| {
+            let token = self.next_scan_token;
+            self.next_scan_token += 1;
+            token
+        });
         self.dismiss_search_for_overlay();
         self.picker = Some(PickerState {
             mode,
@@ -3385,10 +3480,20 @@ impl Editor {
             query: String::new(),
             selected: 0,
             ranking_cache: Vec::new(),
-            scan_token: None,
+            scan_token,
+            path_listing_start: None,
         });
         self.focus = Focus::Overlay;
         self.dirty = true;
+        scan_token
+            .map(|token| {
+                self.set_progress("file-scan", "ファイルを走査中…");
+                vec![Effect::StartFileScan {
+                    root: self.workspace_root.clone(),
+                    token,
+                }]
+            })
+            .unwrap_or_default()
     }
 
     fn open_command_palette(&mut self) {
@@ -3418,6 +3523,7 @@ impl Editor {
             selected: 0,
             ranking_cache: Vec::new(),
             scan_token: None,
+            path_listing_start: None,
         });
         self.focus = Focus::Overlay;
         self.dirty = true;
@@ -3457,6 +3563,7 @@ impl Editor {
             selected: 0,
             ranking_cache: Vec::new(),
             scan_token: Some(token),
+            path_listing_start: None,
         });
         self.focus = Focus::Overlay;
         self.status = Some("ファイルを走査中…".to_owned());
@@ -3469,22 +3576,28 @@ impl Editor {
     }
 
     fn dismiss_search_for_overlay(&mut self) {
-        if self.search.take().is_some() {
-            self.finish_progress("grep");
-        }
+        self.take_search();
     }
 
     fn apply_file_scan(&mut self, event: FileScanEvent) {
         match event {
             FileScanEvent::Batch { token, paths } => {
-                if let Some(picker) = &mut self.picker
-                    && picker.mode == PickerMode::Directory
-                    && picker.scan_token == Some(token)
-                {
+                if self.picker.as_ref().and_then(|picker| picker.scan_token) == Some(token) {
+                    // A file already open is offered as its buffer, so drop the
+                    // scanned duplicate rather than listing it twice.
+                    let open: HashSet<_> = self
+                        .documents
+                        .values()
+                        .filter_map(|document| document.path.clone())
+                        .collect();
+                    let picker = self.picker.as_mut().expect("checked above");
                     let start = picker.candidates.len();
-                    picker
-                        .candidates
-                        .extend(paths.into_iter().map(PickerCandidate::Path));
+                    picker.candidates.extend(
+                        paths
+                            .into_iter()
+                            .filter(|path| !open.contains(path))
+                            .map(PickerCandidate::Path),
+                    );
                     picker.ranking_cache.clear();
                     if picker.query.is_empty() {
                         picker.filtered.extend(start..picker.candidates.len());
@@ -3492,6 +3605,29 @@ impl Editor {
                         self.refresh_picker();
                     }
                 }
+            }
+            FileScanEvent::PathCompletions { token, paths } => {
+                let Some(picker) = &mut self.picker else {
+                    return;
+                };
+                if picker.scan_token != Some(token) {
+                    return;
+                }
+                // The whole answer for the path typed so far, so it replaces the
+                // previous listing rather than adding to it. The picker's own
+                // candidates stay underneath for when the query stops being a path.
+                let start = picker.path_listing_start.unwrap_or(picker.candidates.len());
+                picker.candidates.truncate(start);
+                picker
+                    .candidates
+                    .extend(paths.into_iter().map(PickerCandidate::Path));
+                picker.path_listing_start = Some(start);
+                picker.filtered = (start..picker.candidates.len()).collect();
+                picker.ranking_cache.clear();
+                picker.selected = 0;
+                picker.scan_token = None;
+                self.finish_progress("file-scan");
+                self.dirty = true;
             }
             FileScanEvent::Done { token } => {
                 if let Some(picker) = &mut self.picker
@@ -3516,7 +3652,7 @@ impl Editor {
     }
 
     fn open_search(&mut self, replace: bool, scope: SearchScope) -> Vec<Effect> {
-        if self.search.is_some() {
+        if self.layout.search().is_some() {
             // Ctrl+F only toggles the pane's visibility; scope and options are
             // adjusted with the mouse inside the pane.
             return self.close_search_pane();
@@ -3525,7 +3661,7 @@ impl Editor {
         let _ = replace;
         self.picker = None;
         self.dismiss_hover();
-        self.search = Some(SearchState {
+        let search = SearchState {
             query: String::new(),
             replacement: None,
             editing_replace: false,
@@ -3546,14 +3682,14 @@ impl Editor {
             grep_token: None,
             field_cursor: 0,
             results_scroll: 0,
-        });
+        };
+        self.set_right_pane(Some(RightPane::Search(search)));
         self.focus = Focus::Overlay;
-        self.dirty = true;
         Vec::new()
     }
 
     fn toggle_replace_field(&mut self) {
-        if let Some(search) = &mut self.search {
+        if let Some(search) = self.search_mut() {
             if search.replacement.is_some() {
                 search.replacement = None;
                 search.editing_replace = false;
@@ -3570,8 +3706,7 @@ impl Editor {
     /// Jump to and open the file for the given result index, closing the pane.
     fn open_search_hit(&mut self, index: usize) -> Vec<Effect> {
         let Some(hit) = self
-            .search
-            .as_ref()
+            .search()
             .and_then(|search| search.hits.get(index).cloned())
         else {
             return Vec::new();
@@ -3585,7 +3720,7 @@ impl Editor {
                     anchor: CharIdx(range.start),
                     head: CharIdx(range.end),
                 });
-                self.layout = Layout::EditorFull(EditorPane { view });
+                self.show_only(view);
                 // The fresh view is scrolled to the top; reveal the match with
                 // surrounding context rather than pinning it to the bottom edge.
                 self.reveal_caret_with_context();
@@ -3597,7 +3732,7 @@ impl Editor {
                 }) {
                     let mut view = View::new(*doc);
                     view.scroll.top_line = hit.line;
-                    self.layout = Layout::EditorFull(EditorPane { view });
+                    self.show_only(view);
                     Vec::new()
                 } else {
                     // Not open yet: land on the matched line once it loads instead
@@ -3606,14 +3741,13 @@ impl Editor {
                 }
             }
         };
-        self.search = None;
-        self.dirty = true;
+        self.take_search();
         effects
     }
 
     /// The "Run Replace" button: replace every match in one shot.
     fn run_replace(&mut self) -> Vec<Effect> {
-        let Some(search) = self.search.take() else {
+        let Some(search) = self.take_search() else {
             return Vec::new();
         };
         let Some(replacement) = search.replacement else {
@@ -3685,16 +3819,14 @@ impl Editor {
     }
 
     fn close_search_pane(&mut self) -> Vec<Effect> {
-        if self.search.take().is_some() {
-            self.finish_progress("grep");
+        if self.take_search().is_some() {
             self.focus = Focus::Editor(self.focused_side());
-            self.dirty = true;
         }
         Vec::new()
     }
 
     fn set_search_scope(&mut self, scope: SearchScope) -> Vec<Effect> {
-        if let Some(search) = &mut self.search {
+        if let Some(search) = self.search_mut() {
             if search.scope == scope {
                 return Vec::new();
             }
@@ -3722,7 +3854,7 @@ impl Editor {
         {
             return None;
         }
-        let search = self.search.as_ref()?;
+        let search = self.search()?;
         let directory = search.scope == SearchScope::Directory;
         let replace_enabled = search.replacement.is_some();
         let layout = search_pane_layout(directory, replace_enabled);
@@ -3788,17 +3920,14 @@ impl Editor {
         }
         if relative > layout.results_top {
             let index = usize::from(relative - layout.results_top - 1)
-                + self
-                    .search
-                    .as_ref()
-                    .map_or(0, |search| search.results_scroll);
+                + self.search().map_or(0, |search| search.results_scroll);
             return Some(self.open_search_hit(index));
         }
         Some(Vec::new())
     }
 
     fn focus_search_field(&mut self, filter: Option<SearchFilterField>, replace: bool) {
-        if let Some(search) = &mut self.search {
+        if let Some(search) = self.search_mut() {
             search.editing_filter = filter;
             search.editing_replace = replace && search.replacement.is_some();
             search.field_cursor = search_field_len(search);
@@ -3807,7 +3936,7 @@ impl Editor {
     }
 
     fn cycle_search_scope(&mut self) -> Vec<Effect> {
-        if let Some(search) = &mut self.search {
+        if let Some(search) = self.search_mut() {
             search.scope = match search.scope {
                 SearchScope::CurrentBuffer => SearchScope::AllBuffers,
                 SearchScope::AllBuffers => SearchScope::Directory,
@@ -3818,7 +3947,7 @@ impl Editor {
     }
 
     fn refresh_search(&mut self) -> Vec<Effect> {
-        let Some(search) = &self.search else {
+        let Some(search) = self.search() else {
             return Vec::new();
         };
         let query = search.query.clone();
@@ -3828,7 +3957,7 @@ impl Editor {
         filters.include = split_globs(&search.include_input);
         filters.exclude = split_globs(&search.exclude_input);
         if query.is_empty() {
-            if let Some(search) = &mut self.search {
+            if let Some(search) = self.search_mut() {
                 search.hits.clear();
                 search.current = 0;
             }
@@ -3847,7 +3976,7 @@ impl Editor {
         if scope == SearchScope::Directory || large_path.is_some() {
             let token = self.next_grep_token;
             self.next_grep_token += 1;
-            if let Some(search) = &mut self.search {
+            if let Some(search) = self.search_mut() {
                 search.hits.clear();
                 search.grep_token = Some(token);
             }
@@ -3898,7 +4027,7 @@ impl Editor {
                 });
             }
         }
-        if let Some(search) = &mut self.search {
+        if let Some(search) = self.search_mut() {
             search.hits = hits;
             search.current = search.current.min(search.hits.len().saturating_sub(1));
         }
@@ -3907,7 +4036,7 @@ impl Editor {
     }
 
     fn toggle_search_option(&mut self, toggle: impl FnOnce(&mut SearchOptions)) -> Vec<Effect> {
-        if let Some(search) = &mut self.search {
+        if let Some(search) = self.search_mut() {
             toggle(&mut search.options);
             return self.refresh_search();
         }
@@ -3915,7 +4044,7 @@ impl Editor {
     }
 
     fn apply_grep(&mut self, event: GrepEvent) {
-        let Some(search) = &mut self.search else {
+        let Some(search) = self.search_mut() else {
             return;
         };
         let finished = match event {
@@ -3940,7 +4069,7 @@ impl Editor {
     }
 
     fn active_search_field_mut(&mut self) -> Option<&mut String> {
-        let search = self.search.as_mut()?;
+        let search = self.search_mut()?;
         match search.editing_filter {
             Some(SearchFilterField::Include) => Some(&mut search.include_input),
             Some(SearchFilterField::Exclude) => Some(&mut search.exclude_input),
@@ -3950,19 +4079,19 @@ impl Editor {
     }
 
     fn insert_search_char(&mut self, character: char) {
-        let cursor = self.search.as_ref().map_or(0, |search| search.field_cursor);
+        let cursor = self.search().map_or(0, |search| search.field_cursor);
         let Some(field) = self.active_search_field_mut() else {
             return;
         };
         let byte = char_byte_index(field, cursor);
         field.insert(byte, character);
-        if let Some(search) = &mut self.search {
+        if let Some(search) = self.search_mut() {
             search.field_cursor = cursor + 1;
         }
     }
 
     fn backspace_search_char(&mut self) {
-        let cursor = self.search.as_ref().map_or(0, |search| search.field_cursor);
+        let cursor = self.search().map_or(0, |search| search.field_cursor);
         if cursor == 0 {
             return;
         }
@@ -3971,13 +4100,13 @@ impl Editor {
             let start = char_byte_index(field, cursor - 1);
             field.replace_range(start..end, "");
         }
-        if let Some(search) = &mut self.search {
+        if let Some(search) = self.search_mut() {
             search.field_cursor = cursor - 1;
         }
     }
 
     fn move_search_cursor(&mut self, right: bool) {
-        if let Some(search) = &mut self.search {
+        if let Some(search) = self.search_mut() {
             let len = search_field_len(search);
             search.field_cursor = if right {
                 (search.field_cursor + 1).min(len)
@@ -3989,7 +4118,7 @@ impl Editor {
     }
 
     fn scroll_search_results(&mut self, delta: isize) {
-        if let Some(search) = &mut self.search {
+        if let Some(search) = self.search_mut() {
             let max = search.hits.len().saturating_sub(1);
             search.results_scroll = if delta < 0 {
                 search.results_scroll.saturating_sub(delta.unsigned_abs())
@@ -4006,16 +4135,45 @@ impl Editor {
             self.dirty = true;
             return Vec::new();
         }
-        if self.search.is_some() {
+        if self.search().is_some() {
             self.insert_search_char(character);
             return self.refresh_search();
         }
         if let Some(picker) = &mut self.picker {
             picker.query.push(character);
-            self.refresh_picker();
             self.dirty = true;
+            return self.picker_query_changed();
         }
         Vec::new()
+    }
+
+    /// Re-rank after the query changed, and ask for a directory listing when the
+    /// query became a path — the workspace scan cannot answer those.
+    fn picker_query_changed(&mut self) -> Vec<Effect> {
+        let Some(picker) = &mut self.picker else {
+            return Vec::new();
+        };
+        if !picker.accepts_paths() || !is_path_query(&picker.query) {
+            // Back to a fuzzy pattern: drop the listing so the picker's own
+            // candidates are what gets ranked.
+            if let Some(start) = picker.path_listing_start.take() {
+                picker.candidates.truncate(start);
+                picker.ranking_cache.clear();
+                picker.selected = 0;
+            }
+            self.refresh_picker();
+            return Vec::new();
+        }
+        let input = picker.query.clone();
+        let token = self.next_scan_token;
+        self.next_scan_token += 1;
+        self.picker.as_mut().expect("picker exists").scan_token = Some(token);
+        self.refresh_picker();
+        vec![Effect::ListPathCompletions {
+            input,
+            root: self.workspace_root.clone(),
+            token,
+        }]
     }
 
     fn refresh_picker(&mut self) {
@@ -4023,6 +4181,16 @@ impl Editor {
             return;
         };
         let query = picker.query.clone();
+        if let Some(start) = picker.path_listing_start {
+            // Already prefix-filtered by the directory listing; fuzzy-matching a
+            // path against workspace-relative labels would only throw it away.
+            let ranking: Vec<_> = (start..picker.candidates.len()).collect();
+            let picker = self.picker.as_mut().expect("picker exists");
+            picker.selected = picker.selected.min(ranking.len().saturating_sub(1));
+            picker.filtered = ranking;
+            self.dirty = true;
+            return;
+        }
         if let Some(cached) = picker
             .ranking_cache
             .iter()
@@ -4049,14 +4217,25 @@ impl Editor {
             .enumerate()
             .filter_map(|(index, candidate)| {
                 let label = self.candidate_label(candidate);
-                matcher
-                    .fuzzy_match(&label, &query)
-                    .map(|score| (index, score))
+                matcher.fuzzy_match(&label, &query).map(|score| {
+                    (
+                        index,
+                        score,
+                        matches!(candidate, PickerCandidate::Document(_)),
+                    )
+                })
             })
             .collect();
-        scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+        // Equal scores go to the open buffer: the diff picker offers unopened
+        // files too, and what you already have open is the likelier target.
+        scored.sort_by_key(|(_, score, is_open_buffer)| {
+            (
+                std::cmp::Reverse(*score),
+                std::cmp::Reverse(*is_open_buffer),
+            )
+        });
         let picker = self.picker.as_mut().expect("picker exists");
-        picker.filtered = scored.into_iter().map(|(index, _)| index).collect();
+        picker.filtered = scored.into_iter().map(|(index, _, _)| index).collect();
         picker
             .ranking_cache
             .retain(|(cached_query, _)| cached_query != &query);
@@ -4078,7 +4257,7 @@ impl Editor {
             self.dirty = true;
             return;
         }
-        if self.search.is_some() {
+        if self.search().is_some() {
             // Results are browsed with the mouse wheel, not the keyboard.
             return;
         }
@@ -4184,7 +4363,7 @@ impl Editor {
             }
             return Vec::new();
         }
-        if self.search.is_some() {
+        if self.search().is_some() {
             // The search pane is entirely mouse-driven: results open on click and
             // replacement runs from the button, so Enter does nothing here.
             return Vec::new();
@@ -4216,22 +4395,34 @@ impl Editor {
                 if let Some(pane) = self.layout.active_editor_mut(self.focus) {
                     pane.view = View::new(target);
                 } else {
-                    self.layout = Layout::EditorFull(EditorPane {
-                        view: View::new(target),
-                    });
+                    self.show_only(View::new(target));
                     final_side = Side::Left;
                 }
             }
-            (PickerMode::Diff, PickerCandidate::Document(target)) => {
-                self.layout = Layout::EditorAndEditor {
-                    left: EditorPane {
-                        view: View::new(picker.base),
-                    },
-                    right: EditorPane {
+            (PickerMode::Diff, PickerCandidate::Path(path)) => {
+                let (target, load) = self.document_for_path(path);
+                effects.extend(load);
+                self.layout.left = EditorPane {
+                    view: View::new(picker.base),
+                };
+                self.set_right_pane(Some(RightPane::Diff(DiffPane {
+                    pane: EditorPane {
                         view: View::new(target),
                     },
-                    diff: true,
+                    top_row: 0,
+                })));
+                final_side = Side::Left;
+            }
+            (PickerMode::Diff, PickerCandidate::Document(target)) => {
+                self.layout.left = EditorPane {
+                    view: View::new(picker.base),
                 };
+                self.set_right_pane(Some(RightPane::Diff(DiffPane {
+                    pane: EditorPane {
+                        view: View::new(target),
+                    },
+                    top_row: 0,
+                })));
                 final_side = Side::Left;
             }
             (PickerMode::Command, PickerCandidate::Command(index)) => {
@@ -4264,10 +4455,10 @@ impl Editor {
     }
 
     fn close_picker(&mut self) {
-        let closing_directory = self
+        let scanning = self
             .picker
             .as_ref()
-            .is_some_and(|picker| picker.mode == PickerMode::Directory);
+            .is_some_and(|picker| picker.scan_token.is_some());
         let return_side = self
             .completion
             .as_ref()
@@ -4275,11 +4466,11 @@ impl Editor {
             .or_else(|| self.picker.as_ref().map(|picker| picker.return_side))
             .unwrap_or(Side::Left);
         self.picker = None;
-        self.search = None;
+        self.take_search();
         self.completion = None;
         self.rename_input = None;
         self.confirm = None;
-        if closing_directory {
+        if scanning {
             self.finish_progress("file-scan");
             if self.status.as_deref() == Some("ファイルを走査中…") {
                 self.status = None;
@@ -4393,34 +4584,30 @@ impl Editor {
             .indentation_for_language(document.language.as_deref())
             .0;
         let gutter_width = text.len_lines().max(1).to_string().len().max(2) + 3;
-        let pane_width = if self.search.is_some() {
-            // The search pane occupies the right half; the editor is on the left.
-            split_left_width(self.terminal_size.0)
-        } else {
-            match self.layout {
-                Layout::EditorFull(_) => self.terminal_size.0,
-                Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. }
-                    if matches!(self.focus, Focus::Editor(Side::Right)) =>
-                {
-                    split_right_width(self.terminal_size.0)
-                }
-                Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. } => {
-                    split_left_width(self.terminal_size.0)
-                }
-            }
-        }
-        .max(1);
+        let pane_width = self.active_pane_width().max(1);
         let text_width = pane_width.saturating_sub(gutter_width as u16).max(1);
         let local_column = if matches!(self.focus, Focus::Editor(Side::Right)) {
             column.saturating_sub(split_left_width(self.terminal_size.0).saturating_add(1))
         } else {
             column
         };
-        if matches!(self.layout, Layout::EditorAndEditor { diff: true, .. }) {
-            let line = (pane.view.scroll.top_line + usize::from(row))
-                .min(text.len_lines().saturating_sub(1));
-            let display_col = usize::from(local_column).saturating_sub(6);
-            return Some(display_col_to_char_idx(text, line, display_col, tab_size));
+        if self.layout.is_diff() {
+            // Screen rows are aligned diff rows, which carry the line number
+            // each side contributes — the panes scroll together and neither
+            // side's line numbers run consecutively down the screen.
+            let rows = self.diff_rows()?;
+            let height = usize::from(self.terminal_size.1.saturating_sub(1));
+            let start = self.diff_top_row().min(rows.len().saturating_sub(height));
+            let entry = rows.get(start + usize::from(row))?;
+            let side = if matches!(self.focus, Focus::Editor(Side::Right)) {
+                &entry.right
+            } else {
+                &entry.left
+            };
+            // A blank row is where this side has no line at all; nothing to aim at.
+            let (line, _) = side.as_ref()?;
+            let display_col = usize::from(local_column.saturating_sub(crate::diff::GUTTER_WIDTH));
+            return Some(display_col_to_char_idx(text, *line, display_col, tab_size));
         }
         let mut visual_row = usize::from(row) + pane.view.scroll.wrapped_row_offset;
         let mut line = pane.view.scroll.top_line;
@@ -4438,6 +4625,10 @@ impl Editor {
     }
 
     fn scroll_active(&mut self, amount: isize) {
+        if self.layout.is_diff() {
+            self.scroll_diff(amount);
+            return;
+        }
         let focus = self.focus;
         let (documents, layout) = (&self.documents, &mut self.layout);
         let Some(pane) = layout.active_editor_mut(focus) else {
@@ -4462,18 +4653,119 @@ impl Editor {
     }
 
     fn scroll_terminal(&mut self, amount: isize) {
-        let Some(parser) = &mut self.terminal else {
+        let Some(shell) = self.shell.as_mut() else {
             return;
         };
-        let current = parser.screen().scrollback();
+        let current = shell.parser.screen().scrollback();
         let target = if amount < 0 {
             current.saturating_sub(amount.unsigned_abs())
         } else {
             current.saturating_add(amount as usize)
         };
-        parser.set_scrollback(target);
-        self.terminal_selection = None;
+        shell.parser.set_scrollback(target);
+        shell.selection = None;
         self.dirty = true;
+    }
+
+    /// The aligned rows the diff view is showing, or `None` when the right pane
+    /// is not a diff (or either side has no editable text).
+    fn diff_rows(&self) -> Option<Vec<crate::diff::DiffRow>> {
+        let (left, right, _) = self.layout.split().filter(|_| self.layout.is_diff())?;
+        let left_text = self.documents.get(&left.view.doc)?.editable_opt()?.text();
+        let right_text = self.documents.get(&right.view.doc)?.editable_opt()?.text();
+        Some(crate::diff::aligned(
+            &crate::diff::rope_lines(left_text),
+            &crate::diff::rope_lines(right_text),
+        ))
+    }
+
+    /// Did this click land on the diff navigator's arrows? `Some(true)` means
+    /// next difference.
+    fn diff_navigator_click(&self, column: u16, row: u16) -> Option<bool> {
+        let (current, total) = self.diff_hunk_position()?;
+        let pane_x = split_left_width(self.terminal_size.0).saturating_add(1);
+        crate::render::diff_navigator_hit(
+            pane_x,
+            self.terminal_size.0.saturating_sub(pane_x),
+            current,
+            total,
+            column,
+            row,
+        )
+    }
+
+    fn scroll_diff(&mut self, amount: isize) {
+        // The exact row count needs the alignment; the sum of both line counts
+        // bounds it, and the renderer clamps the last screenful precisely.
+        let max_row = self
+            .layout
+            .split()
+            .map(|(left, right, _)| {
+                [left, right]
+                    .iter()
+                    .map(|pane| {
+                        self.documents
+                            .get(&pane.view.doc)
+                            .and_then(Document::editable_opt)
+                            .map_or(0, |editable| editable.text().len_lines())
+                    })
+                    .sum::<usize>()
+            })
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let Some(diff) = self.layout.diff_mut() else {
+            return;
+        };
+        diff.top_row = if amount < 0 {
+            diff.top_row.saturating_sub(amount.unsigned_abs())
+        } else {
+            (diff.top_row + amount as usize).min(max_row)
+        };
+        self.dirty = true;
+    }
+
+    /// Scroll to the next (or previous) run of changed rows.
+    fn jump_diff_hunk(&mut self, forward: bool) {
+        let Some(rows) = self.diff_rows() else {
+            return;
+        };
+        let starts = crate::diff::hunk_starts(&rows);
+        let Some(diff) = self.layout.diff_mut() else {
+            return;
+        };
+        let current = diff.top_row;
+        let target = if forward {
+            starts.iter().find(|start| **start > current)
+        } else {
+            starts.iter().rev().find(|start| **start < current)
+        };
+        let Some(target) = target.copied() else {
+            self.notify(
+                ToastLevel::Info,
+                if forward {
+                    "最後の差分です"
+                } else {
+                    "最初の差分です"
+                },
+            );
+            return;
+        };
+        diff.top_row = target;
+        self.dirty = true;
+    }
+
+    /// `(current hunk 1-based, total)` for the diff navigator, where "current"
+    /// is the last hunk at or above the top of the view.
+    pub fn diff_hunk_position(&self) -> Option<(usize, usize)> {
+        let rows = self.diff_rows()?;
+        let starts = crate::diff::hunk_starts(&rows);
+        let top = self.layout.diff()?.top_row;
+        let index = starts.iter().filter(|start| **start <= top).count();
+        Some((index, starts.len()))
+    }
+
+    pub fn diff_top_row(&self) -> usize {
+        self.layout.diff().map_or(0, |diff| diff.top_row)
     }
 
     fn edit_active(&mut self, edit: impl FnOnce(&mut Document, &mut View)) {
@@ -4667,22 +4959,7 @@ impl Editor {
             return;
         }
         let rows = usize::from(self.terminal_size.1.saturating_sub(1)).max(1);
-        let pane_cols = if self.search.is_some() {
-            usize::from(split_left_width(self.terminal_size.0))
-        } else {
-            match self.layout {
-                Layout::EditorFull(_) => usize::from(self.terminal_size.0),
-                Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. }
-                    if matches!(self.focus, Focus::Editor(Side::Right)) =>
-                {
-                    usize::from(split_right_width(self.terminal_size.0))
-                }
-                Layout::EditorAndShell { .. } | Layout::EditorAndEditor { .. } => {
-                    usize::from(split_left_width(self.terminal_size.0))
-                }
-            }
-        }
-        .max(1);
+        let pane_cols = usize::from(self.active_pane_width()).max(1);
         let focus = self.focus;
         let tab_size = self
             .layout
@@ -4815,8 +5092,20 @@ const COMMAND_PALETTE: &[CommandPaletteEntry] = &[
     CommandPaletteEntry {
         key: "F6",
         name: "Diff / バッファ比較",
-        description: "比較対象を選び左右diff表示",
+        description: "比較対象を選び左右diff表示。表示中はEsc/F6で閉じる",
         command: Command::OpenDiffPicker,
+    },
+    CommandPaletteEntry {
+        key: "F7",
+        name: "Prev Diff / 前の差分",
+        description: "diff表示で前の差分位置へスクロール",
+        command: Command::DiffPrevHunk,
+    },
+    CommandPaletteEntry {
+        key: "F8",
+        name: "Next Diff / 次の差分",
+        description: "diff表示で次の差分位置へスクロール",
+        command: Command::DiffNextHunk,
     },
     CommandPaletteEntry {
         key: "Ctrl+T",
@@ -4977,6 +5266,28 @@ struct PickerState {
     selected: usize,
     ranking_cache: Vec<(String, Vec<usize>)>,
     scan_token: Option<u64>,
+    /// Where the current directory listing starts in `candidates`. Everything
+    /// from here on answers a path-shaped query and is dropped once the query
+    /// stops being one, restoring the picker's own candidates underneath.
+    path_listing_start: Option<usize>,
+}
+
+impl PickerState {
+    /// Whether this picker offers files at all — the command palette and the
+    /// buffer list do not, so a path typed into them stays a fuzzy pattern.
+    fn accepts_paths(&self) -> bool {
+        matches!(self.mode, PickerMode::Directory | PickerMode::Diff)
+    }
+}
+
+/// Does this query name a filesystem path rather than a fuzzy pattern? The
+/// workspace scan only knows files under the root, so `/`, `~/` and `../`
+/// queries would otherwise match nothing at all.
+///
+/// A bare leading dot is deliberately not enough: `.rs` is a useful fuzzy
+/// pattern, and only `./` or `..` commit to being a path.
+fn is_path_query(query: &str) -> bool {
+    query.starts_with(['/', '~']) || query.starts_with("./") || query.starts_with("..")
 }
 
 #[derive(Clone, Debug)]
@@ -5312,6 +5623,16 @@ fn split_right_width(total: u16) -> u16 {
         .saturating_sub(1)
 }
 
+/// A running shell and the screen it has drawn so far. The child process lives
+/// in the runtime; this is the editor's view of it.
+struct ShellSession {
+    /// Distinguishes this session from one it replaced, whose reader thread
+    /// reports its exit only after the successor is already running.
+    token: u64,
+    parser: vt100::Parser,
+    selection: Option<TerminalSelection>,
+}
+
 #[derive(Clone, Debug)]
 struct TerminalSelection {
     anchor: (u16, u16),
@@ -5465,6 +5786,75 @@ mod tests {
         assert!(!editor.take_dirty());
     }
 
+    /// Open the shell pane on a fresh session, returning the token the editor
+    /// asked the runtime to spawn under. Terminal events must carry it to be
+    /// accepted.
+    fn open_shell(editor: &mut Editor) -> u64 {
+        match editor.update(Command::ToggleShell.into()).as_slice() {
+            [Effect::SpawnShell { token, .. }] => *token,
+            other => panic!("expected a shell spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opening_a_right_pane_replaces_whichever_one_was_there() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+
+        editor.update(Command::ToggleShell.into());
+        assert!(editor.shell_visible());
+
+        // Ctrl+F over an open shell used to leave both panes alive, with the
+        // renderer deciding which one won.
+        editor.update(Command::OpenSearch.into());
+        assert!(editor.search_pane_visible());
+        assert!(!editor.shell_visible());
+
+        editor.update(Command::ToggleSplit.into());
+        assert!(editor.split_buffers().is_some());
+        assert!(!editor.search_pane_visible());
+
+        editor.update(Command::ToggleShell.into());
+        assert!(editor.shell_visible());
+        assert!(editor.split_buffers().is_none());
+    }
+
+    #[test]
+    fn a_replaced_shell_session_cannot_tear_down_its_successor() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+
+        let first = open_shell(&mut editor);
+        editor.update(AppEvent::Terminal(TerminalEvent::Exited {
+            token: first,
+            error: None,
+        }));
+        let second = open_shell(&mut editor);
+        assert_ne!(first, second);
+
+        // The dead shell's reader thread reports its exit only now, after the
+        // successor is already on screen. Applying it would close the pane and
+        // leave the fresh shell with nowhere to draw.
+        editor.update(AppEvent::Terminal(TerminalEvent::Exited {
+            token: first,
+            error: Some("stale".to_owned()),
+        }));
+        assert!(editor.shell_visible());
+        assert_eq!(editor.status(), None);
+
+        editor.update(AppEvent::Terminal(TerminalEvent::Output {
+            token: second,
+            bytes: b"$ ".to_vec(),
+        }));
+        assert!(editor.terminal_contents().unwrap().starts_with("$ "));
+
+        editor.update(AppEvent::Terminal(TerminalEvent::Exited {
+            token: second,
+            error: None,
+        }));
+        assert!(!editor.shell_visible());
+    }
+
     #[test]
     fn shell_focus_keeps_the_left_editor_available_for_rendering() {
         let mut editor = Editor::default();
@@ -5484,26 +5874,74 @@ mod tests {
                 if shell.as_deref() == Some("/configured/shell")
         ));
 
+        let token = match effects.as_slice() {
+            [Effect::SpawnShell { token, .. }] => *token,
+            other => panic!("expected a shell spawn, got {other:?}"),
+        };
+
         assert!(editor.update(Command::ToggleShell.into()).is_empty());
         assert!(!editor.shell_visible());
-        assert!(editor.terminal.is_some());
 
+        // Reopening resumes the same session, so nothing is spawned.
         assert!(editor.update(Command::ToggleShell.into()).is_empty());
         assert!(editor.shell_visible());
         assert!(editor.shell_focused());
 
-        editor.update(AppEvent::Terminal(TerminalEvent::Exited(None)));
+        editor.update(AppEvent::Terminal(TerminalEvent::Exited {
+            token,
+            error: None,
+        }));
         assert!(!editor.shell_visible());
-        assert!(editor.terminal.is_none());
         assert_eq!(editor.status(), None);
+    }
+
+    #[test]
+    fn hiding_the_shell_pane_keeps_the_session_but_an_exit_ends_it() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+
+        let token = open_shell(&mut editor);
+        editor.update(AppEvent::Terminal(TerminalEvent::Output {
+            token,
+            bytes: b"session log".to_vec(),
+        }));
+
+        editor.update(Command::ToggleShell.into());
+        assert!(!editor.shell_visible());
+        // Output that arrives while the pane is hidden still belongs to the
+        // session, so it is there when the pane comes back.
+        editor.update(AppEvent::Terminal(TerminalEvent::Output {
+            token,
+            bytes: b" continues".to_vec(),
+        }));
+
+        assert!(editor.update(Command::ToggleShell.into()).is_empty());
+        assert!(
+            editor
+                .terminal_contents()
+                .unwrap()
+                .contains("session log continues")
+        );
+
+        // Once the shell exits the session is gone, so the next open spawns.
+        editor.update(AppEvent::Terminal(TerminalEvent::Exited {
+            token,
+            error: None,
+        }));
+        let next = open_shell(&mut editor);
+        assert_ne!(next, token);
+        assert_eq!(editor.terminal_contents().unwrap().trim(), "");
     }
 
     #[test]
     fn shell_drag_selection_copies_a_stable_snapshot_and_clears_hover() {
         let mut editor = Editor::default();
         editor.update(AppEvent::Resize { cols: 20, rows: 6 });
-        editor.update(Command::ToggleShell.into());
-        editor.update(AppEvent::Terminal(TerminalEvent::Output(b"hello".to_vec())));
+        let token = open_shell(&mut editor);
+        editor.update(AppEvent::Terminal(TerminalEvent::Output {
+            token,
+            bytes: b"hello".to_vec(),
+        }));
         editor.hover = Some("old hover".to_owned());
 
         let mouse = |kind, column| {
@@ -5531,9 +5969,10 @@ mod tests {
         );
         assert!(editor.hover.is_none());
 
-        editor.update(AppEvent::Terminal(TerminalEvent::Output(
-            b"\rXXXXX".to_vec(),
-        )));
+        editor.update(AppEvent::Terminal(TerminalEvent::Output {
+            token,
+            bytes: b"\rXXXXX".to_vec(),
+        }));
         assert!(
             editor
                 .terminal_screen()
@@ -5543,7 +5982,7 @@ mod tests {
         );
 
         editor.update(AppEvent::TerminalInput(b"x".to_vec()));
-        assert!(editor.terminal_selection.is_none());
+        assert!(editor.terminal_selection_view().is_none());
     }
 
     #[test]
@@ -5813,7 +6252,7 @@ mod tests {
         let mut editor = Editor::default();
         editor.update(AppEvent::Resize { cols: 40, rows: 24 });
         editor.update(Command::OpenReplace.into());
-        assert!(!editor.search.as_ref().unwrap().options.case_sensitive);
+        assert!(!editor.search().unwrap().options.case_sensitive);
 
         // Column 26 is the blank just after the "[Aa]" label; the nearer toggle
         // is still case-sensitivity.
@@ -5827,7 +6266,7 @@ mod tests {
             clicks: 1,
         }));
 
-        assert!(editor.search.as_ref().unwrap().options.case_sensitive);
+        assert!(editor.search().unwrap().options.case_sensitive);
     }
 
     #[test]
@@ -5912,8 +6351,7 @@ mod tests {
         assert_eq!(editor.search_view().unwrap().exclude, "");
         assert!(
             editor
-                .search
-                .as_ref()
+                .search()
                 .unwrap()
                 .filters
                 .exclude_dirs
@@ -5939,10 +6377,7 @@ mod tests {
         let mut editor = Editor::default();
         editor.update(AppEvent::Resize { cols: 40, rows: 24 });
         editor.update(Command::OpenReplace.into());
-        assert_eq!(
-            editor.search.as_ref().unwrap().scope,
-            SearchScope::CurrentBuffer
-        );
+        assert_eq!(editor.search().unwrap().scope, SearchScope::CurrentBuffer);
 
         // The pane starts at column split_left_width(40)+1 = 21, so its inner
         // content begins at 22 and the " dir " tab spans columns 37..42.
@@ -5956,10 +6391,7 @@ mod tests {
             clicks: 1,
         }));
 
-        assert_eq!(
-            editor.search.as_ref().unwrap().scope,
-            SearchScope::Directory
-        );
+        assert_eq!(editor.search().unwrap().scope, SearchScope::Directory);
     }
 
     #[test]
@@ -6356,6 +6788,183 @@ mod tests {
         assert_eq!(right.text.to_string(), "same\nleft");
     }
 
+    /// A diff of two files that agree except at rows 2 and 6.
+    fn diff_editor() -> Editor {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 6 });
+        editor.open_paths([PathBuf::from("left.txt"), PathBuf::from("right.txt")]);
+        let body = |second: &str, sixth: &str| {
+            format!("l1\n{second}\nl3\nl4\nl5\n{sixth}\nl7\nl8\nl9\nl10")
+        };
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok(body("same", "same")),
+        }));
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(2),
+            result: Ok(body("CHANGED", "ALSO")),
+        }));
+        editor.update(Command::OpenDiffPicker.into());
+        editor.update(Command::PickerConfirm.into());
+        assert!(editor.split_buffers().is_some_and(|(_, _, diff)| diff));
+        editor
+    }
+
+    #[test]
+    fn clicking_in_the_diff_does_not_ask_the_language_server_anything() {
+        let mut editor = diff_editor();
+        for id in [DocumentId(1), DocumentId(2)] {
+            let document = editor.documents.get_mut(&id).unwrap();
+            document.path = Some(PathBuf::from(format!("/tmp/diff{}.rs", id.0)));
+            document.language = Some("rust".to_owned());
+        }
+        editor.test_register_server("rust", 1).ready = true;
+        editor.test_open_doc(DocumentId(1), 1);
+        editor.test_open_doc(DocumentId(2), 1);
+
+        let effects = editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 8,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+
+        // Outside the diff this same click asks for hover; a comparison view
+        // must not, which is what made the diff look language-server driven.
+        assert!(effects.is_empty());
+        assert!(
+            !editor
+                .pending_lsp
+                .values()
+                .any(|pending| matches!(pending, PendingLsp::Hover { .. }))
+        );
+    }
+
+    #[test]
+    fn clicking_a_scrolled_diff_row_lands_on_the_line_that_row_shows() {
+        let mut editor = diff_editor();
+        editor.update(Command::DiffNextHunk.into());
+        editor.update(Command::DiffNextHunk.into());
+        let top_row = editor.diff_top_row();
+        assert!(top_row > 0);
+
+        // Row 0 of the screen is whatever aligned row the view is scrolled to.
+        let expected = editor.diff_rows().unwrap()[top_row]
+            .left
+            .as_ref()
+            .unwrap()
+            .0;
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 8,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+
+        let caret = editor
+            .layout
+            .active_editor(editor.focus)
+            .unwrap()
+            .view
+            .selections
+            .primary()
+            .head;
+        let text = editor
+            .documents
+            .get(&DocumentId(2))
+            .unwrap()
+            .editable()
+            .text();
+        assert_eq!(text.char_to_line(caret.0), expected);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_diff_by_aligned_row() {
+        let mut editor = diff_editor();
+        assert_eq!(editor.diff_top_row(), 0);
+
+        let wheel = |kind| {
+            AppEvent::Mouse(MouseInput {
+                event: MouseEvent {
+                    kind,
+                    column: 10,
+                    row: 2,
+                    modifiers: KeyModifiers::NONE,
+                },
+                clicks: 0,
+            })
+        };
+        editor.update(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(editor.diff_top_row(), 3);
+
+        editor.update(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(editor.diff_top_row(), 0);
+
+        // Already at the top: scrolling up further must not underflow.
+        editor.update(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(editor.diff_top_row(), 0);
+    }
+
+    #[test]
+    fn diff_navigation_steps_between_hunks_and_stops_at_the_ends() {
+        let mut editor = diff_editor();
+        let (_, total) = editor.diff_hunk_position().unwrap();
+        assert_eq!(total, 2);
+
+        editor.update(Command::DiffNextHunk.into());
+        let first = editor.diff_top_row();
+        assert!(first > 0);
+        assert_eq!(editor.diff_hunk_position().unwrap(), (1, 2));
+
+        editor.update(Command::DiffNextHunk.into());
+        assert!(editor.diff_top_row() > first);
+        assert_eq!(editor.diff_hunk_position().unwrap(), (2, 2));
+
+        // Past the last hunk the view stays put rather than wrapping.
+        let last = editor.diff_top_row();
+        editor.update(Command::DiffNextHunk.into());
+        assert_eq!(editor.diff_top_row(), last);
+
+        editor.update(Command::DiffPrevHunk.into());
+        assert_eq!(editor.diff_top_row(), first);
+    }
+
+    #[test]
+    fn clicking_the_diff_navigator_arrows_moves_between_hunks() {
+        let mut editor = diff_editor();
+        let (current, total) = editor.diff_hunk_position().unwrap();
+        let pane_x = split_left_width(80).saturating_add(1);
+        let width = 80 - pane_x;
+        let label_width = crate::render::diff_navigator_label_width(current, total);
+        // The arrows sit at the right edge of the diff pane, on its first row.
+        let next_column = pane_x + width - label_width + 4;
+
+        let click = |column| {
+            AppEvent::Mouse(MouseInput {
+                event: MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                clicks: 1,
+            })
+        };
+        editor.update(click(next_column));
+        assert_eq!(editor.diff_hunk_position().unwrap().0, 1);
+        editor.update(click(next_column));
+        assert_eq!(editor.diff_hunk_position().unwrap().0, 2);
+
+        editor.update(click(next_column - 3));
+        assert_eq!(editor.diff_hunk_position().unwrap().0, 1);
+    }
+
     #[test]
     fn mouse_click_switches_the_active_split_buffer() {
         let mut editor = Editor::default();
@@ -6401,6 +7010,203 @@ mod tests {
         assert_eq!(editor.active_buffer().unwrap().text.to_string(), "right");
     }
 
+    /// Open two buffers and start the diff picker, returning the scan token.
+    fn diff_picker(editor: &mut Editor) -> u64 {
+        editor.open_paths([PathBuf::from("left.txt"), PathBuf::from("right.txt")]);
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok("left".to_owned()),
+        }));
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(2),
+            result: Ok("right".to_owned()),
+        }));
+        editor
+            .update(Command::OpenDiffPicker.into())
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::StartFileScan { token, .. } => Some(token),
+                _ => None,
+            })
+            .expect("the diff picker scans for unopened files")
+    }
+
+    #[test]
+    fn diff_picker_offers_unopened_files_below_the_open_buffers() {
+        let mut editor = Editor::default();
+        let token = diff_picker(&mut editor);
+        assert_eq!(editor.picker_view().unwrap().total, 1);
+
+        editor.update(AppEvent::FileScan(FileScanEvent::Batch {
+            token,
+            // left.txt is already a buffer, so only the unopened file is added.
+            paths: vec![PathBuf::from("left.txt"), PathBuf::from("unopened.rs")],
+        }));
+
+        let labels: Vec<_> = editor
+            .picker_view()
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|item| item.label)
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["left.txt".to_owned(), "unopened.rs".to_owned()]
+        );
+    }
+
+    #[test]
+    fn diffing_an_unopened_file_loads_it_into_the_right_pane() {
+        let mut editor = Editor::default();
+        let token = diff_picker(&mut editor);
+        editor.update(AppEvent::FileScan(FileScanEvent::Batch {
+            token,
+            paths: vec![PathBuf::from("unopened.rs")],
+        }));
+        for character in "unopened".chars() {
+            editor.update(AppEvent::TextInput(character));
+        }
+
+        let effects = editor.update(Command::PickerConfirm.into());
+
+        assert!(
+            matches!(effects.as_slice(), [Effect::ReadFile { path, .. }] if path == &PathBuf::from("unopened.rs"))
+        );
+        let (left, _, diff) = editor.split_buffers().expect("a diff is open");
+        assert!(diff);
+        // The buffer we came from stays on the left; the picked file loads right.
+        assert_eq!(left.text.to_string(), "right");
+    }
+
+    #[test]
+    fn only_committed_path_prefixes_switch_the_picker_to_a_listing() {
+        for query in ["/etc", "~/src", "./src", "..", "../up"] {
+            assert!(is_path_query(query), "{query} should list a directory");
+        }
+        // Still useful as fuzzy patterns, so they must keep matching candidates.
+        for query in [".rs", "main.rs", "", "src"] {
+            assert!(!is_path_query(query), "{query} should stay a fuzzy pattern");
+        }
+    }
+
+    #[test]
+    fn an_absolute_query_lists_the_directory_instead_of_matching_nothing() {
+        let mut editor = Editor::default();
+        let token = diff_picker(&mut editor);
+        editor.update(AppEvent::FileScan(FileScanEvent::Batch {
+            token,
+            paths: vec![PathBuf::from("unopened.rs")],
+        }));
+
+        let mut effects = Vec::new();
+        for character in "/us".chars() {
+            effects = editor.update(AppEvent::TextInput(character));
+        }
+        let listing_token = match effects.as_slice() {
+            [Effect::ListPathCompletions { input, token, .. }] if input == "/us" => *token,
+            other => panic!("expected a directory listing, got {other:?}"),
+        };
+
+        editor.update(AppEvent::FileScan(FileScanEvent::PathCompletions {
+            token: listing_token,
+            paths: vec![PathBuf::from("/usr"), PathBuf::from("/usr/share")],
+        }));
+        let labels: Vec<_> = editor
+            .picker_view()
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|item| item.label)
+            .collect();
+        assert_eq!(labels, vec!["/usr".to_owned(), "/usr/share".to_owned()]);
+
+        // Deleting back to a fuzzy query restores the picker's own candidates.
+        for _ in 0.."/us".len() {
+            editor.update(Command::PickerBackspace.into());
+        }
+        let labels: Vec<_> = editor
+            .picker_view()
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|item| item.label)
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["left.txt".to_owned(), "unopened.rs".to_owned()]
+        );
+    }
+
+    #[test]
+    fn toggle_split_takes_the_diffs_half_over_instead_of_just_dismissing_it() {
+        let mut editor = Editor::default();
+        let token = diff_picker(&mut editor);
+        editor.update(AppEvent::FileScan(FileScanEvent::Done { token }));
+        editor.update(Command::PickerConfirm.into());
+        assert!(editor.split_buffers().is_some_and(|(_, _, diff)| diff));
+
+        editor.update(Command::ToggleSplit.into());
+
+        // One press lands on a plain split rather than closing, so it no longer
+        // takes two presses to get there.
+        let (_, _, diff) = editor.split_buffers().expect("a split is open");
+        assert!(!diff);
+        assert_eq!(editor.focus(), Focus::Editor(Side::Right));
+
+        // And it still toggles its own pane closed.
+        editor.update(Command::ToggleSplit.into());
+        assert!(editor.split_buffers().is_none());
+    }
+
+    #[test]
+    fn esc_and_f6_each_close_the_diff() {
+        for close in [Command::CollapseSelections, Command::OpenDiffPicker] {
+            let mut editor = Editor::default();
+            let token = diff_picker(&mut editor);
+            editor.update(AppEvent::FileScan(FileScanEvent::Done { token }));
+            editor.update(Command::PickerConfirm.into());
+            assert!(editor.split_buffers().is_some_and(|(_, _, diff)| diff));
+
+            assert!(editor.update(close.into()).is_empty());
+
+            assert!(
+                editor.split_buffers().is_none(),
+                "{close:?} left the diff open"
+            );
+            assert!(editor.picker_view().is_none(), "{close:?} opened a picker");
+            assert_eq!(editor.focus(), Focus::Editor(Side::Left));
+        }
+    }
+
+    #[test]
+    fn esc_still_collapses_selections_when_no_diff_is_open() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::TextPaste("hello".to_owned()));
+        editor.update(Command::SelectAll.into());
+        assert!(
+            editor
+                .layout
+                .left
+                .view
+                .selections
+                .iter()
+                .any(|selection| !selection.is_caret())
+        );
+
+        editor.update(Command::CollapseSelections.into());
+
+        assert!(
+            editor
+                .layout
+                .left
+                .view
+                .selections
+                .iter()
+                .all(|selection| selection.is_caret())
+        );
+    }
+
     #[test]
     fn opening_a_file_from_picker_exits_diff_mode() {
         let mut editor = Editor::default();
@@ -6417,9 +7223,16 @@ mod tests {
         editor.update(Command::PickerConfirm.into());
         assert!(editor.split_buffers().is_some_and(|(_, _, diff)| diff));
 
-        editor.update(Command::OpenDirectoryPicker.into());
+        let token = editor
+            .update(Command::OpenDirectoryPicker.into())
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::StartFileScan { token, .. } => Some(token),
+                _ => None,
+            })
+            .expect("the directory picker starts a scan");
         editor.update(AppEvent::FileScan(FileScanEvent::Batch {
-            token: 1,
+            token,
             paths: vec![PathBuf::from("next.txt")],
         }));
         let effects = editor.update(Command::PickerConfirm.into());
@@ -6521,8 +7334,13 @@ mod tests {
         }
 
         let palette = editor.picker_view().unwrap();
-        assert!(palette.items[0].label.contains("F6"));
-        assert!(palette.items[0].label.contains("Diff"));
+        // Several entries mention diff now, so match on content rather than rank.
+        assert!(
+            palette
+                .items
+                .iter()
+                .any(|item| item.label.contains("F6") && item.label.contains("Diff"))
+        );
     }
 
     #[test]
@@ -6960,7 +7778,7 @@ mod tests {
         editor.toggle_replace_field();
         editor.update(AppEvent::TextInput('X'));
         // Each keystroke restarts the grep, so feed hits for the latest token.
-        let token = editor.search.as_ref().unwrap().grep_token.unwrap();
+        let token = editor.search().unwrap().grep_token.unwrap();
         editor.update(AppEvent::Grep(GrepEvent::Hits {
             token,
             hits: vec![GrepHit {
@@ -7633,14 +8451,18 @@ mod tests {
     fn mouse_wheel_scrolls_the_terminal_pane_scrollback() {
         let mut editor = Editor::default();
         editor.update(AppEvent::Resize { cols: 40, rows: 6 });
-        editor.update(Command::ToggleShell.into());
-        editor.update(AppEvent::Terminal(TerminalEvent::Output(
-            (0..20)
+        let token = open_shell(&mut editor);
+        editor.update(AppEvent::Terminal(TerminalEvent::Output {
+            token,
+            bytes: (0..20)
                 .map(|line| format!("line {line}\r\n"))
                 .collect::<String>()
                 .into_bytes(),
-        )));
-        assert_eq!(editor.terminal.as_ref().unwrap().screen().scrollback(), 0);
+        }));
+        assert_eq!(
+            editor.shell.as_ref().unwrap().parser.screen().scrollback(),
+            0
+        );
 
         editor.update(AppEvent::Mouse(MouseInput {
             event: MouseEvent {
@@ -7652,17 +8474,21 @@ mod tests {
             clicks: 0,
         }));
 
-        assert_eq!(editor.terminal.as_ref().unwrap().screen().scrollback(), 3);
+        assert_eq!(
+            editor.shell.as_ref().unwrap().parser.screen().scrollback(),
+            3
+        );
     }
 
     #[test]
     fn shell_paste_preserves_child_bracketed_paste_mode() {
         let mut editor = Editor::default();
         editor.update(AppEvent::Resize { cols: 40, rows: 6 });
-        editor.update(Command::ToggleShell.into());
-        editor.update(AppEvent::Terminal(TerminalEvent::Output(
-            b"\x1b[?2004h".to_vec(),
-        )));
+        let token = open_shell(&mut editor);
+        editor.update(AppEvent::Terminal(TerminalEvent::Output {
+            token,
+            bytes: b"\x1b[?2004h".to_vec(),
+        }));
 
         let effects = editor.update(AppEvent::TextPaste("one\ntwo".to_owned()));
 

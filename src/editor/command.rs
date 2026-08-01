@@ -40,6 +40,8 @@ pub enum Command {
     Format,
     ToggleShell,
     ToggleSplit,
+    DiffNextHunk,
+    DiffPrevHunk,
     CloseBuffer,
     Indent,
     Outdent,

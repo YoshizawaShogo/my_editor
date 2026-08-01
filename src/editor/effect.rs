@@ -21,6 +21,13 @@ pub enum Effect {
         root: PathBuf,
         token: u64,
     },
+    /// List the directory the partially typed path points at, keeping entries
+    /// that start with what has been typed of the final component.
+    ListPathCompletions {
+        input: String,
+        root: PathBuf,
+        token: u64,
+    },
     StartGrep {
         pattern: String,
         filters: SearchFilters,
@@ -80,6 +87,7 @@ pub enum Effect {
         root: PathBuf,
     },
     SpawnShell {
+        token: u64,
         cols: u16,
         rows: u16,
         shell: Option<String>,

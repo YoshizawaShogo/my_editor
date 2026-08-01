@@ -2,11 +2,13 @@ mod editable;
 mod hash;
 mod history;
 mod large_file;
+mod text_sniff;
 
 pub use editable::{ActiveDiagnostic, Editable};
 pub use hash::content_hash;
 pub use history::{Change, History, Revision};
 pub use large_file::LargeFile;
+pub use text_sniff::looks_like_text;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
