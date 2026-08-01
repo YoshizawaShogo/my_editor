@@ -286,6 +286,14 @@ impl Editor {
                     self.jump_diff_hunk(forward);
                     return Vec::new();
                 }
+                // The diff view has its own navigator above; here the badges sit
+                // on ordinary editor panes.
+                if matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left))
+                    && !self.layout.is_diff()
+                    && self.edge_badge_click(mouse.event.column, mouse.event.row)
+                {
+                    return Vec::new();
+                }
                 let on_split_divider = self.layout.right.is_some()
                     && mouse.event.column == split_left_width(self.terminal_size.0);
                 // The diff is a comparison view, not a place to interrogate code:
@@ -4694,6 +4702,152 @@ impl Editor {
         )
     }
 
+    /// Handle a left-click on a normal editor pane's off-screen-change badge
+    /// (the top-right `↑` / bottom-right `↓` indicators summarising diagnostics
+    /// and git changes above/below the viewport). Clicking a segment scrolls the
+    /// pane to the nearest matching change in that direction, so the badges work
+    /// like the diff navigator. Returns `true` when a jump was made.
+    fn edge_badge_click(&mut self, column: u16, row: u16) -> bool {
+        use crate::lsp::DiagnosticSeverity::{Error, Warning};
+        use crate::render::EdgeBadgeCategory;
+
+        let total = self.terminal_size.0;
+        let divider = split_left_width(total);
+        // The split divider belongs to neither pane's badge.
+        if self.layout.right.is_some() && column == divider {
+            return false;
+        }
+        let has_right_editor = self.layout.right_editor().is_some();
+        let side = if has_right_editor && column > divider {
+            Side::Right
+        } else {
+            Side::Left
+        };
+        let (pane_x, pane_width) = match side {
+            Side::Right => (divider.saturating_add(1), split_right_width(total)),
+            Side::Left if self.layout.right.is_some() => (0, divider),
+            Side::Left => (0, total),
+        };
+        let pane_height = self.terminal_size.1.saturating_sub(1);
+
+        let pane = match side {
+            Side::Left => &self.layout.left,
+            Side::Right => match self.layout.right_editor() {
+                Some(pane) => pane,
+                None => return false,
+            },
+        };
+        let doc = pane.view.doc;
+        let Some(editable) = self.documents.get(&doc).and_then(Document::editable_opt) else {
+            return false;
+        };
+        let text = editable.text();
+        let start = pane.view.scroll.top_line;
+        let end = (start + usize::from(pane_height) + pane.view.scroll.wrapped_row_offset)
+            .min(text.len_lines());
+        // A change is off-screen above the viewport when its line sits before the
+        // first visible line, and below when at or past the last visible one.
+        let off_screen = |line: usize, above: bool| {
+            if above { line < start } else { line >= end }
+        };
+        let diagnostic_line = |diagnostic: &crate::document::ActiveDiagnostic| {
+            text.char_to_line(diagnostic.range.start.0.min(text.len_chars()))
+        };
+
+        // The counts must match what the renderer drew, or the hit-test lands on
+        // segments that aren't there.
+        let errors = |above: bool| {
+            editable
+                .diagnostics
+                .iter()
+                .filter(|&d| d.severity == Error && off_screen(diagnostic_line(d), above))
+                .count()
+        };
+        let warnings = |above: bool| {
+            editable
+                .diagnostics
+                .iter()
+                .filter(|&d| d.severity == Warning && off_screen(diagnostic_line(d), above))
+                .count()
+        };
+        let git = |above: bool, kind: GitLineKind| {
+            editable
+                .git_lines
+                .iter()
+                .filter(|&g| g.kind == kind && off_screen(g.line, above))
+                .count()
+        };
+        let hit = crate::render::edge_badge_hit(
+            pane_x,
+            pane_width,
+            pane_height,
+            true,
+            errors(true),
+            warnings(true),
+            git(true, GitLineKind::Modified),
+            git(true, GitLineKind::Added),
+            column,
+            row,
+        )
+        .or_else(|| {
+            crate::render::edge_badge_hit(
+                pane_x,
+                pane_width,
+                pane_height,
+                false,
+                errors(false),
+                warnings(false),
+                git(false, GitLineKind::Modified),
+                git(false, GitLineKind::Added),
+                column,
+                row,
+            )
+        });
+        let Some(hit) = hit else {
+            return false;
+        };
+
+        let mut candidates = Vec::new();
+        for diagnostic in &editable.diagnostics {
+            let wanted = match hit.category {
+                EdgeBadgeCategory::Error => diagnostic.severity == Error,
+                EdgeBadgeCategory::Warning => diagnostic.severity == Warning,
+                EdgeBadgeCategory::Any => matches!(diagnostic.severity, Error | Warning),
+                _ => false,
+            };
+            if wanted {
+                candidates.push(diagnostic_line(diagnostic));
+            }
+        }
+        for git_line in &editable.git_lines {
+            let wanted = match hit.category {
+                EdgeBadgeCategory::Modified => git_line.kind == GitLineKind::Modified,
+                EdgeBadgeCategory::Added => git_line.kind == GitLineKind::Added,
+                EdgeBadgeCategory::Any => {
+                    matches!(git_line.kind, GitLineKind::Modified | GitLineKind::Added)
+                }
+                _ => false,
+            };
+            if wanted {
+                candidates.push(git_line.line);
+            }
+        }
+        let target = if hit.above {
+            candidates.into_iter().filter(|line| *line < start).max()
+        } else {
+            candidates.into_iter().filter(|line| *line >= end).min()
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        let head = CharIdx(text.line_to_char(target));
+
+        self.focus = Focus::Editor(side);
+        self.record_jump_origin();
+        self.go_to_location(doc, head);
+        true
+    }
+
     fn scroll_diff(&mut self, amount: isize) {
         // The exact row count needs the alignment; the sum of both line counts
         // bounds it, and the renderer clamps the last screenful precisely.
@@ -5995,6 +6149,53 @@ mod tests {
             editor.update(Command::CopyShellSelection.into()),
             vec![Effect::TerminalInput(vec![3])]
         );
+    }
+
+    #[test]
+    fn clicking_the_bottom_edge_badge_scrolls_to_the_next_change_below() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 6 });
+        let text = (0..30)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.update(AppEvent::TextPaste(text));
+        // Bring the viewport back to the top so the change sits off-screen below.
+        editor.update(
+            Command::Move {
+                direction: Direction::Left,
+                unit: Unit::Document,
+                extend: false,
+            }
+            .into(),
+        );
+        let doc = editor.layout.left.view.doc;
+        editor
+            .documents
+            .get_mut(&doc)
+            .unwrap()
+            .editable_mut()
+            .git_lines = vec![GitLine {
+            line: 20,
+            kind: GitLineKind::Modified,
+        }];
+
+        // The bottom badge for a lone "M1" renders "↓ M1" right-aligned in the
+        // 40-wide pane, so the "M" segment sits at column 38 on the last text row.
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 38,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+
+        let buffer = editor.active_buffer().unwrap();
+        let head = buffer.view.selections.primary().head;
+        assert_eq!(buffer.text.char_to_line(head.0), 20);
+        assert!(buffer.view.scroll.top_line > 0);
     }
 
     #[test]

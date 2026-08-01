@@ -883,6 +883,77 @@ fn draw_large_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &crate::editor::
     }
 }
 
+/// Which count a click on an edge badge landed on. `Any` is the arrow itself,
+/// which navigates to the nearest change of any kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EdgeBadgeCategory {
+    Error,
+    Warning,
+    Modified,
+    Added,
+    Any,
+}
+
+/// A click on an edge badge: whether it was the top (`above`) or bottom badge,
+/// and which count segment the click landed on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EdgeBadgeHit {
+    pub above: bool,
+    pub category: EdgeBadgeCategory,
+}
+
+/// The count segments an edge badge draws, in render order. Shared by the
+/// renderer and the hit-test so their geometry can never drift apart.
+fn edge_badge_parts(
+    errors: usize,
+    warnings: usize,
+    modified: usize,
+    added: usize,
+) -> Vec<(String, Color, EdgeBadgeCategory)> {
+    let mut parts = Vec::new();
+    if errors > 0 {
+        parts.push((
+            format!("E{errors}"),
+            Color::Rgb(0xe2, 0x78, 0x78),
+            EdgeBadgeCategory::Error,
+        ));
+    }
+    if warnings > 0 {
+        parts.push((
+            format!("W{warnings}"),
+            Color::Rgb(0xe2, 0xa4, 0x78),
+            EdgeBadgeCategory::Warning,
+        ));
+    }
+    if modified > 0 {
+        parts.push((
+            format!("M{modified}"),
+            Color::Rgb(0x84, 0xa0, 0xc6),
+            EdgeBadgeCategory::Modified,
+        ));
+    }
+    if added > 0 {
+        parts.push((
+            format!("A{added}"),
+            Color::Rgb(0xb4, 0xbe, 0x82),
+            EdgeBadgeCategory::Added,
+        ));
+    }
+    parts
+}
+
+/// The badge's rectangle: right-aligned, one row tall, pinned to the top of the
+/// pane when `above` and the bottom otherwise.
+fn edge_badge_rect(area: Rect, above: bool, parts_width: usize) -> Rect {
+    let width = (parts_width).min(usize::from(area.width)) as u16;
+    Rect {
+        x: area.right().saturating_sub(width),
+        y: if above { area.y } else { area.bottom() - 1 },
+        width,
+        height: 1,
+    }
+}
+
 fn draw_edge_badge(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -899,39 +970,77 @@ fn draw_edge_badge(
         return;
     }
     let arrow = if above { '↑' } else { '↓' };
-    let mut parts = Vec::new();
-    if errors > 0 {
-        parts.push((format!("E{errors}"), Color::Rgb(0xe2, 0x78, 0x78)));
-    }
-    if warnings > 0 {
-        parts.push((format!("W{warnings}"), Color::Rgb(0xe2, 0xa4, 0x78)));
-    }
-    if modified > 0 {
-        parts.push((format!("M{modified}"), Color::Rgb(0x84, 0xa0, 0xc6)));
-    }
-    if added > 0 {
-        parts.push((format!("A{added}"), Color::Rgb(0xb4, 0xbe, 0x82)));
-    }
-    let width = (1 + parts
+    let parts = edge_badge_parts(errors, warnings, modified, added);
+    let parts_width = 1 + parts
         .iter()
-        .map(|(text, _)| 1 + text.chars().count())
-        .sum::<usize>())
-    .min(usize::from(area.width)) as u16;
-    let badge = Rect {
-        x: area.right().saturating_sub(width),
-        y: if above { area.y } else { area.bottom() - 1 },
-        width,
-        height: 1,
-    };
+        .map(|(text, _, _)| 1 + text.chars().count())
+        .sum::<usize>();
+    let badge = edge_badge_rect(area, above, parts_width);
     let mut spans = vec![Span::styled(
         arrow.to_string(),
         Style::default().fg(Color::Yellow).bg(POPUP_BG),
     )];
-    for (text, color) in parts {
+    for (text, color, _) in parts {
         spans.push(Span::styled(" ", Style::default().bg(POPUP_BG)));
         spans.push(Span::styled(text, Style::default().fg(color).bg(POPUP_BG)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), badge);
+}
+
+/// Which count segment of an edge badge the click at `(column, row)` landed on,
+/// or `None` for anywhere else. Takes the pane geometry as plain columns so the
+/// editor can hit-test without depending on ratatui's `Rect`, mirroring the
+/// geometry `draw_edge_badge` uses exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn edge_badge_hit(
+    pane_x: u16,
+    pane_width: u16,
+    pane_height: u16,
+    above: bool,
+    errors: usize,
+    warnings: usize,
+    modified: usize,
+    added: usize,
+    column: u16,
+    row: u16,
+) -> Option<EdgeBadgeHit> {
+    if errors == 0 && warnings == 0 && modified == 0 && added == 0
+        || pane_width == 0
+        || pane_height == 0
+    {
+        return None;
+    }
+    let parts = edge_badge_parts(errors, warnings, modified, added);
+    let parts_width = 1 + parts
+        .iter()
+        .map(|(text, _, _)| 1 + text.chars().count())
+        .sum::<usize>();
+    let badge = edge_badge_rect(
+        Rect::new(pane_x, 0, pane_width, pane_height),
+        above,
+        parts_width,
+    );
+    if row != badge.y || column < badge.x || column >= badge.x + badge.width {
+        return None;
+    }
+    if column == badge.x {
+        return Some(EdgeBadgeHit {
+            above,
+            category: EdgeBadgeCategory::Any,
+        });
+    }
+    let mut cursor = badge.x + 1;
+    for (text, _, category) in &parts {
+        let segment = 1 + text.chars().count() as u16;
+        if column >= cursor && column < cursor + segment {
+            return Some(EdgeBadgeHit {
+                above,
+                category: *category,
+            });
+        }
+        cursor += segment;
+    }
+    None
 }
 
 fn draw_picker(frame: &mut Frame<'_>, picker: &crate::editor::PickerView) {
@@ -2068,6 +2177,40 @@ mod tests {
         assert_eq!(buffer[(22, 2)].fg, Color::Rgb(0xe2, 0xa4, 0x78));
         assert_eq!(buffer[(25, 2)].fg, Color::Rgb(0x84, 0xa0, 0xc6));
         assert_eq!(buffer[(28, 2)].fg, Color::Rgb(0xb4, 0xbe, 0x82));
+    }
+
+    #[test]
+    fn edge_badge_hit_maps_columns_to_the_segment_drawn_there() {
+        // Same layout as the draw test above: within a width-30 pane the bottom
+        // badge renders "↓ E2 W3 M4 A5" right-aligned, so its arrow sits at
+        // column 17 and each count follows.
+        let hit = |column| edge_badge_hit(0, 30, 3, false, 2, 3, 4, 5, column, 2);
+
+        assert_eq!(
+            hit(17),
+            Some(EdgeBadgeHit {
+                above: false,
+                category: EdgeBadgeCategory::Any,
+            })
+        );
+        assert_eq!(hit(19).unwrap().category, EdgeBadgeCategory::Error);
+        assert_eq!(hit(22).unwrap().category, EdgeBadgeCategory::Warning);
+        assert_eq!(hit(25).unwrap().category, EdgeBadgeCategory::Modified);
+        assert_eq!(hit(28).unwrap().category, EdgeBadgeCategory::Added);
+        // Left of the badge, and on the top row where only an above-badge lives.
+        assert_eq!(hit(16), None);
+        assert_eq!(edge_badge_hit(0, 30, 3, false, 2, 3, 4, 5, 19, 0), None);
+    }
+
+    #[test]
+    fn edge_badge_hit_skips_absent_counts() {
+        // With only warnings and modified the badge is "↓ W3 M4" right-aligned in
+        // the width-30 pane, so its arrow is at column 23 and the segments follow
+        // with no gap left for the absent error count.
+        let hit = |column| edge_badge_hit(0, 30, 3, false, 0, 3, 4, 0, column, 2);
+        assert_eq!(hit(23).unwrap().category, EdgeBadgeCategory::Any);
+        assert_eq!(hit(25).unwrap().category, EdgeBadgeCategory::Warning);
+        assert_eq!(hit(28).unwrap().category, EdgeBadgeCategory::Modified);
     }
 
     #[test]
