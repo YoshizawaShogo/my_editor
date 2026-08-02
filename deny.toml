@@ -1,8 +1,12 @@
 [advisories]
 version = 2
 ignore = [
-    # Transitively pulled in by ratatui 0.29; acceptable for this prototype until the dependency chain moves off it.
+    # `paste` (unmaintained). Transitively via ratatui 0.29; compile-time proc-macro
+    # only, no runtime exposure. Revisit when ratatui drops it.
     "RUSTSEC-2024-0436",
+    # `lru` 0.12.5 (unsound `IterMut`). Transitively via ratatui 0.29, which pins
+    # this version; not a remotely-exploitable vulnerability. Revisit on ratatui upgrade.
+    "RUSTSEC-2026-0002",
 ]
 
 [licenses]
