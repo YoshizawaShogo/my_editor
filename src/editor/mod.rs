@@ -52,6 +52,8 @@ struct LspServer {
     hover_capable: bool,
     incremental_sync: bool,
     semantic_legend: Option<crate::lsp::SemanticTokensLegend>,
+    /// Characters that trigger signature help; empty when unsupported.
+    signature_help_triggers: Vec<String>,
     error: Option<String>,
     restart_count: u8,
 }
@@ -65,6 +67,7 @@ impl LspServer {
             hover_capable: false,
             incremental_sync: false,
             semantic_legend: None,
+            signature_help_triggers: Vec::new(),
             error: None,
             restart_count: 0,
         }
@@ -78,6 +81,7 @@ impl LspServer {
         self.hover_capable = false;
         self.incremental_sync = false;
         self.semantic_legend = None;
+        self.signature_help_triggers = Vec::new();
         self.error = Some(error);
     }
 }
@@ -104,8 +108,14 @@ pub struct Editor {
     completion: Option<CompletionState>,
     completion_suppressed: Option<(DocumentId, i32)>,
     rename_input: Option<String>,
+    /// The Go-to-Line prompt: the pane side to jump in and the digits typed so
+    /// far. `Some` means the prompt is open.
+    goto_input: Option<(Side, String)>,
     confirm: Option<ConfirmState>,
     hover: Option<String>,
+    /// The signature-help popup (argument hints). Like hover, it never takes
+    /// focus — it is a plain overlay shown while typing a call.
+    signature_help: Option<SignatureHelpState>,
     deferred_hover: Option<(DocumentId, CharIdx)>,
     nav_back: Vec<(DocumentId, CharIdx)>,
     nav_forward: Vec<(DocumentId, CharIdx)>,
@@ -150,8 +160,10 @@ impl Default for Editor {
             completion: None,
             completion_suppressed: None,
             rename_input: None,
+            goto_input: None,
             confirm: None,
             hover: None,
+            signature_help: None,
             deferred_hover: None,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
@@ -185,7 +197,7 @@ impl Editor {
                 }
                 self.insert_typed_character(character, Some(at));
                 self.autocomplete_after_typing(character);
-                Vec::new()
+                self.signature_help_after_typing(character)
             }
             AppEvent::TextPaste(text) => {
                 if self.focus == Focus::Shell {
@@ -310,6 +322,7 @@ impl Editor {
                     && matches!(mouse.event.kind, MouseEventKind::Up(MouseButton::Left));
                 if matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left)) {
                     self.dismiss_completion();
+                    self.dismiss_signature_help();
                     // A plain click is a jump; remember where we were so Ctrl+E can
                     // return. Ctrl+click goes to definition, which records its own origin.
                     if !mouse.event.modifiers.contains(KeyModifiers::CONTROL)
@@ -861,6 +874,10 @@ impl Editor {
         self.rename_input.as_deref()
     }
 
+    pub fn goto_view(&self) -> Option<&str> {
+        self.goto_input.as_ref().map(|(_, digits)| digits.as_str())
+    }
+
     pub fn confirm_view(&self) -> Option<&str> {
         self.confirm
             .as_ref()
@@ -869,6 +886,15 @@ impl Editor {
 
     pub fn hover_view(&self) -> Option<&str> {
         self.hover.as_deref()
+    }
+
+    pub fn signature_help_view(&self) -> Option<SignatureHelpView<'_>> {
+        let help = self.signature_help.as_ref()?;
+        Some(SignatureHelpView {
+            label: &help.label,
+            active_parameter: help.active_parameter,
+            anchor: help.anchor,
+        })
     }
 
     pub fn terminal_contents(&self) -> Option<String> {
@@ -1164,6 +1190,7 @@ impl Editor {
                 incremental_sync,
                 hover_provider,
                 semantic_tokens_legend,
+                signature_help_triggers,
             } => {
                 self.finish_progress(&format!("lsp:{server}"));
                 if let Some(entry) = self.server_mut(server) {
@@ -1172,6 +1199,7 @@ impl Editor {
                     entry.hover_capable = hover_provider;
                     entry.incremental_sync = incremental_sync;
                     entry.semantic_legend = semantic_tokens_legend;
+                    entry.signature_help_triggers = signature_help_triggers;
                     entry.restart_count = 0;
                     entry.error = (!hover_provider).then(|| "hover is not supported".to_owned());
                 }
@@ -1438,6 +1466,26 @@ impl Editor {
                             effects.push(Effect::ScheduleHoverProbe { doc, delay_ms: 50 });
                         }
                         Err(_) => effects.push(Effect::ScheduleHoverProbe { doc, delay_ms: 500 }),
+                    }
+                }
+                Some(PendingLsp::SignatureHelp { doc, anchor }) => {
+                    // Focus-less like hover: only show it if the caret is still in
+                    // the requesting document and no overlay has taken over.
+                    if self
+                        .layout
+                        .active_editor(self.focus)
+                        .is_some_and(|pane| pane.view.doc == doc)
+                        && matches!(self.focus, Focus::Editor(_))
+                    {
+                        self.signature_help = result
+                            .ok()
+                            .and_then(|value| {
+                                serde_json::from_value::<Option<lsp_types::SignatureHelp>>(value)
+                                    .ok()
+                            })
+                            .flatten()
+                            .and_then(|help| signature_help_state(help, anchor));
+                        self.dirty = true;
                     }
                 }
                 Some(PendingLsp::SemanticTokens { doc, version }) => {
@@ -1824,6 +1872,83 @@ impl Editor {
             })
             .to_string(),
         }]
+    }
+
+    /// After a keystroke, open/refresh or close the signature-help popup. Fires
+    /// on the active server's trigger characters (usually `(` / `,`), refreshes
+    /// while the popup is already up so the active argument tracks the caret, and
+    /// closes on the call's `)`.
+    fn signature_help_after_typing(&mut self, character: char) -> Vec<Effect> {
+        if character == ')' {
+            self.dismiss_signature_help();
+            return Vec::new();
+        }
+        if !self.is_signature_help_trigger(character) && self.signature_help.is_none() {
+            return Vec::new();
+        }
+        let Some(index) = self
+            .layout
+            .active_editor(self.focus)
+            .map(|pane| pane.view.selections.primary().head)
+        else {
+            return Vec::new();
+        };
+        self.request_signature_help_at(index)
+    }
+
+    fn is_signature_help_trigger(&self, character: char) -> bool {
+        let mut buffer = [0u8; 4];
+        let needle = character.encode_utf8(&mut buffer);
+        self.layout
+            .active_editor(self.focus)
+            .and_then(|pane| self.documents.get(&pane.view.doc))
+            .and_then(|document| document.language.as_deref())
+            .and_then(|language| self.lsp_servers.get(language))
+            .and_then(|id| self.servers.get(id))
+            .filter(|server| server.ready)
+            .is_some_and(|server| {
+                server
+                    .signature_help_triggers
+                    .iter()
+                    .any(|trigger| trigger == needle)
+            })
+    }
+
+    fn request_signature_help_at(&mut self, index: CharIdx) -> Vec<Effect> {
+        self.pending_lsp
+            .retain(|_, pending| !matches!(pending, PendingLsp::SignatureHelp { .. }));
+        let Some((server, path, line, character)) = self.active_lsp_context_at(index) else {
+            return Vec::new();
+        };
+        let Some(doc) = self
+            .layout
+            .active_editor(self.focus)
+            .map(|pane| pane.view.doc)
+        else {
+            return Vec::new();
+        };
+        let id = self.next_lsp_request;
+        self.next_lsp_request += 1;
+        self.pending_lsp
+            .insert(id, PendingLsp::SignatureHelp { doc, anchor: index });
+        vec![Effect::LspRequest {
+            server,
+            id,
+            method: "textDocument/signatureHelp".to_owned(),
+            params: serde_json::json!({
+                "textDocument": {"uri": format!("file://{}", path.display())},
+                "position": {"line": line, "character": character}
+            })
+            .to_string(),
+        }]
+    }
+
+    fn dismiss_signature_help(&mut self) {
+        if self.signature_help.take().is_some() {
+            self.dirty = true;
+        }
+        self.pending_lsp
+            .retain(|_, pending| !matches!(pending, PendingLsp::SignatureHelp { .. }));
     }
 
     fn request_hover_at(&mut self, index: CharIdx) -> Vec<Effect> {
@@ -2495,6 +2620,8 @@ impl Editor {
             } => self.move_active(direction, unit, extend),
             Command::SelectAll => self.select_all(),
             Command::CollapseSelections => {
+                // Esc also closes the focus-less signature-help popup.
+                self.dismiss_signature_help();
                 // The diff is display-only, so Esc backs out of it. Selections
                 // there exist only for copying, and are not what you are trying
                 // to escape from.
@@ -2565,7 +2692,10 @@ impl Editor {
             Command::PickerUp => self.move_picker(-1),
             Command::PickerDown => self.move_picker(1),
             Command::PickerBackspace => {
-                if let Some(rename) = &mut self.rename_input {
+                if let Some((_, digits)) = &mut self.goto_input {
+                    digits.pop();
+                    self.dirty = true;
+                } else if let Some(rename) = &mut self.rename_input {
                     rename.pop();
                     self.dirty = true;
                 } else if self.search().is_some() {
@@ -2653,6 +2783,50 @@ impl Editor {
                     self.dirty = true;
                 } else {
                     self.status = Some("このバッファではリネームを利用できません".to_owned());
+                }
+            }
+            Command::GoToLine => {
+                // Mirror the rename prompt: a modal single-line input on the
+                // shared overlay focus. Remember the side so the jump lands in the
+                // pane the caret was in, even in a split.
+                self.hover = None;
+                self.deferred_hover = None;
+                self.completion = None;
+                self.goto_input = Some((self.focused_side(), String::new()));
+                self.focus = Focus::Overlay;
+                self.dirty = true;
+            }
+            Command::Reload => {
+                // Re-read the active file from disk. The editor already auto-reloads
+                // unmodified buffers on external change; this covers the one case it
+                // won't touch — a buffer with unsaved edits — by confirming before
+                // discarding them.
+                let Some(doc) = self
+                    .layout
+                    .active_editor(self.focus)
+                    .map(|pane| pane.view.doc)
+                else {
+                    return Vec::new();
+                };
+                let Some(document) = self.documents.get(&doc) else {
+                    return Vec::new();
+                };
+                let Some(path) = document.path.clone() else {
+                    self.status = Some("再読込できるファイルがありません".to_owned());
+                    return Vec::new();
+                };
+                let modified = document
+                    .editable_opt()
+                    .is_some_and(|editable| editable.modified);
+                if modified {
+                    self.confirm = Some(ConfirmState {
+                        message: "未保存の変更を破棄して再読込しますか? [Enter / Esc]".to_owned(),
+                        action: ConfirmAction::ReloadDiscard(doc),
+                    });
+                    self.focus = Focus::Overlay;
+                    self.dirty = true;
+                } else {
+                    return vec![Effect::ReadFile { id: doc, path }];
                 }
             }
             Command::Format => return self.request_formatting(),
@@ -4124,6 +4298,14 @@ impl Editor {
     }
 
     fn overlay_input(&mut self, character: char) -> Vec<Effect> {
+        if let Some((_, digits)) = &mut self.goto_input {
+            // A line number: ignore everything but digits.
+            if character.is_ascii_digit() {
+                digits.push(character);
+                self.dirty = true;
+            }
+            return Vec::new();
+        }
         if let Some(rename) = &mut self.rename_input {
             rename.push(character);
             self.dirty = true;
@@ -4299,11 +4481,43 @@ impl Editor {
                     }];
                 }
                 ConfirmAction::CloseDiscard(doc) => return self.close_document(doc),
+                ConfirmAction::ReloadDiscard(doc) => {
+                    let Some(path) = self.documents.get(&doc).and_then(|d| d.path.clone()) else {
+                        return Vec::new();
+                    };
+                    return vec![Effect::ReadFile { id: doc, path }];
+                }
                 ConfirmAction::QuitDiscard => {
                     self.quit = true;
                     return vec![Effect::Quit];
                 }
             }
+        }
+        if let Some((side, digits)) = self.goto_input.take() {
+            self.focus = Focus::Editor(side);
+            // Line numbers are 1-based; clamp to the last line so a too-large
+            // number lands at the end rather than doing nothing.
+            let target = digits
+                .parse::<usize>()
+                .ok()
+                .filter(|line| *line >= 1)
+                .and_then(|line| {
+                    let doc = self
+                        .layout
+                        .active_editor(self.focus)
+                        .map(|pane| pane.view.doc)?;
+                    let editable = self.documents.get(&doc).and_then(Document::editable_opt)?;
+                    let text = editable.text();
+                    let last = text.len_lines().saturating_sub(1);
+                    Some((doc, CharIdx(text.line_to_char((line - 1).min(last)))))
+                });
+            if let Some((doc, head)) = target {
+                self.record_jump_origin();
+                self.go_to_location(doc, head);
+            } else {
+                self.dirty = true;
+            }
+            return Vec::new();
         }
         if let Some(new_name) = self.rename_input.take() {
             let Some((server, path, line, character)) = self.active_lsp_context() else {
@@ -4463,6 +4677,7 @@ impl Editor {
         self.take_search();
         self.completion = None;
         self.rename_input = None;
+        self.goto_input = None;
         self.confirm = None;
         if scanning {
             self.finish_progress("file-scan");
@@ -5012,6 +5227,7 @@ impl Editor {
 
     fn move_active(&mut self, direction: Direction, unit: Unit, extend: bool) {
         self.dismiss_completion();
+        self.dismiss_signature_help();
         let focus = self.focus;
         let (documents, layout) = (&mut self.documents, &mut self.layout);
         let Some(pane) = layout.active_editor_mut(focus) else {
@@ -5367,6 +5583,18 @@ const COMMAND_PALETTE: &[CommandPaletteEntry] = &[
         command: Command::Rename,
     },
     CommandPaletteEntry {
+        key: "Ctrl+N",
+        name: "Go to Line / 行番号ジャンプ",
+        description: "指定した行番号へカーソルを移動",
+        command: Command::GoToLine,
+    },
+    CommandPaletteEntry {
+        key: "F5",
+        name: "Reload File / 再読込",
+        description: "ファイルをディスクから読み直す（未保存時は確認）",
+        command: Command::Reload,
+    },
+    CommandPaletteEntry {
         key: "—",
         name: "Format Document / 整形",
         description: "LSPで文書を整形",
@@ -5512,6 +5740,7 @@ enum ConfirmAction {
         replacement: String,
     },
     CloseDiscard(DocumentId),
+    ReloadDiscard(DocumentId),
     QuitDiscard,
 }
 
@@ -5740,6 +5969,10 @@ enum PendingLsp {
     HoverProbe {
         doc: DocumentId,
     },
+    SignatureHelp {
+        doc: DocumentId,
+        anchor: CharIdx,
+    },
     SemanticTokens {
         doc: DocumentId,
         version: i32,
@@ -5853,6 +6086,62 @@ fn sampled_hover_probe_indices(text: &Rope, limit: usize) -> Vec<CharIdx> {
     indices
 }
 
+/// Reduce an LSP `SignatureHelp` to the one signature line to show and the byte
+/// range of the active parameter within it. Returns `None` when there is nothing
+/// to show, which closes the popup.
+fn signature_help_state(
+    help: lsp_types::SignatureHelp,
+    anchor: CharIdx,
+) -> Option<SignatureHelpState> {
+    let active = help.active_signature.unwrap_or(0) as usize;
+    let signature = help
+        .signatures
+        .get(active)
+        .or_else(|| help.signatures.first())?;
+    let label = signature.label.clone();
+    let active_index = signature.active_parameter.or(help.active_parameter);
+    let active_parameter = active_index.and_then(|index| {
+        let parameter = signature.parameters.as_ref()?.get(index as usize)?;
+        parameter_byte_range(&label, &parameter.label)
+    });
+    Some(SignatureHelpState {
+        label,
+        active_parameter,
+        anchor,
+    })
+}
+
+/// The byte range of a parameter within its signature label. Simple labels are
+/// matched as substrings; offset labels are UTF-16 code-unit offsets per the LSP
+/// spec, converted to byte offsets here.
+fn parameter_byte_range(
+    label: &str,
+    parameter: &lsp_types::ParameterLabel,
+) -> Option<(usize, usize)> {
+    match parameter {
+        lsp_types::ParameterLabel::Simple(text) => {
+            let start = label.find(text.as_str())?;
+            Some((start, start + text.len()))
+        }
+        lsp_types::ParameterLabel::LabelOffsets(offsets) => {
+            let start = utf16_offset_to_byte(label, offsets[0] as usize)?;
+            let end = utf16_offset_to_byte(label, offsets[1] as usize)?;
+            (start <= end).then_some((start, end))
+        }
+    }
+}
+
+fn utf16_offset_to_byte(text: &str, target: usize) -> Option<usize> {
+    let mut utf16 = 0;
+    for (byte, character) in text.char_indices() {
+        if utf16 == target {
+            return Some(byte);
+        }
+        utf16 += character.len_utf16();
+    }
+    (utf16 == target).then_some(text.len())
+}
+
 fn marked_string(marked: lsp_types::MarkedString) -> String {
     match marked {
         lsp_types::MarkedString::String(value) => value,
@@ -5881,6 +6170,22 @@ struct CompletionCandidate {
 pub struct CompletionView {
     pub items: Vec<String>,
     pub selected: usize,
+    pub anchor: CharIdx,
+}
+
+/// The signature-help popup: one signature line and the byte range within it to
+/// highlight as the active parameter. `anchor` positions it at the caret like the
+/// completion popup.
+#[derive(Debug)]
+struct SignatureHelpState {
+    label: String,
+    active_parameter: Option<(usize, usize)>,
+    anchor: CharIdx,
+}
+
+pub struct SignatureHelpView<'a> {
+    pub label: &'a str,
+    pub active_parameter: Option<(usize, usize)>,
     pub anchor: CharIdx,
 }
 
@@ -6187,6 +6492,144 @@ mod tests {
         let head = buffer.view.selections.primary().head;
         assert_eq!(buffer.text.char_to_line(head.0), 20);
         assert!(buffer.view.scroll.top_line > 0);
+    }
+
+    #[test]
+    fn go_to_line_jumps_to_the_typed_line_and_ignores_non_digits() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 10 });
+        let text = (0..30)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.update(AppEvent::TextPaste(text));
+
+        editor.update(Command::GoToLine.into());
+        assert_eq!(editor.goto_view(), Some(""));
+        editor.update(AppEvent::TextInput('x')); // ignored — digits only
+        assert_eq!(editor.goto_view(), Some(""));
+        editor.update(AppEvent::TextInput('1'));
+        editor.update(AppEvent::TextInput('2'));
+        assert_eq!(editor.goto_view(), Some("12"));
+        editor.update(Command::PickerConfirm.into());
+
+        assert_eq!(editor.goto_view(), None);
+        let buffer = editor.active_buffer().unwrap();
+        // 1-based line 12 → 0-based line 11.
+        assert_eq!(
+            buffer
+                .text
+                .char_to_line(buffer.view.selections.primary().head.0),
+            11
+        );
+    }
+
+    #[test]
+    fn go_to_line_escape_leaves_the_caret_where_it_was() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 10 });
+        let text = (0..30)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.update(AppEvent::TextPaste(text));
+        editor.update(
+            Command::Move {
+                direction: Direction::Left,
+                unit: Unit::Document,
+                extend: false,
+            }
+            .into(),
+        );
+        let before = editor
+            .active_buffer()
+            .unwrap()
+            .view
+            .selections
+            .primary()
+            .head;
+
+        editor.update(Command::GoToLine.into());
+        editor.update(AppEvent::TextInput('5'));
+        editor.update(Command::PickerCancel.into());
+
+        assert_eq!(editor.goto_view(), None);
+        assert_eq!(
+            editor
+                .active_buffer()
+                .unwrap()
+                .view
+                .selections
+                .primary()
+                .head,
+            before
+        );
+    }
+
+    #[test]
+    fn go_to_line_clamps_a_number_past_the_end_to_the_last_line() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 10 });
+        let text = (0..30)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.update(AppEvent::TextPaste(text));
+
+        editor.update(Command::GoToLine.into());
+        for digit in "999".chars() {
+            editor.update(AppEvent::TextInput(digit));
+        }
+        editor.update(Command::PickerConfirm.into());
+
+        let buffer = editor.active_buffer().unwrap();
+        assert_eq!(
+            buffer
+                .text
+                .char_to_line(buffer.view.selections.primary().head.0),
+            buffer.text.len_lines() - 1
+        );
+    }
+
+    #[test]
+    fn reload_reads_an_unmodified_file_from_disk_immediately() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 10 });
+        editor.open_paths([PathBuf::from("main.rs")]);
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok("fn main() {}".to_owned()),
+        }));
+
+        let effects = editor.update(Command::Reload.into());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::ReadFile { path, .. }] if path == &PathBuf::from("main.rs")
+        ));
+    }
+
+    #[test]
+    fn reload_confirms_before_discarding_unsaved_edits() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 10 });
+        editor.open_paths([PathBuf::from("main.rs")]);
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok("fn main() {}".to_owned()),
+        }));
+        editor.update(AppEvent::TextInput('x'));
+
+        // A modified buffer asks first, and does not read yet.
+        let effects = editor.update(Command::Reload.into());
+        assert!(effects.is_empty());
+        assert!(editor.confirm_view().is_some());
+
+        // Confirming discards the edits and reads from disk.
+        let effects = editor.update(Command::PickerConfirm.into());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::ReadFile { path, .. }] if path == &PathBuf::from("main.rs")
+        ));
     }
 
     #[test]
@@ -6686,6 +7129,7 @@ mod tests {
             incremental_sync: true,
             hover_provider: true,
             semantic_tokens_legend: None,
+            signature_help_triggers: Vec::new(),
         }));
 
         assert!(effects.iter().any(|effect| matches!(
@@ -8052,6 +8496,76 @@ mod tests {
     }
 
     #[test]
+    fn typing_a_trigger_character_requests_signature_help() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("/tmp/call.rs")]);
+        editor.documents.get_mut(&DocumentId(1)).unwrap().language = Some("rust".to_owned());
+        let server = editor.test_register_server("rust", 1);
+        server.ready = true;
+        server.signature_help_triggers = vec!["(".to_owned(), ",".to_owned()];
+        editor.test_open_doc(DocumentId(1), 1);
+
+        // A non-trigger character asks for nothing.
+        assert!(editor.signature_help_after_typing('x').is_empty());
+
+        let effects = editor.signature_help_after_typing('(');
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::LspRequest { server: 1, method, .. }]
+                if method == "textDocument/signatureHelp"
+        ));
+    }
+
+    #[test]
+    fn signature_help_response_highlights_the_active_parameter_and_closes_on_paren() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("/tmp/call.rs")]);
+        editor.documents.get_mut(&DocumentId(1)).unwrap().language = Some("rust".to_owned());
+        let server = editor.test_register_server("rust", 1);
+        server.ready = true;
+        server.signature_help_triggers = vec!["(".to_owned()];
+        editor.test_open_doc(DocumentId(1), 1);
+
+        let effects = editor.signature_help_after_typing('(');
+        let id = match effects.as_slice() {
+            [Effect::LspRequest { id, .. }] => *id,
+            other => panic!("expected a signature help request, got {other:?}"),
+        };
+
+        // "fn add(a: i32, b: i32)" — the second parameter "b: i32" is bytes 15..21.
+        let result = serde_json::json!({
+            "signatures": [{
+                "label": "fn add(a: i32, b: i32)",
+                "parameters": [{"label": [7, 13]}, {"label": [15, 21]}],
+            }],
+            "activeSignature": 0,
+            "activeParameter": 1
+        });
+        editor.update(AppEvent::Lsp(LspEvent::Response {
+            id,
+            result: Ok(result),
+        }));
+
+        let view = editor.signature_help_view().expect("popup shown");
+        assert_eq!(view.label, "fn add(a: i32, b: i32)");
+        assert_eq!(view.active_parameter, Some((15, 21)));
+
+        // Closing the call dismisses the popup.
+        editor.signature_help_after_typing(')');
+        assert!(editor.signature_help_view().is_none());
+    }
+
+    #[test]
+    fn utf16_parameter_offsets_map_across_multibyte_characters() {
+        // "aあb": 'あ' is one UTF-16 unit but three bytes.
+        assert_eq!(utf16_offset_to_byte("aあb", 0), Some(0));
+        assert_eq!(utf16_offset_to_byte("aあb", 1), Some(1));
+        assert_eq!(utf16_offset_to_byte("aあb", 2), Some(4));
+        assert_eq!(utf16_offset_to_byte("aあb", 3), Some(5));
+        assert_eq!(utf16_offset_to_byte("aあb", 9), None);
+    }
+
+    #[test]
     fn file_opened_after_lsp_initialization_gets_did_open_and_semantic_tokens() {
         let mut editor = Editor::default();
         editor.open_paths([PathBuf::from("/tmp/first.rs")]);
@@ -8068,6 +8582,7 @@ mod tests {
             incremental_sync: true,
             hover_provider: true,
             semantic_tokens_legend: None,
+            signature_help_triggers: Vec::new(),
         }));
 
         editor.open_paths([PathBuf::from("/tmp/second.rs")]);
@@ -8147,6 +8662,7 @@ mod tests {
             incremental_sync: true,
             hover_provider: true,
             semantic_tokens_legend: None,
+            signature_help_triggers: Vec::new(),
         }));
         assert!(editor.doc_is_opened(DocumentId(1)));
         let version_before = editor.doc_version(DocumentId(1)).unwrap();
@@ -8236,6 +8752,7 @@ mod tests {
             incremental_sync: true,
             hover_provider: true,
             semantic_tokens_legend: None,
+            signature_help_triggers: Vec::new(),
         }));
         assert_eq!(
             editor.active_buffer().unwrap().language_status,

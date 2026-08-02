@@ -46,6 +46,9 @@ pub fn translate(raw: RawInput, _focus: &Focus, pending: &mut KeyChordState) -> 
             None
         }
         RawInput::Key { event: key, .. } if key.code == KeyCode::F(4) => Some(Command::Quit.into()),
+        RawInput::Key { event: key, .. } if key.code == KeyCode::F(5) => {
+            Some(Command::Reload.into())
+        }
         RawInput::Key { event: key, .. } if key.code == KeyCode::F(6) => {
             Some(Command::OpenDiffPicker.into())
         }
@@ -162,6 +165,7 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
     }
     match key.code {
         KeyCode::F(2) => Some(Command::Rename.into()),
+        KeyCode::Char('n') if ctrl => Some(Command::GoToLine.into()),
         KeyCode::Char('z') if ctrl => Some(Command::Undo.into()),
         KeyCode::Char('y') if ctrl => Some(Command::Redo.into()),
         KeyCode::Char('e') if ctrl => Some(Command::NavigateBack.into()),

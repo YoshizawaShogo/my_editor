@@ -175,10 +175,16 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
     if let Some(hover) = editor.hover_view() {
         draw_hover(frame, editor, hover);
     }
+    if let Some(help) = editor.signature_help_view() {
+        draw_signature_help(frame, editor, &help);
+    }
     // The rename prompt is modal, so it draws last — on top of any hover or
     // diagnostic popup that would otherwise sit over it.
     if let Some(rename) = editor.rename_view() {
         draw_rename(frame, rename);
+    }
+    if let Some(goto) = editor.goto_view() {
+        draw_goto_line(frame, goto);
     }
 }
 
@@ -514,6 +520,22 @@ fn draw_rename(frame: &mut Frame<'_>, value: &str) {
     );
 }
 
+fn draw_goto_line(frame: &mut Frame<'_>, value: &str) {
+    let viewport = overlay_area(frame);
+    let width = viewport.width.saturating_sub(4).clamp(1, 56);
+    let area = Rect {
+        x: viewport.x + (viewport.width.saturating_sub(width)) / 2,
+        y: viewport.y + 2,
+        width,
+        height: 3.min(viewport.height.saturating_sub(2)),
+    };
+    let inner = draw_popup_frame(frame, area);
+    frame.render_widget(
+        Paragraph::new(format!("Go to line  {value}")).style(Style::default().fg(FG).bg(POPUP_BG)),
+        inner,
+    );
+}
+
 fn draw_completion(
     frame: &mut Frame<'_>,
     editor: &Editor,
@@ -547,6 +569,43 @@ fn draw_completion(
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(POPUP_BG)),
+        inner,
+    );
+}
+
+fn draw_signature_help(
+    frame: &mut Frame<'_>,
+    editor: &Editor,
+    help: &crate::editor::SignatureHelpView<'_>,
+) {
+    let viewport = overlay_area(frame);
+    let Some(cursor) = completion_anchor_position(editor, viewport, help.anchor) else {
+        return;
+    };
+    let Some(area) = completion_popup_area(viewport, cursor, 1) else {
+        return;
+    };
+    let inner = draw_popup_frame(frame, area);
+    // The label is one line; fold any stray newline so byte offsets (which index
+    // the original string) stay valid — '\n' and ' ' are both one byte.
+    let label = help.label.replace('\n', " ");
+    let dim = Style::default().fg(MUTED).bg(POPUP_BG);
+    let spans = match help.active_parameter {
+        Some((start, end)) if start <= end && end <= label.len() => vec![
+            Span::styled(label[..start].to_string(), dim),
+            Span::styled(
+                label[start..end].to_string(),
+                Style::default()
+                    .fg(FG)
+                    .bg(POPUP_BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(label[end..].to_string(), dim),
+        ],
+        _ => vec![Span::styled(label, Style::default().fg(FG).bg(POPUP_BG))],
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(POPUP_BG)),
         inner,
     );
 }

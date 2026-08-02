@@ -37,6 +37,8 @@ pub enum Command {
     SearchToggleHidden,
     ToggleCompletion,
     Rename,
+    GoToLine,
+    Reload,
     Format,
     ToggleShell,
     ToggleSplit,

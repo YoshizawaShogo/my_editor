@@ -565,6 +565,7 @@ impl Runtime {
                                 incremental_sync: capabilities.incremental_sync,
                                 hover_provider: capabilities.hover_provider,
                                 semantic_tokens_legend: capabilities.semantic_tokens_legend,
+                                signature_help_triggers: capabilities.signature_help_triggers,
                             },
                             Err(error) => crate::lsp::LspEvent::InitializationFailed {
                                 server,
@@ -621,6 +622,11 @@ impl Runtime {
                     },
                     "textDocument": {
                         "hover": {"contentFormat": ["markdown", "plaintext"]},
+                        "signatureHelp": {
+                            "signatureInformation": {
+                                "documentationFormat": ["markdown", "plaintext"]
+                            }
+                        },
                         "semanticTokens": {
                             "requests": {"full": true},
                             "tokenTypes": [
@@ -860,6 +866,7 @@ struct InitializeCapabilities {
     incremental_sync: bool,
     hover_provider: bool,
     semantic_tokens_legend: Option<crate::lsp::SemanticTokensLegend>,
+    signature_help_triggers: Vec<String>,
 }
 
 fn parse_initialize_response(
@@ -912,10 +919,22 @@ fn parse_initialize_response(
                 .map(|modifier| modifier.as_str().to_owned())
                 .collect(),
         });
+    // A signature-help provider without explicit trigger characters still fires
+    // on the conventional call punctuation.
+    let signature_help_triggers = result
+        .capabilities
+        .signature_help_provider
+        .map(|options| {
+            options
+                .trigger_characters
+                .unwrap_or_else(|| vec!["(".to_owned(), ",".to_owned()])
+        })
+        .unwrap_or_default();
     Ok(InitializeCapabilities {
         incremental_sync,
         hover_provider,
         semantic_tokens_legend,
+        signature_help_triggers,
     })
 }
 
@@ -1489,6 +1508,7 @@ mod tests {
                 incremental_sync: true,
                 hover_provider: true,
                 semantic_tokens_legend: None,
+                signature_help_triggers: Vec::new(),
             })
         );
     }
@@ -1522,6 +1542,7 @@ mod tests {
                     token_types: vec!["unresolvedReference".to_owned(), "function".to_owned()],
                     token_modifiers: vec!["deprecated".to_owned()],
                 }),
+                signature_help_triggers: Vec::new(),
             })
         );
     }

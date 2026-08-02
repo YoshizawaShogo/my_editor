@@ -43,6 +43,9 @@ pub enum LspEvent {
         incremental_sync: bool,
         hover_provider: bool,
         semantic_tokens_legend: Option<SemanticTokensLegend>,
+        /// The characters that should trigger `textDocument/signatureHelp`
+        /// (typically `(` and `,`). Empty when the server has no such provider.
+        signature_help_triggers: Vec<String>,
     },
     InitializationFailed {
         server: u64,

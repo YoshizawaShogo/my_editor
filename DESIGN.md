@@ -16,6 +16,12 @@
 - マルチルートワークスペース。
 - ミニマップ / 右端 overview ruler（TUI では作らない。画面外の提示はエッジ矢印＋件数で行う。§9.5）。
 - キーバインドのユーザ再定義（キーマップは内蔵固定）。
+- 行の上下移動（Move Line Up/Down）・行の複製（Duplicate Line）。使わないため作らない。
+- LSP 参照検索（Find References, `textDocument/references`）。スコープを絞る方針で使用頻度が低く、問題は lint で落とすため作らない。
+- LSP シンボル移動／アウトライン（`textDocument/documentSymbol`）。専用レイアウト（サイドバー等）の追加コストに見合わず、`Ctrl+F` 検索で代替できるため作らない。
+- LSP コードアクション／クイックフィックス（`textDocument/codeAction`）。使わないため作らない。修正は手動＋lintで対応。
+- 名前を付けて保存（Save As）。使わないため作らない。新規ファイルはファイルピッカーへのパス直接入力で作成する。
+- 保存時フォーマット（format on save）・保存時末尾空白除去。使わないため作らない。整形は必要時に手動で行う。
 
 ## 2. 設計原則（実装全体の指針）
 
@@ -552,6 +558,7 @@ VSCode ライクでも全ショートカットは実装しない。**右手は�
 | 矢印 / `Home` / `End` | カーソル移動 | |
 | `Ctrl+←/→` | 単語移動 | |
 | `Ctrl+Home` / `Ctrl+End` | 文書頭 / 末へ | ページ送りの代替 |
+| `Ctrl+N` | 行番号ジャンプ（Go to Line） | 番号入力プロンプトを開き、指定行へ移動。`Ctrl+G` はバッファピッカーで使用済みのため別キー。`Ctrl+J` は Enter(LF)衝突、`Ctrl+L` は clear の癖で誤爆するため避けた |
 | `Shift+移動` | 選択拡張 | |
 | `Ctrl+A` | 全選択 | |
 | `Ctrl+D` | 次の同一語を選択 | マルチカーソル |
@@ -570,6 +577,7 @@ VSCode ライクでも全ショートカットは実装しない。**右手は�
 | `Ctrl+Shift+F` | 検索をディレクトリスコープで直接開く | 循環の 3 段目へ一発 |
 | `Ctrl+@` / `Ctrl+Space` | 補完ポップアップ トグル | 同じNUL入力を同一操作として扱う。上下で選択 / `Enter`で確定。表示中も他のキーは通常編集 |
 | `F2` | リネーム | LSP |
+| `F5` | ファイル再読込 | ディスクから読み直す。未編集は自動再読込済み（§4.x）だが、未保存編集ありの競合時は確認ダイアログで破棄可否を尋ねる |
 | `Ctrl+]` | 左右エディタ分割トグル | フォーカス追従（モード1↔3） |
 | `Ctrl+O` | シェル表示トグル | フォーカス追従（モード1↔2） |
 | `F4` | エディタ終了 | Alt+F4 のイメージ。未保存があれば `Confirm`。あまり押さない前提の隔離キー |
@@ -613,7 +621,14 @@ struct LspHandle { to_server: mpsc::Sender<LspOutbound> }   // メイン→ア�
 
 ### 8.3 対応機能（全機能）
 
-診断（publishDiagnostics）／補完（completion＋ポップアップ）／定義ジャンプ（definition）／ホバー（hover）／リネーム（rename＋WorkspaceEdit 適用）／整形（formatting）。ドキュメント同期は `didOpen`/`didChange`(増分)/`didSave`/`didClose`。
+診断（publishDiagnostics）／補完（completion＋ポップアップ）／定義ジャンプ（definition）／ホバー（hover）／リネーム（rename＋WorkspaceEdit 適用）／整形（formatting）／シグネチャヘルプ（signatureHelp）。ドキュメント同期は `didOpen`/`didChange`(増分)/`didSave`/`didClose`。
+
+シグネチャヘルプ（引数ヒント。`textDocument/signatureHelp`）は、関数呼び出しの入力中に引数の並びと現在位置を提示する。挙動:
+
+- **トリガ**: サーバが `initialize` で返す `signatureHelpProvider.triggerCharacters`（無指定時は `(` と `,`）を入力したとき自動要求。表示中はさらに入力するたび再要求して `activeParameter` を追従させ、`)`・`Esc`・カーソル移動・クリックで閉じる。専用キーは持たない。
+- **表示**: 関数シグネチャ1行を補完ポップアップと同じくキャレット直下に出し、`activeParameter` の引数を太字強調（残りは淡色）。複数オーバーロードは `activeSignature` を採用。パラメータ位置は LSP の UTF-16 オフセットをバイトオフセットへ変換して求める。
+- **マルチカーソル時**: primary カーソルのみ（他の位置依存 LSP と同じ方針）。
+- 実装は `Overlay` の variant ではなく、hover と同じく `Editor` の `signature_help: Option<..>` フィールドとして持ち、focus を奪わず描画する（トリガ文字は `LspServer` に保持）。
 
 MVP の起動導線（§7.4 確定）:
 
