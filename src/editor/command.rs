@@ -74,6 +74,9 @@ pub enum Unit {
     Character,
     Word,
     Line,
+    /// Smart Home: the first non-blank column, toggling to column 0 when already
+    /// there. Only meaningful with `Direction::Left`.
+    LineStartSmart,
     Document,
 }
 

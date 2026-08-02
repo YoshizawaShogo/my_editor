@@ -211,7 +211,11 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
         KeyCode::Down => Some(move_event(Direction::Down, Unit::Character, shift)),
         KeyCode::Home => Some(move_event(
             Direction::Left,
-            if ctrl { Unit::Document } else { Unit::Line },
+            if ctrl {
+                Unit::Document
+            } else {
+                Unit::LineStartSmart
+            },
             shift,
         )),
         KeyCode::End => Some(move_event(

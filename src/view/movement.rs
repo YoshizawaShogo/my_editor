@@ -16,6 +16,7 @@ pub fn move_head(
     let head = match unit {
         Unit::Character => move_character(text, selection.head, direction),
         Unit::Line => move_line(text, selection.head, direction),
+        Unit::LineStartSmart => smart_home(text, selection.head),
         Unit::Document => move_document(text, direction),
         Unit::Word => move_word(text, selection.head, direction),
     };
@@ -84,6 +85,26 @@ fn move_word(text: &Rope, index: CharIdx, direction: Direction) -> CharIdx {
     }
 }
 
+/// Smart Home: jump to the first non-blank character of the line, or to column 0
+/// when the caret is already sitting on it. Toggling between the two is what makes
+/// a single Home key do both.
+fn smart_home(text: &Rope, index: CharIdx) -> CharIdx {
+    let head = index.0.min(text.len_chars());
+    let line = text.char_to_line(head);
+    let line_start = text.line_to_char(line);
+    let indent = text
+        .line(line)
+        .chars()
+        .take_while(|character| *character == ' ' || *character == '\t')
+        .count();
+    let first_non_blank = line_start + indent;
+    if head == first_non_blank {
+        CharIdx(line_start)
+    } else {
+        CharIdx(first_non_blank)
+    }
+}
+
 pub fn is_word(character: char) -> bool {
     character.is_alphanumeric() || character == '_'
 }
@@ -100,6 +121,54 @@ mod tests {
         let moved = move_head(&text, selection, Direction::Down, Unit::Character, false);
 
         assert_eq!(moved, Selection::caret(CharIdx(9)));
+    }
+
+    #[test]
+    fn smart_home_toggles_between_first_non_blank_and_column_zero() {
+        let text = Rope::from_str("    let x = 1;\n");
+        // From the end of the line, Home lands on the first non-blank ("let").
+        let from_end = move_head(
+            &text,
+            Selection::caret(CharIdx(13)),
+            Direction::Left,
+            Unit::LineStartSmart,
+            false,
+        );
+        assert_eq!(from_end.head, CharIdx(4));
+
+        // Pressing it again, already on the first non-blank, goes to column 0.
+        let from_indent = move_head(
+            &text,
+            Selection::caret(CharIdx(4)),
+            Direction::Left,
+            Unit::LineStartSmart,
+            false,
+        );
+        assert_eq!(from_indent.head, CharIdx(0));
+
+        // And once more toggles back to the first non-blank.
+        let from_start = move_head(
+            &text,
+            Selection::caret(CharIdx(0)),
+            Direction::Left,
+            Unit::LineStartSmart,
+            false,
+        );
+        assert_eq!(from_start.head, CharIdx(4));
+    }
+
+    #[test]
+    fn smart_home_extends_the_selection_when_asked() {
+        let text = Rope::from_str("    value\n");
+        let moved = move_head(
+            &text,
+            Selection::caret(CharIdx(9)),
+            Direction::Left,
+            Unit::LineStartSmart,
+            true,
+        );
+        assert_eq!(moved.anchor, CharIdx(9));
+        assert_eq!(moved.head, CharIdx(4));
     }
 
     #[test]
