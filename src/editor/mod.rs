@@ -346,7 +346,7 @@ impl Editor {
                     Ok(config) => {
                         self.config = config;
                         self.refresh_languages();
-                        self.start_workspace_lsps()
+                        self.start_lsps_for_open_documents()
                     }
                     Err(error) => {
                         self.status = Some(error);
@@ -1976,30 +1976,16 @@ impl Editor {
         }]
     }
 
-    fn start_workspace_lsps(&mut self) -> Vec<Effect> {
-        let servers: Vec<_> = self
-            .config
-            .language
-            .iter()
-            .filter_map(|language| {
-                language
-                    .lsp
-                    .clone()
-                    .map(|command| (language.name.clone(), command))
-            })
-            .collect();
+    /// Start a language server for each language that is *actually open*, once the
+    /// config that names those servers has loaded. Opening a `.md` file must not
+    /// spawn rust-analyzer — a server only starts when a document of its language
+    /// is present. Files opened later start their server lazily through
+    /// [`Self::start_or_open_lsp`] on load.
+    fn start_lsps_for_open_documents(&mut self) -> Vec<Effect> {
+        let docs: Vec<DocumentId> = self.documents.keys().copied().collect();
         let mut effects = Vec::new();
-        for (language, command) in servers {
-            if self.lsp_servers.contains_key(&language) {
-                continue;
-            }
-            let server = self.register_server(language.clone());
-            effects.push(Effect::SpawnLsp {
-                server,
-                language,
-                command,
-                root: self.workspace_root.clone(),
-            });
+        for doc in docs {
+            effects.extend(self.start_or_open_lsp(doc));
         }
         effects
     }
@@ -8190,19 +8176,34 @@ mod tests {
     }
 
     #[test]
-    fn loading_config_starts_workspace_lsp_before_a_language_file_is_opened() {
+    fn loading_config_does_not_start_a_language_server_until_its_file_is_opened() {
         let mut editor = Editor::default();
         editor.set_workspace_root(PathBuf::from("/workspace"));
 
+        // No language file is open, so loading the config must not spawn any
+        // server — opening, say, a Markdown file should never wake rust-analyzer.
         let effects = editor.update(AppEvent::ConfigLoaded(Ok(Config::default())));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SpawnLsp { .. }))
+        );
 
+        // Opening a Rust file starts rust-analyzer lazily.
+        editor.open_paths([PathBuf::from("main.rs")]);
+        let effects = editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok("fn main() {}".to_owned()),
+        }));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::SpawnLsp {
+            effects
+                .iter()
+                .find(|effect| matches!(effect, Effect::SpawnLsp { .. })),
+            Some(Effect::SpawnLsp {
                 language,
                 root,
                 ..
-            }] if language == "rust" && root == &PathBuf::from("/workspace")
+            }) if language == "rust" && root == &PathBuf::from("/workspace")
         ));
     }
 
