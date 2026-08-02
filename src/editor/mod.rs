@@ -3305,8 +3305,8 @@ impl Editor {
     fn apply_mouse(&mut self, input: MouseInput) {
         let mouse = input.event;
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_active(-3),
-            MouseEventKind::ScrollDown => self.scroll_active(3),
+            MouseEventKind::ScrollUp => self.scroll_at(mouse.column, -3),
+            MouseEventKind::ScrollDown => self.scroll_at(mouse.column, 3),
             MouseEventKind::Down(MouseButton::Left) => {
                 let divider = split_left_width(self.terminal_size.0);
                 if self.layout.right.is_some() && mouse.column == divider {
@@ -4632,12 +4632,17 @@ impl Editor {
         Some(CharIdx(text.len_chars()))
     }
 
-    fn scroll_active(&mut self, amount: isize) {
+    /// Scroll the pane the mouse is over, not the focused one — hovering a split
+    /// and spinning the wheel scrolls whichever side the cursor sits on, which is
+    /// what other editors do. Focus is left untouched.
+    fn scroll_at(&mut self, column: u16, amount: isize) {
         if self.layout.is_diff() {
             self.scroll_diff(amount);
             return;
         }
-        let focus = self.focus;
+        let over_right =
+            self.layout.right_editor().is_some() && column > split_left_width(self.terminal_size.0);
+        let focus = Focus::Editor(if over_right { Side::Right } else { Side::Left });
         let (documents, layout) = (&self.documents, &mut self.layout);
         let Some(pane) = layout.active_editor_mut(focus) else {
             return;
@@ -7110,6 +7115,48 @@ mod tests {
         // Already at the top: scrolling up further must not underflow.
         editor.update(wheel(MouseEventKind::ScrollUp));
         assert_eq!(editor.diff_top_row(), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_pane_under_the_cursor_not_the_active_one() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 80, rows: 10 });
+        let text = (0..40)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.update(AppEvent::TextPaste(text));
+        editor.update(
+            Command::Move {
+                direction: Direction::Left,
+                unit: Unit::Document,
+                extend: false,
+            }
+            .into(),
+        );
+        // Both halves show the same document, each starting at the top; the right
+        // half is the active one.
+        editor.update(Command::ToggleSplit.into());
+        assert_eq!(editor.focus, Focus::Editor(Side::Right));
+
+        // Spin the wheel over the left (inactive) half at column 10.
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 0,
+        }));
+
+        assert_eq!(editor.layout.left.view.scroll.top_line, 3);
+        assert_eq!(
+            editor.layout.right_editor().unwrap().view.scroll.top_line,
+            0
+        );
+        // Scrolling an inactive pane must not steal focus.
+        assert_eq!(editor.focus, Focus::Editor(Side::Right));
     }
 
     #[test]
