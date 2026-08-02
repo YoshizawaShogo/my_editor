@@ -4,9 +4,11 @@ ignore = [
     # `paste` (unmaintained). Transitively via ratatui 0.29; compile-time proc-macro
     # only, no runtime exposure. Revisit when ratatui drops it.
     "RUSTSEC-2024-0436",
-    # `lru` 0.12.5 (unsound `IterMut`). Transitively via ratatui 0.29, which pins
-    # this version; not a remotely-exploitable vulnerability. Revisit on ratatui upgrade.
-    "RUSTSEC-2026-0002",
+    # Known-and-accepted, not a vulnerability so cargo-deny does not fail on it
+    # (unsound = warning), listed here for the record: `lru` 0.12.5 (RUSTSEC-2026-0002,
+    # unsound `IterMut`) comes in transitively via ratatui 0.29, which pins the version.
+    # Revisit on a ratatui upgrade. Not added to the ignore list because deny treats it
+    # as a non-fatal warning and an unmatched entry would itself warn.
 ]
 
 [licenses]

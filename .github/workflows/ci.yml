@@ -21,3 +21,13 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test
+
+  # Supply-chain gate: fails on vulnerable dependencies, disallowed licenses,
+  # banned crates, or crates from unexpected sources. Uses deny.toml.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
