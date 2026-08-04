@@ -136,6 +136,11 @@ pub struct EditorConfig {
     pub insert_spaces: bool,
     pub shell: Option<String>,
     pub large_file_threshold: String,
+    /// Copy to the host OS clipboard via the terminal's OSC 52 sequence. Off by
+    /// default: terminals that don't support OSC 52 (or tmux/screen without
+    /// clipboard passthrough) echo the sequence as garbage. Enable it on a
+    /// terminal that supports it to get editor-copy → system-clipboard over SSH.
+    pub osc52_clipboard: bool,
 }
 
 impl Default for EditorConfig {
@@ -145,6 +150,7 @@ impl Default for EditorConfig {
             insert_spaces: true,
             shell: None,
             large_file_threshold: "10MiB".to_owned(),
+            osc52_clipboard: false,
         }
     }
 }

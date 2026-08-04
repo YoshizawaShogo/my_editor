@@ -3379,7 +3379,7 @@ impl Editor {
                 return Vec::new();
             }
             self.clipboard.store(vec![fragments.join("\n")]);
-            return vec![Effect::ClipboardOsc52(self.clipboard.osc52_text())];
+            return self.osc52_effects(self.clipboard.osc52_text());
         }
         let Some(editable) = document.editable_opt() else {
             return Vec::new();
@@ -3417,7 +3417,19 @@ impl Editor {
         } else {
             self.clipboard.store(fragments);
         }
-        vec![Effect::ClipboardOsc52(self.clipboard.osc52_text())]
+        self.osc52_effects(self.clipboard.osc52_text())
+    }
+
+    /// Wrap copied text in an OSC 52 effect only when the config enables it. The
+    /// in-editor register is updated regardless (so copy/paste inside the editor
+    /// always works); this only controls whether we also push to the host OS
+    /// clipboard, which garbles terminals that don't support OSC 52.
+    fn osc52_effects(&self, text: String) -> Vec<Effect> {
+        if self.config.editor.osc52_clipboard {
+            vec![Effect::ClipboardOsc52(text)]
+        } else {
+            Vec::new()
+        }
     }
 
     fn copy_shell_selection(&self, send_interrupt_if_empty: bool) -> Vec<Effect> {
@@ -3443,10 +3455,11 @@ impl Editor {
             end.0,
             end.1.saturating_add(1).min(cols),
         );
-        (!text.is_empty())
-            .then_some(Effect::ClipboardOsc52(text))
-            .into_iter()
-            .collect()
+        if text.is_empty() {
+            Vec::new()
+        } else {
+            self.osc52_effects(text)
+        }
     }
 
     fn terminal_mouse_position(&self, column: u16, row: u16) -> Option<(u16, u16)> {
@@ -6386,6 +6399,7 @@ mod tests {
     #[test]
     fn shell_drag_selection_copies_a_stable_snapshot_and_clears_hover() {
         let mut editor = Editor::default();
+        editor.config.editor.osc52_clipboard = true;
         editor.update(AppEvent::Resize { cols: 20, rows: 6 });
         let token = open_shell(&mut editor);
         editor.update(AppEvent::Terminal(TerminalEvent::Output {
@@ -6694,6 +6708,7 @@ mod tests {
     #[test]
     fn copy_updates_register_and_emits_osc52_effect() {
         let mut editor = Editor::default();
+        editor.config.editor.osc52_clipboard = true;
         editor.update(AppEvent::TextPaste("copy me".to_owned()));
         editor.update(Command::SelectAll.into());
 
@@ -6703,8 +6718,29 @@ mod tests {
     }
 
     #[test]
+    fn copy_without_osc52_enabled_updates_the_register_but_emits_no_effect() {
+        // Default config: nothing is written to the terminal (so unsupported
+        // terminals don't garble), yet in-editor copy/paste still works.
+        let mut editor = Editor::default();
+        editor.update(AppEvent::TextPaste("copy me".to_owned()));
+        editor.update(Command::SelectAll.into());
+
+        let effects = editor.update(Command::Copy.into());
+        assert!(effects.is_empty());
+
+        // The register was still populated: paste re-inserts the text.
+        editor.update(Command::CollapseSelections.into());
+        editor.update(Command::Paste.into());
+        assert_eq!(
+            editor.active_buffer().unwrap().text.to_string(),
+            "copy mecopy me"
+        );
+    }
+
+    #[test]
     fn copy_without_a_selection_copies_and_pastes_the_current_line() {
         let mut editor = Editor::default();
+        editor.config.editor.osc52_clipboard = true;
         editor.update(AppEvent::TextPaste("one\ntwo".to_owned()));
 
         let effects = editor.update(Command::Copy.into());
@@ -6720,6 +6756,7 @@ mod tests {
     #[test]
     fn cut_without_a_selection_cuts_and_restores_the_current_line() {
         let mut editor = Editor::default();
+        editor.config.editor.osc52_clipboard = true;
         editor.update(AppEvent::TextPaste("one\ntwo".to_owned()));
         editor.update(
             Command::Move {

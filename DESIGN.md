@@ -802,7 +802,7 @@ struct EdgeSummary { errors: usize, warnings: usize, git_changes: usize, search_
 ## 10. クリップボード
 
 - **内部レジスタ** `Register` を常に保持（マルチカーソル対応のため行/複数片も保持可能）。
-- yank/copy 時、内部レジスタ更新に加えて `Effect::ClipboardOsc52(text)` を発行し、OSC52 エスケープで **手元端末（SSH クライアント側）のシステムクリップボード**へ転送する。
+- yank/copy 時、内部レジスタは常に更新する。加えて設定 `editor.osc52_clipboard` が有効なときだけ `Effect::ClipboardOsc52(text)` を発行し、OSC52 エスケープで **手元端末（SSH クライアント側）のシステムクリップボード**へ転送する。**既定は無効**（OSC52 非対応の端末や、クリップボード・パススルー未設定の tmux/screen 越しでは生シーケンスが画面に化けるため）。対応端末で有効化するとエディタのコピーがそのままシステムクリップボードへ入る。無効でも内部レジスタによるエディタ内コピー&ペーストは常に動作する。
 - 選択が全て空の`Ctrl+C`は、各カーソルの論理行を改行付きのlinewiseレジスタとしてコピーする。linewise pasteはカーソル行の行頭へ挿入し、行の途中へ内容を割り込ませない。選択があれば従来どおり選択範囲を文字単位でコピーする。
 - paste は内部レジスタから（端末→アプリ方向の OSC52 read は端末対応が不安定なため使わない）。ブラケットペーストは端末の貼り付けとして受け、複数行を 1 編集として扱う。
 
@@ -840,6 +840,7 @@ tab_size = 4
 insert_spaces = true
 shell = "/path/to/shell"          # 省略時は $SHELL、さらに無ければ /bin/sh
 large_file_threshold = "10MiB"   # これを超えると less 相当の読み取り専用で開く（§4.2.1）
+osc52_clipboard = false           # OSC52でOSクリップボードへコピー（§10）。既定OFF。対応端末で有効化
 
 [search]                          # Ctrl+F / Ctrl+H の Directory スコープ既定（§13）
 respect_ignore_files = true       # .gitignore / .ignore を尊重
