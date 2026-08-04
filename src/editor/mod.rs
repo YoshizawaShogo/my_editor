@@ -2636,8 +2636,10 @@ impl Editor {
             Command::Copy => return self.copy_active(true),
             Command::CopyShellSelection => return self.copy_shell_selection(true),
             Command::Cut => {
-                let effects = self.copy_active(true);
-                if !effects.is_empty() {
+                // Deleting must key off "did we copy", not off the OSC 52 effect —
+                // that effect is empty when OS-clipboard push is disabled, and a
+                // no-selection Ctrl+X must still cut the current line.
+                if self.copy_into_register(true) {
                     let linewise = self.clipboard.is_linewise();
                     self.edit_active(|document, view| {
                         if linewise {
@@ -2648,8 +2650,9 @@ impl Editor {
                                 .delete_backward(&mut view.selections);
                         }
                     });
+                    return self.osc52_effects(self.clipboard.osc52_text());
                 }
-                return effects;
+                return Vec::new();
             }
             Command::Paste => {
                 let fragments = self.clipboard.fragments().to_vec();
@@ -3363,12 +3366,25 @@ impl Editor {
     }
 
     fn copy_active(&mut self, copy_caret_lines: bool) -> Vec<Effect> {
+        if self.copy_into_register(copy_caret_lines) {
+            self.osc52_effects(self.clipboard.osc52_text())
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Copy the active selection — or, when every cursor is a bare caret and
+    /// `copy_caret_lines` is set, the caret lines — into the internal register.
+    /// Returns whether anything was captured. Kept separate from OSC 52 emission
+    /// so callers like Cut can act on "did we copy" regardless of the (optional)
+    /// clipboard push.
+    fn copy_into_register(&mut self, copy_caret_lines: bool) -> bool {
         let focus = self.focus;
         let Some(pane) = self.layout.active_editor(focus) else {
-            return Vec::new();
+            return false;
         };
         let Some(document) = self.documents.get(&pane.view.doc) else {
-            return Vec::new();
+            return false;
         };
         if let Some(large) = document.large() {
             let selection = pane.view.selections.primary();
@@ -3376,13 +3392,13 @@ impl Editor {
             let end = selection.anchor.0.max(selection.head.0);
             let fragments: Vec<_> = (start..=end).filter_map(|line| large.line(line)).collect();
             if fragments.is_empty() {
-                return Vec::new();
+                return false;
             }
             self.clipboard.store(vec![fragments.join("\n")]);
-            return self.osc52_effects(self.clipboard.osc52_text());
+            return true;
         }
         let Some(editable) = document.editable_opt() else {
-            return Vec::new();
+            return false;
         };
         let linewise = copy_caret_lines
             && pane
@@ -3410,14 +3426,14 @@ impl Editor {
             editable.selected_texts(&pane.view.selections)
         };
         if fragments.iter().all(String::is_empty) && !linewise {
-            return Vec::new();
+            return false;
         }
         if linewise {
             self.clipboard.store_linewise(fragments);
         } else {
             self.clipboard.store(fragments);
         }
-        self.osc52_effects(self.clipboard.osc52_text())
+        true
     }
 
     /// Wrap copied text in an OSC 52 effect only when the config enables it. The
@@ -6755,8 +6771,9 @@ mod tests {
 
     #[test]
     fn cut_without_a_selection_cuts_and_restores_the_current_line() {
+        // Default config (OSC 52 off): the cut must still delete the caret line —
+        // deletion must not depend on the clipboard-push effect being emitted.
         let mut editor = Editor::default();
-        editor.config.editor.osc52_clipboard = true;
         editor.update(AppEvent::TextPaste("one\ntwo".to_owned()));
         editor.update(
             Command::Move {
@@ -6769,7 +6786,7 @@ mod tests {
 
         let effects = editor.update(Command::Cut.into());
 
-        assert_eq!(effects, vec![Effect::ClipboardOsc52("one\n".to_owned())]);
+        assert!(effects.is_empty());
         assert_eq!(editor.active_buffer().unwrap().text.to_string(), "two");
 
         editor.update(Command::Undo.into());
