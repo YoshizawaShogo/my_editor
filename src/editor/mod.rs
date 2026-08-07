@@ -2650,7 +2650,7 @@ impl Editor {
                                 .delete_backward(&mut view.selections);
                         }
                     });
-                    return self.clipboard_effects(self.clipboard.osc52_text());
+                    return self.osc52_effects(self.clipboard.osc52_text());
                 }
                 return Vec::new();
             }
@@ -3367,7 +3367,7 @@ impl Editor {
 
     fn copy_active(&mut self, copy_caret_lines: bool) -> Vec<Effect> {
         if self.copy_into_register(copy_caret_lines) {
-            self.clipboard_effects(self.clipboard.osc52_text())
+            self.osc52_effects(self.clipboard.osc52_text())
         } else {
             Vec::new()
         }
@@ -3436,21 +3436,16 @@ impl Editor {
         true
     }
 
-    /// Effects that push a copy out to the host OS clipboard. The in-editor
-    /// register is updated separately, so copy/paste inside the editor always
-    /// works regardless of these.
-    ///
-    /// [`Effect::ClipboardCopy`] is always emitted: the runtime forwards it to
-    /// an external clipboard command (wl-copy / xclip / xsel) when one is
-    /// available and drops it otherwise. OSC 52 is emitted additionally only
-    /// when explicitly enabled, since terminals without OSC 52 support garble on
-    /// the escape sequence.
-    fn clipboard_effects(&self, text: String) -> Vec<Effect> {
-        let mut effects = vec![Effect::ClipboardCopy(text.clone())];
+    /// Wrap copied text in an OSC 52 effect only when the config enables it. The
+    /// in-editor register is updated regardless (so copy/paste inside the editor
+    /// always works); this only controls whether we also push to the host OS
+    /// clipboard, which garbles terminals that don't support OSC 52.
+    fn osc52_effects(&self, text: String) -> Vec<Effect> {
         if self.config.editor.osc52_clipboard {
-            effects.push(Effect::ClipboardOsc52(text));
+            vec![Effect::ClipboardOsc52(text)]
+        } else {
+            Vec::new()
         }
-        effects
     }
 
     fn copy_shell_selection(&self, send_interrupt_if_empty: bool) -> Vec<Effect> {
@@ -3479,7 +3474,7 @@ impl Editor {
         if text.is_empty() {
             Vec::new()
         } else {
-            self.clipboard_effects(text)
+            self.osc52_effects(text)
         }
     }
 
@@ -3496,11 +3491,19 @@ impl Editor {
         Some((row, column.saturating_sub(start).min(cols - 1)))
     }
 
+    /// Lines advanced per mouse-wheel notch. Larger covers the same distance in
+    /// fewer redraws — cheaper over SSH, where each redraw is a round-trip.
+    const MOUSE_WHEEL_SCROLL_LINES: isize = 5;
+
     fn apply_mouse(&mut self, input: MouseInput) {
         let mouse = input.event;
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_at(mouse.column, -3),
-            MouseEventKind::ScrollDown => self.scroll_at(mouse.column, 3),
+            MouseEventKind::ScrollUp => {
+                self.scroll_at(mouse.column, -Self::MOUSE_WHEEL_SCROLL_LINES)
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_at(mouse.column, Self::MOUSE_WHEEL_SCROLL_LINES)
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let divider = split_left_width(self.terminal_size.0);
                 if self.layout.right.is_some() && mouse.column == divider {
@@ -6444,13 +6447,7 @@ mod tests {
         editor.update(mouse(MouseEventKind::Drag(MouseButton::Left), 15));
         let effects = editor.update(mouse(MouseEventKind::Up(MouseButton::Left), 15));
 
-        assert_eq!(
-            effects,
-            vec![
-                Effect::ClipboardCopy("hello".to_owned()),
-                Effect::ClipboardOsc52("hello".to_owned()),
-            ]
-        );
+        assert_eq!(effects, vec![Effect::ClipboardOsc52("hello".to_owned())]);
         assert_eq!(
             editor.terminal_selection_view(),
             Some(TerminalSelectionView {
@@ -6741,27 +6738,19 @@ mod tests {
 
         let effects = editor.update(Command::Copy.into());
 
-        assert_eq!(
-            effects,
-            vec![
-                Effect::ClipboardCopy("copy me".to_owned()),
-                Effect::ClipboardOsc52("copy me".to_owned()),
-            ]
-        );
+        assert_eq!(effects, vec![Effect::ClipboardOsc52("copy me".to_owned())]);
     }
 
     #[test]
-    fn copy_without_osc52_still_emits_the_external_clipboard_effect() {
-        // Default config: no OSC 52 escape is written to the terminal (so
-        // unsupported terminals don't garble). The external ClipboardCopy effect
-        // is still emitted — the runtime drops it when no clipboard tool exists —
-        // and in-editor copy/paste works regardless.
+    fn copy_without_osc52_enabled_updates_the_register_but_emits_no_effect() {
+        // Default config: nothing is written to the terminal (so unsupported
+        // terminals don't garble), yet in-editor copy/paste still works.
         let mut editor = Editor::default();
         editor.update(AppEvent::TextPaste("copy me".to_owned()));
         editor.update(Command::SelectAll.into());
 
         let effects = editor.update(Command::Copy.into());
-        assert_eq!(effects, vec![Effect::ClipboardCopy("copy me".to_owned())]);
+        assert!(effects.is_empty());
 
         // The register was still populated: paste re-inserts the text.
         editor.update(Command::CollapseSelections.into());
@@ -6780,13 +6769,7 @@ mod tests {
 
         let effects = editor.update(Command::Copy.into());
 
-        assert_eq!(
-            effects,
-            vec![
-                Effect::ClipboardCopy("two\n".to_owned()),
-                Effect::ClipboardOsc52("two\n".to_owned()),
-            ]
-        );
+        assert_eq!(effects, vec![Effect::ClipboardOsc52("two\n".to_owned())]);
         editor.update(Command::Paste.into());
         assert_eq!(
             editor.active_buffer().unwrap().text.to_string(),
@@ -6811,7 +6794,7 @@ mod tests {
 
         let effects = editor.update(Command::Cut.into());
 
-        assert_eq!(effects, vec![Effect::ClipboardCopy("one\n".to_owned())]);
+        assert!(effects.is_empty());
         assert_eq!(editor.active_buffer().unwrap().text.to_string(), "two");
 
         editor.update(Command::Undo.into());
@@ -7616,7 +7599,10 @@ mod tests {
             })
         };
         editor.update(wheel(MouseEventKind::ScrollDown));
-        assert_eq!(editor.diff_top_row(), 3);
+        assert_eq!(
+            editor.diff_top_row(),
+            Editor::MOUSE_WHEEL_SCROLL_LINES as usize
+        );
 
         editor.update(wheel(MouseEventKind::ScrollUp));
         assert_eq!(editor.diff_top_row(), 0);
@@ -7659,7 +7645,10 @@ mod tests {
             clicks: 0,
         }));
 
-        assert_eq!(editor.layout.left.view.scroll.top_line, 3);
+        assert_eq!(
+            editor.layout.left.view.scroll.top_line,
+            Editor::MOUSE_WHEEL_SCROLL_LINES as usize
+        );
         assert_eq!(
             editor.layout.right_editor().unwrap().view.scroll.top_line,
             0

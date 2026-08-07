@@ -98,9 +98,5 @@ pub enum Effect {
         rows: u16,
     },
     ClipboardOsc52(String),
-    /// Push copied text to the host OS clipboard via an external clipboard
-    /// command (wl-copy / xclip / xsel). The runtime resolves which command to
-    /// run once at startup and drops this effect when none is available.
-    ClipboardCopy(String),
     Quit,
 }
