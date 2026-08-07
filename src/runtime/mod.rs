@@ -3,7 +3,7 @@ mod input;
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     os::unix::{io::AsRawFd, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -12,9 +12,6 @@ use std::{
 use lsp_server::{Message, Notification, Request, RequestId, Response, ResponseError};
 use nix::pty::{Winsize, openpty};
 use tokio::sync::mpsc;
-
-#[cfg(test)]
-use std::os::unix::fs::PermissionsExt;
 
 use crate::{
     Result,
@@ -40,6 +37,10 @@ pub struct Runtime {
     terminal: TerminalSession,
     lsp: std::collections::HashMap<u64, LspHandle>,
     shell: Option<ShellHandle>,
+    /// External clipboard command to pipe copied text into (wl-copy / xclip /
+    /// xsel), resolved once at startup. `None` when no clipboard tool is usable,
+    /// in which case copy stays in-editor only.
+    clipboard_copy: Option<Vec<String>>,
     rendered_line_count: usize,
 }
 
@@ -62,6 +63,7 @@ impl Runtime {
             terminal,
             lsp: std::collections::HashMap::new(),
             shell: None,
+            clipboard_copy: detect_clipboard_command(),
             rendered_line_count: 1,
         }
     }
@@ -502,9 +504,44 @@ impl Runtime {
                 }
             }
             Effect::ClipboardOsc52(text) => self.terminal.copy_osc52(&text)?,
+            Effect::ClipboardCopy(text) => self.copy_to_clipboard(text),
             Effect::Quit => {}
         }
         Ok(())
+    }
+
+    /// Pipe copied text into the resolved external clipboard command on a
+    /// detached thread (the tool may block briefly). A no-op when no clipboard
+    /// tool was found; a spawn failure surfaces as an error toast.
+    fn copy_to_clipboard(&self, text: String) {
+        let Some(command) = self.clipboard_copy.clone() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let program = command[0].clone();
+            let mut child = match Command::new(&program)
+                .args(&command[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = tx.send(AppEvent::Error(format!(
+                        "クリップボードにコピーできません ({program}): {error}"
+                    )));
+                    return;
+                }
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                // Dropping `stdin` at the end of this block closes the pipe so the
+                // clipboard tool sees EOF and commits the selection.
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        });
     }
 
     fn spawn_lsp(&mut self, server: u64, language: String, command: Vec<String>, root: PathBuf) {
@@ -1173,6 +1210,44 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+/// Resolve the external clipboard command to pipe copied text into, or `None`
+/// when neither a Wayland nor an X11 clipboard tool is usable (copy then stays
+/// in-editor only). Wayland is preferred over X11 when both are present.
+fn detect_clipboard_command() -> Option<Vec<String>> {
+    let display_set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    if display_set("WAYLAND_DISPLAY") && program_on_path("wl-copy") {
+        return Some(vec!["wl-copy".to_owned()]);
+    }
+    if display_set("DISPLAY") {
+        if program_on_path("xclip") {
+            return Some(
+                ["xclip", "-selection", "clipboard"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            );
+        }
+        if program_on_path("xsel") {
+            return Some(
+                ["xsel", "--clipboard", "--input"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            );
+        }
+    }
+    None
+}
+
+/// Whether `program` resolves to an executable file on `PATH`.
+fn program_on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| {
+        fs::metadata(directory.join(program))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    })
 }
 
 fn find_workspace_root() -> PathBuf {

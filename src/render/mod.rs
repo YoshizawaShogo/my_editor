@@ -1993,7 +1993,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, editor: &Editor, buffer: &Acti
         segments.push((status.to_owned(), Color::Rgb(0x4b, 0x4f, 0x61)));
     }
     frame.render_widget(
-        Paragraph::new(powerline_line(segments)).style(Style::default().bg(STATUS_BG)),
+        Paragraph::new(segmented_line(segments)).style(Style::default().bg(STATUS_BG)),
         area,
     );
 }
@@ -2006,21 +2006,21 @@ fn git_status_label(branch: Option<&str>, status: Option<&str>) -> Option<String
     ))
 }
 
-fn powerline_line(segments: Vec<(String, Color)>) -> Line<'static> {
-    let mut spans = Vec::with_capacity(segments.len() * 2);
-    for (index, (text, background)) in segments.iter().enumerate() {
-        let next_background = segments
-            .get(index + 1)
-            .map_or(STATUS_BG, |(_, color)| *color);
-        spans.push(Span::styled(
-            format!(" {text} "),
-            Style::default().fg(Color::White).bg(*background),
-        ));
-        spans.push(Span::styled(
-            "",
-            Style::default().fg(*background).bg(next_background),
-        ));
-    }
+/// Render the status segments as distinct colored blocks. The change in
+/// background color between segments is the only divider — there is no
+/// separator glyph — so the bar renders identically on any terminal/font and
+/// needs no Powerline/Nerd font (the old U+E0B0 separator lives in the Unicode
+/// Private Use Area and shows as tofu without such a font).
+fn segmented_line(segments: Vec<(String, Color)>) -> Line<'static> {
+    let spans = segments
+        .into_iter()
+        .map(|(text, background)| {
+            Span::styled(
+                format!(" {text} "),
+                Style::default().fg(Color::White).bg(background),
+            )
+        })
+        .collect::<Vec<_>>();
     Line::from(spans)
 }
 
@@ -2273,18 +2273,21 @@ mod tests {
     }
 
     #[test]
-    fn statusline_uses_powerline_separators_and_distinct_backgrounds() {
+    fn statusline_segments_are_distinct_color_blocks_without_a_separator_glyph() {
         let first = Color::Rgb(1, 2, 3);
         let second = Color::Rgb(4, 5, 6);
-        let line = powerline_line(vec![
+        let line = segmented_line(vec![
             ("file.rs".to_owned(), first),
             ("<git> M @main".to_owned(), second),
         ]);
 
-        assert_eq!(line.spans[1].content.as_ref(), "");
-        assert_eq!(line.spans[1].style.fg, Some(first));
+        // One span per segment and no separator span: the background color
+        // change is the only divider, so the bar needs no Powerline/Nerd font.
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content.as_ref(), " file.rs ");
+        assert_eq!(line.spans[0].style.bg, Some(first));
+        assert_eq!(line.spans[1].content.as_ref(), " <git> M @main ");
         assert_eq!(line.spans[1].style.bg, Some(second));
-        assert_eq!(line.spans[3].style.bg, Some(STATUS_BG));
     }
 
     #[test]
