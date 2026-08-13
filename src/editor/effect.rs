@@ -19,6 +19,9 @@ pub enum Effect {
     LoadConfig,
     StartFileScan {
         root: PathBuf,
+        /// Honor `.gitignore`/`.ignore` while walking. Forced false when the root
+        /// is itself ignored, so the picker can still list the tree.
+        respect_ignore_files: bool,
         token: u64,
     },
     /// List the directory the partially typed path points at, keeping entries

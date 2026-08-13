@@ -96,6 +96,11 @@ pub struct Editor {
     picker: Option<PickerState>,
     config: Config,
     workspace_root: PathBuf,
+    /// The workspace root is under a `.gitignore` rule (e.g. a file opened from
+    /// inside `target/` or `node_modules/`). Scanning such a tree with the ignore
+    /// filters on yields nothing, so this forces file-scan and search to walk it
+    /// regardless of `config.search.respect_ignore_files`.
+    workspace_ignored: bool,
     next_scan_token: u64,
     next_grep_token: u64,
     next_shell_token: u64,
@@ -149,6 +154,7 @@ impl Default for Editor {
             picker: None,
             config: Config::default(),
             workspace_root: PathBuf::from("."),
+            workspace_ignored: false,
             next_scan_token: 1,
             next_grep_token: 1,
             next_shell_token: 1,
@@ -630,6 +636,20 @@ impl Editor {
 
     pub fn set_workspace_root(&mut self, root: PathBuf) {
         self.workspace_root = root;
+    }
+
+    /// Mark the workspace root as sitting under a `.gitignore` rule. When set,
+    /// [`Self::respect_ignore_files`] returns false so the file picker and search
+    /// can still see the tree.
+    pub fn set_workspace_ignored(&mut self, ignored: bool) {
+        self.workspace_ignored = ignored;
+    }
+
+    /// Whether file-scan and search should honor `.gitignore`/`.ignore` files.
+    /// Forced off when the workspace root is itself ignored — otherwise the walk
+    /// returns nothing — but otherwise follows the configured default.
+    fn respect_ignore_files(&self) -> bool {
+        !self.workspace_ignored && self.config.search.respect_ignore_files
     }
 
     /// Install `right` as the right pane, dropping whatever it displaced.
@@ -3695,6 +3715,7 @@ impl Editor {
                 self.set_progress("file-scan", "ファイルを走査中…");
                 vec![Effect::StartFileScan {
                     root: self.workspace_root.clone(),
+                    respect_ignore_files: self.respect_ignore_files(),
                     token,
                 }]
             })
@@ -3776,6 +3797,7 @@ impl Editor {
         self.dirty = true;
         vec![Effect::StartFileScan {
             root: self.workspace_root.clone(),
+            respect_ignore_files: self.respect_ignore_files(),
             token,
         }]
     }
@@ -3879,7 +3901,7 @@ impl Editor {
                 include: Vec::new(),
                 exclude: Vec::new(),
                 exclude_dirs: self.config.search.exclude.clone(),
-                respect_ignore_files: self.config.search.respect_ignore_files,
+                respect_ignore_files: self.respect_ignore_files(),
                 include_hidden: self.config.search.include_hidden,
             },
             hits: Vec::new(),

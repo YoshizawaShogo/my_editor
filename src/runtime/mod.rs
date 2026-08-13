@@ -48,7 +48,8 @@ impl Runtime {
         let (tx, rx) = mpsc::unbounded_channel();
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
         let mut editor = Editor::default();
-        editor.set_workspace_root(find_workspace_root());
+        editor.set_workspace_root(workspace_root(&paths));
+        editor.set_workspace_ignored(paths.first().is_some_and(|path| is_git_ignored(path)));
         let mut startup_effects = vec![Effect::LoadConfig];
         startup_effects.extend(editor.open_paths(paths));
         Self {
@@ -215,14 +216,19 @@ impl Runtime {
                     }
                 });
             }
-            Effect::StartFileScan { root, token } => {
+            Effect::StartFileScan {
+                root,
+                respect_ignore_files,
+                token,
+            } => {
                 let tx = self.tx.clone();
                 tokio::task::spawn_blocking(move || {
                     let mut paths = Vec::new();
                     for entry in ignore::WalkBuilder::new(&root)
                         .hidden(true)
-                        .git_ignore(true)
-                        .ignore(true)
+                        .git_ignore(respect_ignore_files)
+                        .git_exclude(respect_ignore_files)
+                        .ignore(respect_ignore_files)
                         .build()
                     {
                         match entry {
@@ -1193,22 +1199,42 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn find_workspace_root() -> PathBuf {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    // このルートはそのままLSPのrootUriになる。gitルートの直下にマニフェストが
-    // あるとは限らず(1リポジトリに複数クレートを置く構成など)、浅すぎるルートを
-    // 渡すとrust-analyzerがプロジェクトを発見できずhover等が機能しないため、
-    // 最寄りのプロジェクトマーカーを.gitより優先する。
-    let markers = ["Cargo.toml", "pyproject.toml", "compile_commands.json"];
-    let root = cwd
-        .ancestors()
-        .find(|directory| markers.iter().any(|marker| directory.join(marker).exists()))
-        .or_else(|| {
-            cwd.ancestors()
-                .find(|directory| directory.join(".git").exists())
-        })
-        .map(Path::to_path_buf);
-    root.unwrap_or(cwd)
+/// Decide where the editor "opens" from the command-line arguments.
+///
+/// A file argument opens in the directory that contains it; a directory
+/// argument opens in that directory as given. With no path at all we open in the
+/// current working directory. In every case the argument (or the cwd) is taken
+/// at face value and is never widened up to the enclosing git/project root.
+fn workspace_root(paths: &[PathBuf]) -> PathBuf {
+    let cwd = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match paths.first() {
+        None => cwd(),
+        Some(path) if path.is_dir() => path.clone(),
+        Some(path) => path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(cwd),
+    }
+}
+
+/// Whether `path` is excluded by a `.gitignore` rule. Opening such a path means
+/// the workspace root sits inside an ignored subtree (`target/`, `node_modules/`,
+/// …); the file picker and search must then ignore the ignore files, or the walk
+/// comes back empty. Returns false outside a git repository or when git is absent.
+fn is_git_ignored(path: &Path) -> bool {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["check-ignore", "-q", "--"])
+        .arg(path)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn compute_git_info(path: &Path) -> std::result::Result<GitInfo, String> {
@@ -1434,6 +1460,22 @@ mod tests {
             vec!["beta.rs".to_owned()]
         );
         assert!(list_path_completions("/no/such/directory/x", &root).is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_root_follows_the_argument_kind() {
+        let root = std::env::temp_dir().join(format!("my_editor_root_{}", std::process::id()));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("main.rs");
+        fs::write(&file, "").unwrap();
+
+        // A file argument opens in the directory that contains it, not the file.
+        assert_eq!(workspace_root(std::slice::from_ref(&file)), nested);
+        // A directory argument opens in that directory as given.
+        assert_eq!(workspace_root(std::slice::from_ref(&nested)), nested);
 
         fs::remove_dir_all(root).unwrap();
     }
