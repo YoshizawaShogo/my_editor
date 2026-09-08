@@ -1367,12 +1367,24 @@ impl Editor {
                                     cursor_back,
                                     label: item.label,
                                     prefix_len: prefix.chars().count(),
+                                    snippet_body: None,
                                 },
                             ))
                         })
                         .collect();
                         items.sort_by_key(|right| std::cmp::Reverse(right.0));
-                        let items = items.into_iter().map(|(_, item)| item).collect::<Vec<_>>();
+                        // Offer language snippets alongside the server's results,
+                        // ranked to the top so `for`, `fn`, … are easy to reach.
+                        let language = self
+                            .documents
+                            .get(&doc)
+                            .and_then(|document| document.language.clone());
+                        let mut merged = language
+                            .as_deref()
+                            .map(|language| snippet_candidates(language, &prefix))
+                            .unwrap_or_default();
+                        merged.extend(items.into_iter().map(|(_, item)| item));
+                        let items = merged;
                         if !items.is_empty() {
                             self.completion = Some(CompletionState {
                                 items,
@@ -1829,7 +1841,7 @@ impl Editor {
                 .then_with(|| left.1.len().cmp(&right.1.len()))
                 .then_with(|| left.1.cmp(right.1))
         });
-        let items: Vec<_> = ranked
+        let words = ranked
             .into_iter()
             .take(50)
             .map(|(_, word)| CompletionCandidate {
@@ -1837,8 +1849,18 @@ impl Editor {
                 cursor_back: 0,
                 label: word.to_owned(),
                 prefix_len,
-            })
-            .collect();
+                snippet_body: None,
+            });
+        // Snippets rank above buffer words so `for`, `if`, … stay reachable.
+        let language = self
+            .documents
+            .get(&doc)
+            .and_then(|document| document.language.clone());
+        let mut items = language
+            .as_deref()
+            .map(|language| snippet_candidates(language, &prefix))
+            .unwrap_or_default();
+        items.extend(words);
         if items.is_empty() {
             if manual {
                 self.status = Some("補完候補がありません".to_owned());
@@ -2925,13 +2947,7 @@ impl Editor {
             Command::DiffNextHunk => self.jump_diff_hunk(true),
             Command::DiffPrevHunk => self.jump_diff_hunk(false),
             Command::CloseBuffer => return self.close_active_buffer(),
-            Command::Indent => {
-                // Tab expands a snippet when the word before a lone caret is a
-                // snippet prefix; otherwise it indents as usual.
-                if !self.try_expand_snippet() {
-                    self.indent_selected_lines(false);
-                }
-            }
+            Command::Indent => self.indent_selected_lines(false),
             Command::Outdent => self.indent_selected_lines(true),
             Command::ToggleComment => self.toggle_comment(),
             Command::Undo => self.edit_active(|document, view| {
@@ -3143,75 +3159,53 @@ impl Editor {
         });
     }
 
-    /// If a lone caret sits just after a snippet prefix for the buffer's language,
-    /// replace that prefix with the expanded snippet and select its first tab stop
-    /// (so typing overwrites the placeholder). Returns whether it expanded — the
-    /// Tab handler falls back to indenting when it did not.
-    fn try_expand_snippet(&mut self) -> bool {
+    /// Leading whitespace of the active caret's line, so a snippet's continuation
+    /// lines can be re-indented to match where it is inserted.
+    fn caret_line_indent(&self) -> String {
         let Some(pane) = self.layout.active_editor(self.focus) else {
-            return false;
+            return String::new();
         };
-        // Snippets are a single-caret action; a range or multi-cursor Tab indents.
-        if pane.view.selections.iter().count() != 1 || !pane.view.selections.primary().is_caret() {
-            return false;
-        }
-        let Some(document) = self.documents.get(&pane.view.doc) else {
-            return false;
-        };
-        let Some(editable) = document.editable_opt() else {
-            return false;
-        };
-        let Some(language) = document.language.as_deref() else {
-            return false;
+        let Some(editable) = self
+            .documents
+            .get(&pane.view.doc)
+            .and_then(Document::editable_opt)
+        else {
+            return String::new();
         };
         let text = editable.text();
         let caret = pane.view.selections.primary().head.0.min(text.len_chars());
-        let mut start = caret;
-        while start > 0 && is_word(text.char(start - 1)) {
-            start -= 1;
-        }
-        if start == caret {
-            return false;
-        }
-        let prefix = text.slice(start..caret).to_string();
-        let Some(snippet) = crate::snippet::snippets_for(language)
-            .iter()
-            .find(|snippet| snippet.prefix == prefix)
-        else {
-            return false;
-        };
-        // Indentation of the caret's line, so continuation lines stay aligned.
         let line_start = text.line_to_char(text.char_to_line(caret));
-        let base_indent: String = text
-            .slice(line_start..)
+        text.slice(line_start..)
             .chars()
             .take_while(|character| matches!(character, ' ' | '\t'))
-            .collect();
-        let expansion = crate::snippet::expand(snippet.body, &base_indent);
-        let body = expansion.text;
-        let body_len = body.chars().count();
-        let first_stop = expansion.stops.into_iter().next();
+            .collect()
+    }
 
+    /// Expand a chosen snippet: drop the `prefix_len` characters already typed,
+    /// insert the expanded body, and select its first tab stop (or land the caret
+    /// at the end) so typing overwrites the placeholder.
+    fn expand_snippet_body(&mut self, body: &str, prefix_len: usize) {
+        let expansion = crate::snippet::expand(body, &self.caret_line_indent());
+        let text = expansion.text;
+        let text_len = text.chars().count();
+        let first_stop = expansion.stops.into_iter().next();
         self.edit_active(|document, view| {
-            // Replace the prefix with the body in one edit…
+            let head = view.selections.primary().head.0;
+            let start = head.saturating_sub(prefix_len);
             view.selections.set_single(Selection {
                 anchor: CharIdx(start),
-                head: CharIdx(caret),
+                head: CharIdx(head),
             });
-            document
-                .editable_mut()
-                .insert_fragments(&mut view.selections, &[body]);
-            // …then land on the first tab stop (selecting its default), or the end.
+            document.editable_mut().insert(&mut view.selections, &text);
             let (anchor, head) = match &first_stop {
                 Some(stop) => (start + stop.start, start + stop.end),
-                None => (start + body_len, start + body_len),
+                None => (start + text_len, start + text_len),
             };
             view.selections.set_single(Selection {
                 anchor: CharIdx(anchor),
                 head: CharIdx(head),
             });
         });
-        true
     }
 
     fn indent_selected_lines(&mut self, outdent: bool) {
@@ -4775,25 +4769,29 @@ impl Editor {
         }
         if let Some(completion) = self.completion.take() {
             if let Some(candidate) = completion.items.get(completion.selected) {
-                let insert = candidate.insert.clone();
                 let prefix_len = candidate.prefix_len;
-                let cursor_back = candidate.cursor_back;
                 self.focus = Focus::Editor(completion.return_side);
-                self.edit_active(|document, view| {
-                    let head = view.selections.primary().head.0;
-                    view.selections.set_single(Selection {
-                        anchor: CharIdx(head.saturating_sub(prefix_len)),
-                        head: CharIdx(head),
-                    });
-                    document
-                        .editable_mut()
-                        .insert(&mut view.selections, &insert);
-                    if cursor_back > 0 {
+                if let Some(body) = candidate.snippet_body.clone() {
+                    self.expand_snippet_body(&body, prefix_len);
+                } else {
+                    let insert = candidate.insert.clone();
+                    let cursor_back = candidate.cursor_back;
+                    self.edit_active(|document, view| {
                         let head = view.selections.primary().head.0;
-                        view.selections
-                            .set_single(Selection::caret(CharIdx(head - cursor_back)));
-                    }
-                });
+                        view.selections.set_single(Selection {
+                            anchor: CharIdx(head.saturating_sub(prefix_len)),
+                            head: CharIdx(head),
+                        });
+                        document
+                            .editable_mut()
+                            .insert(&mut view.selections, &insert);
+                        if cursor_back > 0 {
+                            let head = view.selections.primary().head.0;
+                            view.selections
+                                .set_single(Selection::caret(CharIdx(head - cursor_back)));
+                        }
+                    });
+                }
             }
             return Vec::new();
         }
@@ -5594,6 +5592,27 @@ impl Editor {
             pane.view.scroll.wrapped_row_offset = visual_row + 1 - rows;
         }
     }
+}
+
+/// Completion candidates for the language's snippets whose prefix starts with
+/// what has been typed. Empty when nothing is typed or the language has none.
+fn snippet_candidates(language: &str, prefix: &str) -> Vec<CompletionCandidate> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let prefix_lower = prefix.to_lowercase();
+    let prefix_len = prefix.chars().count();
+    crate::snippet::snippets_for(language)
+        .iter()
+        .filter(|snippet| snippet.prefix.to_lowercase().starts_with(&prefix_lower))
+        .map(|snippet| CompletionCandidate {
+            label: format!("{}  (snippet)", snippet.prefix),
+            insert: String::new(),
+            prefix_len,
+            cursor_back: 0,
+            snippet_body: Some(snippet.body.to_owned()),
+        })
+        .collect()
 }
 
 /// The whole word the caret sits on or immediately after, or None when the caret
@@ -6414,6 +6433,9 @@ struct CompletionCandidate {
     insert: String,
     prefix_len: usize,
     cursor_back: usize,
+    /// When set, confirming expands this snippet body instead of inserting
+    /// `insert` verbatim (see [`Editor::expand_snippet_body`]).
+    snippet_body: Option<String>,
 }
 
 pub struct CompletionView {
@@ -7037,33 +7059,29 @@ mod tests {
     }
 
     #[test]
-    fn tab_expands_a_snippet_prefix_and_selects_the_first_stop() {
+    fn snippets_appear_as_completions_and_expand_on_confirm() {
         let mut editor = Editor::default();
         editor.open_paths([PathBuf::from("x.rs")]);
-        editor.update(AppEvent::TextPaste("for".to_owned()));
+        // Type "fo"; a manual completion should offer the "for" snippet.
+        editor.update(AppEvent::TextInput('f'));
+        editor.update(AppEvent::TextInput('o'));
+        editor.update(Command::ToggleCompletion.into());
 
-        editor.update(Command::Indent.into());
+        let view = editor.completion_view().expect("completion popup");
+        assert!(
+            view.items
+                .iter()
+                .any(|label| label.contains("for") && label.contains("snippet")),
+            "snippet should be offered, got {:?}",
+            view.items
+        );
 
+        // Confirm the (top-ranked) snippet: it expands and selects the first stop.
+        editor.update(Command::PickerConfirm.into());
         let buffer = editor.active_buffer().unwrap();
         assert_eq!(buffer.text.to_string(), "for item in iter {\n    \n}");
-        // The caret lands on the first placeholder, selecting it so typing replaces.
         let range = buffer.view.selections.primary().range();
         assert_eq!(buffer.text.slice(range).to_string(), "item");
-    }
-
-    #[test]
-    fn tab_without_a_snippet_prefix_still_indents() {
-        let mut editor = Editor::default();
-        editor.open_paths([PathBuf::from("x.rs")]);
-        editor.update(AppEvent::TextPaste("xyz".to_owned()));
-
-        editor.update(Command::Indent.into());
-
-        // "xyz" is not a snippet, so Tab inserts indentation at the caret rather
-        // than expanding — the word is intact and the buffer grew.
-        let text = editor.active_buffer().unwrap().text.to_string();
-        assert!(text.starts_with("xyz"));
-        assert!(text.len() > "xyz".len());
     }
 
     #[test]
