@@ -329,11 +329,12 @@ impl Editor {
                 if matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left)) {
                     self.dismiss_completion();
                     self.dismiss_signature_help();
-                    // A plain click is a jump; remember where we were so Ctrl+E can
-                    // return. Ctrl+click goes to definition, which records its own origin.
-                    if !mouse.event.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(self.focus, Focus::Editor(_))
-                    {
+                    // Remember where we are before the click moves the caret, so
+                    // Ctrl+E returns there. This is recorded here for a Ctrl+click
+                    // too — capturing the position you left, not the symbol you
+                    // clicked — so Back after go-to-definition lands where you were
+                    // reading rather than on the click point.
+                    if matches!(self.focus, Focus::Editor(_)) {
                         self.record_jump_origin();
                     }
                 }
@@ -1415,7 +1416,8 @@ impl Editor {
                             }
                         };
                         if let Some(location) = location {
-                            self.record_jump_origin();
+                            // Origin was already recorded at the Ctrl+click, before
+                            // the caret moved to the symbol.
                             let path =
                                 PathBuf::from(location.uri.as_str().trim_start_matches("file://"));
                             if let Some((doc, document)) = self
@@ -1659,16 +1661,39 @@ impl Editor {
 
     /// Remember the caret's current spot before a jump so Ctrl+E can return to it.
     fn record_jump_origin(&mut self) {
-        if let Some(location) = self.current_location() {
-            if self.nav_back.last() == Some(&location) {
+        let Some(location) = self.current_location() else {
+            return;
+        };
+        if let Some(&last) = self.nav_back.last() {
+            if last == location {
                 return;
             }
-            self.nav_back.push(location);
-            if self.nav_back.len() > 200 {
-                self.nav_back.remove(0);
+            // Collapse consecutive origins on the same line, so moving or clicking
+            // around within one line does not fill the back-stack with near-
+            // duplicates that each need a separate Ctrl+E to step past.
+            if last.0 == location.0 && self.same_line(location.0, last.1, location.1) {
+                *self.nav_back.last_mut().expect("checked non-empty") = location;
+                self.nav_forward.clear();
+                return;
             }
-            self.nav_forward.clear();
         }
+        self.nav_back.push(location);
+        if self.nav_back.len() > 200 {
+            self.nav_back.remove(0);
+        }
+        self.nav_forward.clear();
+    }
+
+    /// Whether two caret indices in `doc` fall on the same line.
+    fn same_line(&self, doc: DocumentId, a: CharIdx, b: CharIdx) -> bool {
+        self.documents
+            .get(&doc)
+            .and_then(Document::editable_opt)
+            .is_some_and(|editable| {
+                let text = editable.text();
+                let line = |index: CharIdx| text.char_to_line(index.0.min(text.len_chars()));
+                line(a) == line(b)
+            })
     }
 
     /// Ctrl+E / Ctrl+R: step back and forward through visited caret locations.
@@ -1975,7 +2000,7 @@ impl Editor {
             return Vec::new();
         };
         let doc = pane.view.doc;
-        self.record_jump_origin();
+        // Origin was already recorded at the Ctrl+click, before the caret moved.
         vec![Effect::CtagsDefinition {
             doc,
             symbol,
@@ -7314,6 +7339,32 @@ mod tests {
 
         editor.update(Command::NavigateForward.into());
         assert_eq!(editor.current_location(), Some((DocumentId(0), CharIdx(3))));
+    }
+
+    #[test]
+    fn ctrl_click_records_the_pre_click_position_not_the_symbol() {
+        // Ctrl+click (go-to-definition) should record where you were, so a single
+        // Ctrl+E returns to the reading position rather than the clicked symbol.
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 40, rows: 10 });
+        editor.update(AppEvent::TextPaste("first line\nsecond line".to_owned()));
+        let origin = editor.current_location(); // end of line 2
+
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 8,
+                row: 0, // a different line than the caret
+                modifiers: KeyModifiers::CONTROL,
+            },
+            clicks: 1,
+        }));
+        // The click moved the caret to line 1…
+        assert_ne!(editor.current_location(), origin);
+
+        // …and one Back returns straight to the pre-click position.
+        editor.update(Command::NavigateBack.into());
+        assert_eq!(editor.current_location(), origin);
     }
 
     #[test]
