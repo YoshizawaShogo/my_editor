@@ -32,3 +32,26 @@ license will **fail** `cargo deny check licenses` until you add it deliberately.
 That is the intended review gate, but if you would rather not be interrupted,
 widen the list to the common-permissive set instead. No action needed unless the
 friction bites.
+
+## 3. BUG: opening a non-existent file spams a persistent "file state" error
+
+**Symptom:** Opening a path that does not exist (e.g. `bash_practice/d.txt`)
+leaves the status line stuck showing
+`ファイル状態を取得できません <path>: No such file or directory (os error 2)`,
+and saving does not clear it.
+
+**Cause:** `disk_state()` (src/runtime/mod.rs:1188) does `fs::metadata` and returns
+an `Err` string when the file is missing. That error is surfaced by the `Err`
+branch of `IoEvent::DiskStateObserved` (src/editor/mod.rs:1158) which sets
+`self.status`. The disk-state check re-runs periodically (`Effect::CheckDiskStates`),
+so for a document whose file does not exist yet the error is re-shown on every
+tick — hence "persistent". Opening a not-yet-created file is a normal workflow
+(you open it to create it), so a missing file should be treated as "no file on
+disk yet" (disk_state = None / not-modified externally), not an error.
+
+**Suggested fix (not yet done — mid-refactor):** in `disk_state`, map
+`ErrorKind::NotFound` to `Ok(None)`-style "no disk state" rather than `Err`, and
+have the observer treat that as "file not on disk yet" (clear any external-change
+flag, don't touch the status line). Confirm save then creates it and the state
+settles. Needs a test: open missing path → no error status; save → file created,
+status clean.
