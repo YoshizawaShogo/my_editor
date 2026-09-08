@@ -3810,13 +3810,20 @@ impl Editor {
         match event {
             FileScanEvent::Batch { token, paths } => {
                 if self.picker.as_ref().and_then(|picker| picker.scan_token) == Some(token) {
-                    // A file already open is offered as its buffer, so drop the
-                    // scanned duplicate rather than listing it twice.
-                    let open: HashSet<_> = self
-                        .documents
-                        .values()
-                        .filter_map(|document| document.path.clone())
-                        .collect();
+                    // The diff picker lists open buffers as candidates first, so a
+                    // scanned file that is already open would appear twice — drop the
+                    // duplicate there. The file picker (Ctrl+T) starts empty and lists
+                    // every file, so it must not hide files just because they are open.
+                    let open: HashSet<_> = if self.picker.as_ref().map(|picker| picker.mode)
+                        == Some(PickerMode::Diff)
+                    {
+                        self.documents
+                            .values()
+                            .filter_map(|document| document.path.clone())
+                            .collect()
+                    } else {
+                        HashSet::new()
+                    };
                     let picker = self.picker.as_mut().expect("checked above");
                     let start = picker.candidates.len();
                     picker.candidates.extend(
@@ -7822,6 +7829,35 @@ mod tests {
             labels,
             vec!["left.txt".to_owned(), "unopened.rs".to_owned()]
         );
+    }
+
+    #[test]
+    fn file_picker_lists_files_that_are_already_open() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("open.rs")]);
+        let token = editor
+            .open_directory_picker()
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::StartFileScan { token, .. } => Some(token),
+                _ => None,
+            })
+            .expect("the file picker scans the workspace");
+
+        editor.update(AppEvent::FileScan(FileScanEvent::Batch {
+            token,
+            paths: vec![PathBuf::from("open.rs"), PathBuf::from("other.rs")],
+        }));
+
+        let labels: Vec<_> = editor
+            .picker_view()
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|item| item.label)
+            .collect();
+        // The already-open file is not hidden — it shows alongside the rest.
+        assert_eq!(labels, vec!["open.rs".to_owned(), "other.rs".to_owned()]);
     }
 
     #[test]
