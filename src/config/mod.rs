@@ -21,6 +21,14 @@ impl Default for Config {
                 LanguageConfig::new("markdown", &["md", "markdown"], None),
                 LanguageConfig::new("json", &["json"], Some("//")),
                 LanguageConfig {
+                    lsp: Some(vec!["pylsp".to_owned()]),
+                    ..LanguageConfig::new("python", &["py"], Some("#"))
+                },
+                LanguageConfig {
+                    lsp: Some(vec!["clangd".to_owned()]),
+                    ..LanguageConfig::new("c", &["c", "h"], Some("//"))
+                },
+                LanguageConfig {
                     name: "make".to_owned(),
                     filenames: vec![
                         "Makefile".to_owned(),
