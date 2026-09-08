@@ -30,6 +30,9 @@ impl Default for Config {
                 },
                 // The bash grammar also colours .sh and .csh (see highlight::grammar).
                 LanguageConfig::new("bash", &["sh", "bash", "csh"], Some("#")),
+                // Recognised for comment toggling and ctags go-to-definition; no
+                // tree-sitter grammar is wired, so highlighting stays plain.
+                LanguageConfig::new("tcl", &["tcl"], Some("#")),
                 LanguageConfig {
                     name: "make".to_owned(),
                     filenames: vec![

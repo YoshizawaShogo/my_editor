@@ -56,6 +56,13 @@ pub enum Effect {
         doc: DocumentId,
         path: PathBuf,
     },
+    /// Resolve `symbol`'s definition with ctags, the fallback for languages with
+    /// no language server. A no-op when ctags is not installed.
+    CtagsDefinition {
+        doc: DocumentId,
+        symbol: String,
+        root: PathBuf,
+    },
     SpawnLsp {
         server: u64,
         language: String,

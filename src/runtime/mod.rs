@@ -21,8 +21,8 @@ use crate::{
     config::Config,
     document::{DiskState, LargeFile},
     editor::{
-        AppEvent, Editor, Effect, FileScanEvent, GitEvent, GitInfo, GitLine, GitLineKind,
-        GrepEvent, GrepHit, IoEvent, ShellcheckEvent, TerminalEvent,
+        AppEvent, CtagsDefinitionEvent, Editor, Effect, FileScanEvent, GitEvent, GitInfo, GitLine,
+        GitLineKind, GrepEvent, GrepHit, IoEvent, ShellcheckEvent, TerminalEvent,
     },
     input::{KeyChordState, RawInput, translate},
     render,
@@ -382,6 +382,16 @@ impl Runtime {
                 tokio::task::spawn_blocking(move || {
                     let diagnostics = run_shellcheck(&path);
                     let _ = tx.send(AppEvent::Shellcheck(ShellcheckEvent { doc, diagnostics }));
+                });
+            }
+            Effect::CtagsDefinition { doc, symbol, root } => {
+                let tx = self.tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let location = ctags_definition(&symbol, &root);
+                    let _ = tx.send(AppEvent::CtagsDefinition(CtagsDefinitionEvent {
+                        doc,
+                        location,
+                    }));
                 });
             }
             Effect::SpawnLsp {
@@ -1311,6 +1321,52 @@ fn parse_shellcheck(stdout: &[u8]) -> Vec<crate::lsp::Diagnostic> {
         .collect()
 }
 
+/// Find `symbol`'s definition under `root` with ctags, returning the target file
+/// and its 0-based line. Returns None when ctags is absent, fails, or has no tag
+/// for the symbol — the editor then reports "not found". Scans the workspace on
+/// each call (no cached tag file yet), restricted to the languages the editor
+/// targets; csh is mapped onto the Sh parser, which ctags does not do by default.
+fn ctags_definition(symbol: &str, root: &Path) -> Option<(PathBuf, u32)> {
+    crate::status::which("ctags")?;
+    let output = Command::new("ctags")
+        .args([
+            "--output-format=json",
+            "--fields=+n",
+            "--languages=Python,C,Sh,Rust,Tcl",
+            "--langmap=Sh:+.csh",
+            "-R",
+            "-f",
+            "-",
+        ])
+        .arg(root)
+        .output()
+        .ok()?;
+    parse_ctags_definition(&output.stdout, symbol)
+}
+
+#[derive(serde::Deserialize)]
+struct CtagsTag {
+    #[serde(rename = "_type")]
+    entry_type: String,
+    name: String,
+    path: String,
+    line: Option<u32>,
+}
+
+/// Pick the first tag whose name matches `symbol` from ctags `json` output (one
+/// JSON object per line) and return its path and 0-based line.
+fn parse_ctags_definition(stdout: &[u8], symbol: &str) -> Option<(PathBuf, u32)> {
+    stdout.split(|byte| *byte == b'\n').find_map(|line| {
+        let tag: CtagsTag = serde_json::from_slice(line).ok()?;
+        if tag.entry_type == "tag" && tag.name == symbol {
+            tag.line
+                .map(|line| (PathBuf::from(tag.path), line.saturating_sub(1)))
+        } else {
+            None
+        }
+    })
+}
+
 fn compute_git_info(path: &Path) -> std::result::Result<GitInfo, String> {
     let directory = path
         .parent()
@@ -1583,6 +1639,28 @@ mod tests {
     #[test]
     fn parse_shellcheck_returns_empty_on_garbage() {
         assert!(parse_shellcheck(b"not json").is_empty());
+    }
+
+    #[test]
+    fn parse_ctags_picks_the_named_tag_and_shifts_to_zero_based() {
+        let json = concat!(
+            r#"{"_type": "ptag", "name": "TAG_FILE_FORMAT", "path": "x", "pattern": "2"}"#,
+            "\n",
+            r#"{"_type": "tag", "name": "greet", "path": "/tmp/x.tcl", "pattern": "/^proc greet/", "line": 3}"#,
+            "\n",
+        );
+
+        // 1-based line 3 becomes 0-based line 2.
+        assert_eq!(
+            parse_ctags_definition(json.as_bytes(), "greet"),
+            Some((PathBuf::from("/tmp/x.tcl"), 2))
+        );
+        // A name with no tag returns nothing, and pseudo-tags are ignored.
+        assert_eq!(parse_ctags_definition(json.as_bytes(), "missing"), None);
+        assert_eq!(
+            parse_ctags_definition(json.as_bytes(), "TAG_FILE_FORMAT"),
+            None
+        );
     }
 
     #[test]

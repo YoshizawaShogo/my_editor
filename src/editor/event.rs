@@ -25,6 +25,7 @@ pub enum AppEvent {
     TerminalInput(Vec<u8>),
     Git(GitEvent),
     Shellcheck(ShellcheckEvent),
+    CtagsDefinition(CtagsDefinitionEvent),
     Resize {
         cols: u16,
         rows: u16,
@@ -46,6 +47,15 @@ pub struct GitEvent {
 pub struct ShellcheckEvent {
     pub doc: DocumentId,
     pub diagnostics: Vec<crate::lsp::Diagnostic>,
+}
+
+/// The result of a ctags definition lookup. `location` is the target file and its
+/// 0-based line, or None when no matching tag was found (or ctags is absent). The
+/// originating `doc` lets the editor report "not found" against the right buffer.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CtagsDefinitionEvent {
+    pub doc: DocumentId,
+    pub location: Option<(std::path::PathBuf, u32)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -7,8 +7,8 @@ mod layout;
 pub use command::{Command, Direction, Unit, VerticalDirection};
 pub use effect::Effect;
 pub use event::{
-    AppEvent, FileScanEvent, GitEvent, GitInfo, GitLine, GitLineKind, GrepEvent, GrepHit, IoEvent,
-    MouseInput, ShellcheckEvent, TerminalEvent,
+    AppEvent, CtagsDefinitionEvent, FileScanEvent, GitEvent, GitInfo, GitLine, GitLineKind,
+    GrepEvent, GrepHit, IoEvent, MouseInput, ShellcheckEvent, TerminalEvent,
 };
 pub use focus::{Focus, Side};
 use layout::{DiffPane, RightPane};
@@ -418,6 +418,13 @@ impl Editor {
                 self.dirty = true;
                 Vec::new()
             }
+            AppEvent::CtagsDefinition(event) => match event.location {
+                Some((path, line)) => self.open_path_at(path, lsp_types::Position::new(line, 0)),
+                None => {
+                    self.notify(ToastLevel::Info, "定義が見つかりません");
+                    Vec::new()
+                }
+            },
             AppEvent::Tick => {
                 self.notifications
                     .retain(|toast| toast.created.elapsed() < toast.ttl);
@@ -1899,7 +1906,8 @@ impl Editor {
 
     fn request_definition(&mut self) -> Vec<Effect> {
         let Some((server, path, line, character)) = self.active_lsp_context() else {
-            return Vec::new();
+            // No language server for this buffer — fall back to ctags.
+            return self.request_ctags_definition();
         };
         let id = self.next_lsp_request;
         self.next_lsp_request += 1;
@@ -1913,6 +1921,46 @@ impl Editor {
                 "position": {"line": line, "character": character}
             })
             .to_string(),
+        }]
+    }
+
+    /// Extensions ctags-based go-to-definition is offered for. These are the
+    /// languages ctags indexes well and that the editor targets; other files fall
+    /// through to nothing rather than spending a scan that can't resolve.
+    const CTAGS_EXTENSIONS: &[&str] = &["rs", "c", "h", "py", "sh", "bash", "csh", "tcl"];
+
+    /// Resolve the identifier under the caret with ctags. The fallback path for
+    /// buffers without a language server; a no-op unless the file is a ctags
+    /// target and a symbol sits under the caret. The scan itself runs off-thread
+    /// and is a no-op when ctags is not installed.
+    fn request_ctags_definition(&mut self) -> Vec<Effect> {
+        let pane = match self.layout.active_editor(self.focus) {
+            Some(pane) => pane,
+            None => return Vec::new(),
+        };
+        let Some(document) = self.documents.get(&pane.view.doc) else {
+            return Vec::new();
+        };
+        let Some(editable) = document.editable_opt() else {
+            return Vec::new();
+        };
+        let is_target = document.path.as_deref().is_some_and(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| Self::CTAGS_EXTENSIONS.contains(&extension))
+        });
+        if !is_target {
+            return Vec::new();
+        }
+        let Some(symbol) = word_at(editable.text(), pane.view.selections.primary().head) else {
+            return Vec::new();
+        };
+        let doc = pane.view.doc;
+        self.record_jump_origin();
+        vec![Effect::CtagsDefinition {
+            doc,
+            symbol,
+            root: self.workspace_root.clone(),
         }]
     }
 
@@ -5474,6 +5522,29 @@ impl Editor {
     }
 }
 
+/// The whole word the caret sits on or immediately after, or None when the caret
+/// is not touching a word. Used as the ctags lookup symbol.
+fn word_at(text: &ropey::Rope, caret: CharIdx) -> Option<String> {
+    let len = text.len_chars();
+    let cursor = caret.0.min(len);
+    let adjacent = if cursor < len && is_word(text.char(cursor)) {
+        cursor
+    } else if cursor > 0 && is_word(text.char(cursor - 1)) {
+        cursor - 1
+    } else {
+        return None;
+    };
+    let mut start = adjacent;
+    while start > 0 && is_word(text.char(start - 1)) {
+        start -= 1;
+    }
+    let mut end = adjacent + 1;
+    while end < len && is_word(text.char(end)) {
+        end += 1;
+    }
+    Some(text.slice(start..end).to_string())
+}
+
 fn find_occurrence(haystack: &[char], needle: &[char], start: usize) -> Option<usize> {
     if needle.is_empty() || start > haystack.len().saturating_sub(needle.len()) {
         return None;
@@ -6889,6 +6960,31 @@ mod tests {
                 .any(|effect| matches!(effect, Effect::RunShellcheck { doc, .. } if *doc == id)),
             "saving a .sh file should request a shellcheck run, got {effects:?}"
         );
+    }
+
+    #[test]
+    fn definition_without_a_language_server_falls_back_to_ctags() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("x.rs")]);
+        editor.update(AppEvent::TextPaste("helper".to_owned()));
+
+        // No LSP server is running in the test, so definition takes the ctags path
+        // and asks to resolve the symbol under the caret.
+        let effects = editor.request_definition();
+
+        assert!(
+            matches!(effects.as_slice(), [Effect::CtagsDefinition { symbol, .. }] if symbol == "helper"),
+            "expected a ctags lookup for `helper`, got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn ctags_definition_is_not_offered_for_non_target_files() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("notes.md")]);
+        editor.update(AppEvent::TextPaste("helper".to_owned()));
+
+        assert!(editor.request_definition().is_empty());
     }
 
     #[test]
