@@ -8,7 +8,7 @@ pub use command::{Command, Direction, Unit, VerticalDirection};
 pub use effect::Effect;
 pub use event::{
     AppEvent, FileScanEvent, GitEvent, GitInfo, GitLine, GitLineKind, GrepEvent, GrepHit, IoEvent,
-    MouseInput, TerminalEvent,
+    MouseInput, ShellcheckEvent, TerminalEvent,
 };
 pub use focus::{Focus, Side};
 use layout::{DiffPane, RightPane};
@@ -405,6 +405,15 @@ impl Editor {
                     if let crate::document::DocumentKind::Editable(editable) = &mut document.kind {
                         editable.git_lines = info.lines;
                     }
+                }
+                self.dirty = true;
+                Vec::new()
+            }
+            AppEvent::Shellcheck(event) => {
+                if let Some(document) = self.documents.get_mut(&event.doc)
+                    && let Some(editable) = document.editable_opt_mut()
+                {
+                    editable.set_diagnostics(event.diagnostics);
                 }
                 self.dirty = true;
                 Vec::new()
@@ -1061,6 +1070,14 @@ impl Editor {
                                 doc: id,
                                 path: path.to_path_buf(),
                             });
+                            // Shell scripts have no language server; shellcheck
+                            // fills that gap by relinting on each save.
+                            if document.language.as_deref() == Some("bash") {
+                                effects.push(Effect::RunShellcheck {
+                                    doc: id,
+                                    path: path.to_path_buf(),
+                                });
+                            }
                             if let Some(server) = document
                                 .language
                                 .as_ref()
@@ -6851,6 +6868,39 @@ mod tests {
         assert_eq!(editor.active_buffer().unwrap().text.to_string(), "two");
         editor.update(Command::Paste.into());
         assert_eq!(editor.active_buffer().unwrap().text.to_string(), "one\ntwo");
+    }
+
+    #[test]
+    fn saving_a_shell_script_requests_a_shellcheck_run() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("script.sh")]);
+        let id = DocumentId(1);
+
+        let effects = editor.update(AppEvent::Io(IoEvent::FileSaved { id, result: Ok(()) }));
+
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RunShellcheck { doc, .. } if *doc == id)),
+            "saving a .sh file should request a shellcheck run, got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn saving_a_rust_file_does_not_request_shellcheck() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("main.rs")]);
+
+        let effects = editor.update(AppEvent::Io(IoEvent::FileSaved {
+            id: DocumentId(1),
+            result: Ok(()),
+        }));
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RunShellcheck { .. }))
+        );
     }
 
     #[test]

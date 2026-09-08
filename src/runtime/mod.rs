@@ -22,7 +22,7 @@ use crate::{
     document::{DiskState, LargeFile},
     editor::{
         AppEvent, Editor, Effect, FileScanEvent, GitEvent, GitInfo, GitLine, GitLineKind,
-        GrepEvent, GrepHit, IoEvent, TerminalEvent,
+        GrepEvent, GrepHit, IoEvent, ShellcheckEvent, TerminalEvent,
     },
     input::{KeyChordState, RawInput, translate},
     render,
@@ -375,6 +375,13 @@ impl Runtime {
                 tokio::task::spawn_blocking(move || {
                     let result = compute_git_info(&path);
                     let _ = tx.send(AppEvent::Git(GitEvent { doc, result }));
+                });
+            }
+            Effect::RunShellcheck { doc, path } => {
+                let tx = self.tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let diagnostics = run_shellcheck(&path);
+                    let _ = tx.send(AppEvent::Shellcheck(ShellcheckEvent { doc, diagnostics }));
                 });
             }
             Effect::SpawnLsp {
@@ -1237,6 +1244,73 @@ fn is_git_ignored(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Run shellcheck over `path` and return its findings as editor diagnostics.
+/// Returns an empty vector — which clears any prior warnings — when shellcheck is
+/// not installed, cannot be launched, or emits output we can't parse, so a
+/// missing tool silently disables the feature rather than surfacing errors.
+fn run_shellcheck(path: &Path) -> Vec<crate::lsp::Diagnostic> {
+    if crate::status::which("shellcheck").is_none() {
+        return Vec::new();
+    }
+    let Ok(output) = Command::new("shellcheck")
+        .args(["--format=json1", "--"])
+        .arg(path)
+        .output()
+    else {
+        return Vec::new();
+    };
+    // shellcheck exits non-zero when it reports findings, so the status is
+    // ignored; the findings are on stdout regardless.
+    parse_shellcheck(&output.stdout)
+}
+
+#[derive(serde::Deserialize)]
+struct ShellcheckOutput {
+    comments: Vec<ShellcheckComment>,
+}
+
+#[derive(serde::Deserialize)]
+struct ShellcheckComment {
+    line: u32,
+    #[serde(rename = "endLine")]
+    end_line: u32,
+    column: u32,
+    #[serde(rename = "endColumn")]
+    end_column: u32,
+    level: String,
+    code: u32,
+    message: String,
+}
+
+/// Map shellcheck's `json1` output to diagnostics. shellcheck lines/columns are
+/// 1-based; the editor's diagnostics are 0-based (LSP convention), hence the
+/// shift. The `SCxxxx` code is prefixed so the wiki rule is identifiable.
+fn parse_shellcheck(stdout: &[u8]) -> Vec<crate::lsp::Diagnostic> {
+    let Ok(parsed) = serde_json::from_slice::<ShellcheckOutput>(stdout) else {
+        return Vec::new();
+    };
+    parsed
+        .comments
+        .into_iter()
+        .map(|comment| {
+            let severity = match comment.level.as_str() {
+                "error" => crate::lsp::DiagnosticSeverity::Error,
+                "warning" => crate::lsp::DiagnosticSeverity::Warning,
+                "info" => crate::lsp::DiagnosticSeverity::Information,
+                _ => crate::lsp::DiagnosticSeverity::Hint, // "style"
+            };
+            crate::lsp::Diagnostic {
+                line: comment.line.saturating_sub(1),
+                character: comment.column.saturating_sub(1),
+                end_line: comment.end_line.saturating_sub(1),
+                end_character: comment.end_column.saturating_sub(1),
+                severity,
+                message: format!("SC{}: {}", comment.code, comment.message),
+            }
+        })
+        .collect()
+}
+
 fn compute_git_info(path: &Path) -> std::result::Result<GitInfo, String> {
     let directory = path
         .parent()
@@ -1478,6 +1552,37 @@ mod tests {
         assert_eq!(workspace_root(std::slice::from_ref(&nested)), nested);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parse_shellcheck_maps_levels_and_shifts_to_zero_based() {
+        let json = br#"{"comments":[
+            {"file":"x.sh","line":1,"endLine":1,"column":6,"endColumn":16,"level":"warning","code":2154,"message":"undquoted is referenced but not assigned.","fix":null},
+            {"file":"x.sh","line":2,"endLine":2,"column":6,"endColumn":8,"level":"info","code":2086,"message":"Double quote to prevent globbing.","fix":null}
+        ]}"#;
+
+        let diagnostics = parse_shellcheck(json);
+
+        assert_eq!(diagnostics.len(), 2);
+        // 1-based (line 1, col 6..16) becomes 0-based (line 0, col 5..15).
+        assert_eq!(diagnostics[0].line, 0);
+        assert_eq!(diagnostics[0].character, 5);
+        assert_eq!(diagnostics[0].end_character, 15);
+        assert_eq!(
+            diagnostics[0].severity,
+            crate::lsp::DiagnosticSeverity::Warning
+        );
+        assert!(diagnostics[0].message.starts_with("SC2154: "));
+        // "info" maps to Information.
+        assert_eq!(
+            diagnostics[1].severity,
+            crate::lsp::DiagnosticSeverity::Information
+        );
+    }
+
+    #[test]
+    fn parse_shellcheck_returns_empty_on_garbage() {
+        assert!(parse_shellcheck(b"not json").is_empty());
     }
 
     #[test]

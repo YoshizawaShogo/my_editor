@@ -50,6 +50,12 @@ pub enum Effect {
         doc: DocumentId,
         path: PathBuf,
     },
+    /// Lint a saved shell script with shellcheck. A no-op when shellcheck is not
+    /// installed, so the feature is opt-in by having the tool on PATH.
+    RunShellcheck {
+        doc: DocumentId,
+        path: PathBuf,
+    },
     SpawnLsp {
         server: u64,
         language: String,

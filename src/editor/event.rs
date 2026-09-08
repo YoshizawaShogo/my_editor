@@ -24,6 +24,7 @@ pub enum AppEvent {
     Terminal(TerminalEvent),
     TerminalInput(Vec<u8>),
     Git(GitEvent),
+    Shellcheck(ShellcheckEvent),
     Resize {
         cols: u16,
         rows: u16,
@@ -36,6 +37,15 @@ pub enum AppEvent {
 pub struct GitEvent {
     pub doc: DocumentId,
     pub result: Result<GitInfo, String>,
+}
+
+/// The result of running shellcheck over a saved shell script. Diagnostics are
+/// already mapped to the editor's 0-based `lsp::Diagnostic`; an empty vector both
+/// clears prior warnings and covers the "shellcheck absent / errored" cases.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ShellcheckEvent {
+    pub doc: DocumentId,
+    pub diagnostics: Vec<crate::lsp::Diagnostic>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
