@@ -10,7 +10,6 @@ use crate::{
     diff::{DiffKind, Segment, aligned, rope_lines, word_segments},
     editor::{ActiveBuffer, Editor},
     position::{char_idx_to_display_pos, display_col_after},
-    view::is_word,
 };
 
 const BG: Color = Color::Rgb(0x16, 0x18, 0x21);
@@ -47,7 +46,10 @@ const CHANGED_BG: Color = Color::Rgb(0x38, 0x30, 0x22);
 const WORD_ADDED_BG: Color = Color::Rgb(0x3f, 0x5c, 0x3f);
 const WORD_REMOVED_BG: Color = Color::Rgb(0x63, 0x36, 0x40);
 const POPUP_BG: Color = Color::Rgb(0x1e, 0x21, 0x32);
-const OCCURRENCE_BG: Color = Color::Rgb(0x3d, 0x44, 0x60);
+// A teal that sits clearly off the navy SELECTION hue, so the word-at-cursor
+// highlight reads as distinct from a range selection rather than a lighter shade
+// of it. Kept in Iceberg's cyan family (cf. CODE_TYPE #89b8c2).
+const OCCURRENCE_BG: Color = Color::Rgb(0x24, 0x49, 0x4c);
 const MATCHING_BRACKET_BG: Color = Color::Rgb(0x4a, 0x50, 0x68);
 
 pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
@@ -1437,7 +1439,7 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
         .collect();
     let occurrence_ranges = visible_occurrence_ranges(
         buffer.text,
-        buffer.view.selections.primary().head,
+        buffer.view.selections.primary().range(),
         start,
         end,
     );
@@ -1783,53 +1785,48 @@ fn diagnostic_color(severity: crate::lsp::DiagnosticSeverity) -> Color {
     }
 }
 
+/// Visible ranges that match the current selection's text, for the "same text is
+/// also here" highlight. Returns nothing for a bare caret — typing, arrow-key
+/// navigation and a plain click leave an empty selection, and flashing the whole
+/// file as the caret crosses each word is more distraction than help. The
+/// highlight is opt-in: you get it once you actually select something (a
+/// double-click word, a shift/drag range).
 fn visible_occurrence_ranges(
     text: &ropey::Rope,
-    cursor: crate::position::CharIdx,
+    selection: std::ops::Range<usize>,
     first_line: usize,
     end_line: usize,
 ) -> Vec<std::ops::Range<usize>> {
-    let len = text.len_chars();
-    let cursor = cursor.0.min(len);
-    let adjacent = if cursor < len && is_word(text.char(cursor)) {
-        Some(cursor)
-    } else if cursor > 0 && is_word(text.char(cursor - 1)) {
-        Some(cursor - 1)
-    } else {
-        None
-    };
-    let Some(adjacent) = adjacent else {
+    if selection.is_empty() {
         return Vec::new();
+    }
+    let needle: Vec<char> = text.slice(selection).chars().collect();
+    // Blank or multi-line selections match noise, not a term worth tracking.
+    if needle.iter().all(|character| character.is_whitespace()) || needle.contains(&'\n') {
+        return Vec::new();
+    }
+    let len = text.len_chars();
+    let scan_start = text.line_to_char(first_line.min(text.len_lines()));
+    let scan_end = if end_line < text.len_lines() {
+        text.line_to_char(end_line)
+    } else {
+        len
     };
-    let mut word_start = adjacent;
-    while word_start > 0 && is_word(text.char(word_start - 1)) {
-        word_start -= 1;
-    }
-    let mut word_end = adjacent + 1;
-    while word_end < len && is_word(text.char(word_end)) {
-        word_end += 1;
-    }
-    let word = text.slice(word_start..word_end).to_string();
+    let window: Vec<char> = text.slice(scan_start..scan_end).chars().collect();
     let mut ranges = Vec::new();
-    for line in first_line..end_line.min(text.len_lines()) {
-        let mut index = text.line_to_char(line);
-        let line_end = if line + 1 < text.len_lines() {
-            text.line_to_char(line + 1)
+    if needle.is_empty() || needle.len() > window.len() {
+        return ranges;
+    }
+    // A needle without a newline never spans a line break, so scanning the whole
+    // visible window (newlines and all) can't produce a cross-line match.
+    let mut index = 0;
+    while index + needle.len() <= window.len() {
+        if window[index..index + needle.len()] == needle[..] {
+            let start = scan_start + index;
+            ranges.push(start..start + needle.len());
+            index += needle.len();
         } else {
-            len
-        };
-        while index < line_end {
-            if !is_word(text.char(index)) {
-                index += 1;
-                continue;
-            }
-            let start = index;
-            while index < line_end && is_word(text.char(index)) {
-                index += 1;
-            }
-            if text.slice(start..index) == word.as_str() {
-                ranges.push(start..index);
-            }
+            index += 1;
         }
     }
     ranges
@@ -2188,18 +2185,55 @@ mod tests {
     }
 
     #[test]
-    fn cursor_word_occurrences_are_subtly_highlighted() {
+    fn selected_text_occurrences_are_subtly_highlighted() {
+        use crate::editor::{Command, Direction, Unit};
+        let backend = TestBackend::new(30, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::TextPaste("foo bar foo".to_owned()));
+        // Select the first "foo" (chars 0..3).
+        editor.update(
+            Command::Move {
+                direction: Direction::Left,
+                unit: Unit::Document,
+                extend: false,
+            }
+            .into(),
+        );
+        for _ in 0..3 {
+            editor.update(
+                Command::Move {
+                    direction: Direction::Right,
+                    unit: Unit::Character,
+                    extend: true,
+                }
+                .into(),
+            );
+        }
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        let rendered = terminal.backend().buffer();
+        // The selected instance keeps the selection colour; the other "foo" gets
+        // the occurrence highlight; "bar" is untouched.
+        assert_eq!(rendered[(5, 0)].bg, SELECTION);
+        assert_eq!(rendered[(13, 0)].bg, OCCURRENCE_BG);
+        assert_eq!(rendered[(9, 0)].bg, BG);
+    }
+
+    #[test]
+    fn a_bare_caret_does_not_highlight_occurrences() {
         let backend = TestBackend::new(30, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut editor = Editor::default();
         editor.update(crate::editor::AppEvent::TextPaste("foo bar foo".to_owned()));
 
+        // No selection — typing/arrow navigation must not flash the whole file.
         terminal.draw(|frame| draw(frame, &editor)).unwrap();
 
         let rendered = terminal.backend().buffer();
-        assert_eq!(rendered[(5, 0)].bg, OCCURRENCE_BG);
-        assert_eq!(rendered[(13, 0)].bg, OCCURRENCE_BG);
-        assert_eq!(rendered[(9, 0)].bg, BG);
+        assert_eq!(rendered[(5, 0)].bg, BG);
+        assert_eq!(rendered[(13, 0)].bg, BG);
     }
 
     #[test]
