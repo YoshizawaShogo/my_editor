@@ -28,8 +28,11 @@ impl Default for Config {
                     lsp: Some(vec!["clangd".to_owned()]),
                     ..LanguageConfig::new("c", &["c", "h"], Some("//"))
                 },
-                // The bash grammar also colours .sh and .csh (see highlight::grammar).
-                LanguageConfig::new("bash", &["sh", "bash", "csh"], Some("#")),
+                LanguageConfig::new("bash", &["sh", "bash"], Some("#")),
+                // csh is its own language (its control flow differs from bash, so
+                // snippets and shellcheck must treat it separately), but reuses the
+                // bash tree-sitter grammar for highlighting (see highlight::grammar).
+                LanguageConfig::new("csh", &["csh"], Some("#")),
                 // Recognised for comment toggling and ctags go-to-definition; no
                 // tree-sitter grammar is wired, so highlighting stays plain.
                 LanguageConfig::new("tcl", &["tcl"], Some("#")),

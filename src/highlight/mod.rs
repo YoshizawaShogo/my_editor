@@ -131,12 +131,14 @@ fn cached_query(
     static MARKDOWN: OnceLock<Option<Query>> = OnceLock::new();
     static RUST: OnceLock<Option<Query>> = OnceLock::new();
     static BASH: OnceLock<Option<Query>> = OnceLock::new();
+    static CSH: OnceLock<Option<Query>> = OnceLock::new();
     let slot = match language_name {
         "json" => &JSON,
         "toml" => &TOML,
         "markdown" => &MARKDOWN,
         "rust" => &RUST,
         "bash" => &BASH,
+        "csh" => &CSH,
         _ => return None,
     };
     slot.get_or_init(|| Query::new(language, query_source).ok())
@@ -181,10 +183,9 @@ fn grammar(name: &str) -> Option<(Language, &'static str)> {
             tree_sitter_rust::LANGUAGE.into(),
             tree_sitter_rust::HIGHLIGHTS_QUERY,
         )),
-        // Also drives .sh and .csh — the bash grammar is a close enough fit that
-        // comments, strings and keywords colour sensibly even where the dialects
-        // diverge.
-        "bash" => Some((
+        // The bash grammar also drives csh: a close enough fit that comments,
+        // strings and keywords colour sensibly even where the dialects diverge.
+        "bash" | "csh" => Some((
             tree_sitter_bash::LANGUAGE.into(),
             tree_sitter_bash::HIGHLIGHT_QUERY,
         )),

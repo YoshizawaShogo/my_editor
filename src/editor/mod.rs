@@ -1078,13 +1078,10 @@ impl Editor {
                                 path: path.to_path_buf(),
                             });
                             // Shell scripts have no language server; shellcheck
-                            // fills that gap by relinting on each save. csh shares
-                            // the "bash" language for highlighting but shellcheck
-                            // rejects it (SC1071: sh/bash/dash/ksh only), so skip
-                            // it rather than surface that error on every save.
-                            let is_csh =
-                                path.extension().and_then(|ext| ext.to_str()) == Some("csh");
-                            if document.language.as_deref() == Some("bash") && !is_csh {
+                            // fills that gap by relinting on each save. Only bash/sh
+                            // (the "bash" language) — csh is its own language and
+                            // shellcheck rejects it (SC1071: sh/bash/dash/ksh only).
+                            if document.language.as_deref() == Some("bash") {
                                 effects.push(Effect::RunShellcheck {
                                     doc: id,
                                     path: path.to_path_buf(),
@@ -2928,7 +2925,13 @@ impl Editor {
             Command::DiffNextHunk => self.jump_diff_hunk(true),
             Command::DiffPrevHunk => self.jump_diff_hunk(false),
             Command::CloseBuffer => return self.close_active_buffer(),
-            Command::Indent => self.indent_selected_lines(false),
+            Command::Indent => {
+                // Tab expands a snippet when the word before a lone caret is a
+                // snippet prefix; otherwise it indents as usual.
+                if !self.try_expand_snippet() {
+                    self.indent_selected_lines(false);
+                }
+            }
             Command::Outdent => self.indent_selected_lines(true),
             Command::ToggleComment => self.toggle_comment(),
             Command::Undo => self.edit_active(|document, view| {
@@ -3138,6 +3141,77 @@ impl Editor {
                     .insert_fragments(&mut edits, &fragments);
             }
         });
+    }
+
+    /// If a lone caret sits just after a snippet prefix for the buffer's language,
+    /// replace that prefix with the expanded snippet and select its first tab stop
+    /// (so typing overwrites the placeholder). Returns whether it expanded — the
+    /// Tab handler falls back to indenting when it did not.
+    fn try_expand_snippet(&mut self) -> bool {
+        let Some(pane) = self.layout.active_editor(self.focus) else {
+            return false;
+        };
+        // Snippets are a single-caret action; a range or multi-cursor Tab indents.
+        if pane.view.selections.iter().count() != 1 || !pane.view.selections.primary().is_caret() {
+            return false;
+        }
+        let Some(document) = self.documents.get(&pane.view.doc) else {
+            return false;
+        };
+        let Some(editable) = document.editable_opt() else {
+            return false;
+        };
+        let Some(language) = document.language.as_deref() else {
+            return false;
+        };
+        let text = editable.text();
+        let caret = pane.view.selections.primary().head.0.min(text.len_chars());
+        let mut start = caret;
+        while start > 0 && is_word(text.char(start - 1)) {
+            start -= 1;
+        }
+        if start == caret {
+            return false;
+        }
+        let prefix = text.slice(start..caret).to_string();
+        let Some(snippet) = crate::snippet::snippets_for(language)
+            .iter()
+            .find(|snippet| snippet.prefix == prefix)
+        else {
+            return false;
+        };
+        // Indentation of the caret's line, so continuation lines stay aligned.
+        let line_start = text.line_to_char(text.char_to_line(caret));
+        let base_indent: String = text
+            .slice(line_start..)
+            .chars()
+            .take_while(|character| matches!(character, ' ' | '\t'))
+            .collect();
+        let expansion = crate::snippet::expand(snippet.body, &base_indent);
+        let body = expansion.text;
+        let body_len = body.chars().count();
+        let first_stop = expansion.stops.into_iter().next();
+
+        self.edit_active(|document, view| {
+            // Replace the prefix with the body in one edit…
+            view.selections.set_single(Selection {
+                anchor: CharIdx(start),
+                head: CharIdx(caret),
+            });
+            document
+                .editable_mut()
+                .insert_fragments(&mut view.selections, &[body]);
+            // …then land on the first tab stop (selecting its default), or the end.
+            let (anchor, head) = match &first_stop {
+                Some(stop) => (start + stop.start, start + stop.end),
+                None => (start + body_len, start + body_len),
+            };
+            view.selections.set_single(Selection {
+                anchor: CharIdx(anchor),
+                head: CharIdx(head),
+            });
+        });
+        true
     }
 
     fn indent_selected_lines(&mut self, outdent: bool) {
@@ -6960,6 +7034,36 @@ mod tests {
                 .any(|effect| matches!(effect, Effect::RunShellcheck { doc, .. } if *doc == id)),
             "saving a .sh file should request a shellcheck run, got {effects:?}"
         );
+    }
+
+    #[test]
+    fn tab_expands_a_snippet_prefix_and_selects_the_first_stop() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("x.rs")]);
+        editor.update(AppEvent::TextPaste("for".to_owned()));
+
+        editor.update(Command::Indent.into());
+
+        let buffer = editor.active_buffer().unwrap();
+        assert_eq!(buffer.text.to_string(), "for item in iter {\n    \n}");
+        // The caret lands on the first placeholder, selecting it so typing replaces.
+        let range = buffer.view.selections.primary().range();
+        assert_eq!(buffer.text.slice(range).to_string(), "item");
+    }
+
+    #[test]
+    fn tab_without_a_snippet_prefix_still_indents() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("x.rs")]);
+        editor.update(AppEvent::TextPaste("xyz".to_owned()));
+
+        editor.update(Command::Indent.into());
+
+        // "xyz" is not a snippet, so Tab inserts indentation at the caret rather
+        // than expanding — the word is intact and the buffer grew.
+        let text = editor.active_buffer().unwrap().text.to_string();
+        assert!(text.starts_with("xyz"));
+        assert!(text.len() > "xyz".len());
     }
 
     #[test]
