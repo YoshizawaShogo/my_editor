@@ -32,6 +32,10 @@ pub struct Editable {
     pub semantic_spans: Vec<crate::lsp::SemanticSpan>,
     pub syntax: Option<crate::highlight::IncrementalHighlighter>,
     pending_lsp_changes: Vec<lsp_types::TextDocumentContentChangeEvent>,
+    /// Active snippet tab stops as char ranges, ordered $1, $2, …, $0. Shifted
+    /// alongside diagnostics on every edit so they stay on the placeholders as the
+    /// user types; empty when no snippet is being filled in.
+    snippet_stops: Vec<std::ops::Range<usize>>,
 }
 
 impl Default for Editable {
@@ -53,7 +57,20 @@ impl Editable {
             semantic_spans: Vec::new(),
             syntax: None,
             pending_lsp_changes: Vec::new(),
+            snippet_stops: Vec::new(),
         }
+    }
+
+    pub fn snippet_stops(&self) -> &[std::ops::Range<usize>] {
+        &self.snippet_stops
+    }
+
+    pub fn set_snippet_stops(&mut self, stops: Vec<std::ops::Range<usize>>) {
+        self.snippet_stops = stops;
+    }
+
+    pub fn clear_snippet_stops(&mut self) {
+        self.snippet_stops.clear();
     }
 
     pub fn text(&self) -> &Rope {
@@ -728,7 +745,32 @@ impl Editable {
     /// track the text.
     fn shift_annotations(&mut self, replaced: std::ops::Range<usize>, inserted_len: usize) {
         self.update_semantic_spans(replaced.clone(), inserted_len);
+        self.update_snippet_stops(replaced.clone(), inserted_len);
         self.update_diagnostics(replaced, inserted_len);
+    }
+
+    /// Keep snippet tab stops aligned with an edit: stops before it stay, stops
+    /// after it move by the delta, and a stop the edit lands inside grows or
+    /// shrinks with the change (so typing over a placeholder keeps the stop on the
+    /// text that replaces it).
+    fn update_snippet_stops(&mut self, replaced: std::ops::Range<usize>, inserted_len: usize) {
+        if self.snippet_stops.is_empty() {
+            return;
+        }
+        let delta = inserted_len as isize - replaced.len() as isize;
+        let shift = |value: usize| (value as isize + delta).max(0) as usize;
+        for stop in &mut self.snippet_stops {
+            if stop.end <= replaced.start {
+                // Entirely before the edit — unchanged.
+            } else if stop.start >= replaced.end {
+                stop.start = shift(stop.start);
+                stop.end = shift(stop.end);
+            } else {
+                // The edit overlaps the stop: keep the earlier start, move the end.
+                stop.start = stop.start.min(replaced.start);
+                stop.end = shift(stop.end).max(stop.start);
+            }
+        }
     }
 
     fn update_semantic_spans(&mut self, replaced: std::ops::Range<usize>, inserted_len: usize) {

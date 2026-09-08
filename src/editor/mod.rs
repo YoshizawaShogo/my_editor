@@ -111,6 +111,9 @@ pub struct Editor {
     pending_lsp: HashMap<i64, PendingLsp>,
     next_lsp_request: i64,
     completion: Option<CompletionState>,
+    /// The snippet currently being filled in, if any. Tab/Shift+Tab step through
+    /// its stops (which live on the document as `snippet_stops`).
+    snippet_session: Option<SnippetSession>,
     completion_suppressed: Option<(DocumentId, i32)>,
     rename_input: Option<String>,
     /// The Go-to-Line prompt: the pane side to jump in and the digits typed so
@@ -164,6 +167,7 @@ impl Default for Editor {
             pending_lsp: HashMap::new(),
             next_lsp_request: 1,
             completion: None,
+            snippet_session: None,
             completion_suppressed: None,
             rename_input: None,
             goto_input: None,
@@ -2972,8 +2976,18 @@ impl Editor {
             Command::DiffNextHunk => self.jump_diff_hunk(true),
             Command::DiffPrevHunk => self.jump_diff_hunk(false),
             Command::CloseBuffer => return self.close_active_buffer(),
-            Command::Indent => self.indent_selected_lines(false),
-            Command::Outdent => self.indent_selected_lines(true),
+            Command::Indent => {
+                // While filling in a snippet, Tab walks to the next stop; otherwise
+                // it indents.
+                if !self.advance_snippet_stop() {
+                    self.indent_selected_lines(false);
+                }
+            }
+            Command::Outdent => {
+                if !self.retreat_snippet_stop() {
+                    self.indent_selected_lines(true);
+                }
+            }
             Command::ToggleComment => self.toggle_comment(),
             Command::Undo => self.edit_active(|document, view| {
                 document.editable_mut().undo(&mut view.selections);
@@ -3208,12 +3222,18 @@ impl Editor {
 
     /// Expand a chosen snippet: drop the `prefix_len` characters already typed,
     /// insert the expanded body, and select its first tab stop (or land the caret
-    /// at the end) so typing overwrites the placeholder.
+    /// at the end) so typing overwrites the placeholder. When the snippet has more
+    /// than one stop, a session is started so Tab/Shift+Tab walk the rest.
     fn expand_snippet_body(&mut self, body: &str, prefix_len: usize) {
         let expansion = crate::snippet::expand(body, &self.caret_line_indent());
         let text = expansion.text;
         let text_len = text.chars().count();
-        let first_stop = expansion.stops.into_iter().next();
+        let stops = expansion.stops;
+        let doc = self
+            .layout
+            .active_editor(self.focus)
+            .map(|pane| pane.view.doc);
+
         self.edit_active(|document, view| {
             let head = view.selections.primary().head.0;
             let start = head.saturating_sub(prefix_len);
@@ -3222,15 +3242,112 @@ impl Editor {
                 head: CharIdx(head),
             });
             document.editable_mut().insert(&mut view.selections, &text);
-            let (anchor, head) = match &first_stop {
-                Some(stop) => (start + stop.start, start + stop.end),
+            let absolute: Vec<_> = stops
+                .iter()
+                .map(|stop| (start + stop.start)..(start + stop.end))
+                .collect();
+            let (anchor, head) = match absolute.first() {
+                Some(stop) => (stop.start, stop.end),
                 None => (start + text_len, start + text_len),
             };
+            // More than one stop: remember them on the document so Tab can walk
+            // them and edits keep them aligned. A single stop needs no session.
+            if absolute.len() >= 2 {
+                document.editable_mut().set_snippet_stops(absolute);
+            } else {
+                document.editable_mut().clear_snippet_stops();
+            }
             view.selections.set_single(Selection {
                 anchor: CharIdx(anchor),
                 head: CharIdx(head),
             });
         });
+
+        self.snippet_session = doc
+            .filter(|doc| {
+                self.documents
+                    .get(doc)
+                    .and_then(Document::editable_opt)
+                    .is_some_and(|editable| editable.snippet_stops().len() >= 2)
+            })
+            .map(|doc| SnippetSession { doc, current: 0 });
+    }
+
+    /// Move to the next snippet stop, returning whether a session was active and
+    /// advanced. Ends the session (returning false) once the last stop is passed,
+    /// so Tab falls through to indentation afterwards.
+    fn advance_snippet_stop(&mut self) -> bool {
+        self.step_snippet_stop(true)
+    }
+
+    /// Move to the previous snippet stop; false when there is none before.
+    fn retreat_snippet_stop(&mut self) -> bool {
+        self.step_snippet_stop(false)
+    }
+
+    fn step_snippet_stop(&mut self, forward: bool) -> bool {
+        let Some(session) = &self.snippet_session else {
+            return false;
+        };
+        let doc = session.doc;
+        // A session only applies while its document is the one in focus.
+        if self
+            .layout
+            .active_editor(self.focus)
+            .map(|pane| pane.view.doc)
+            != Some(doc)
+        {
+            self.clear_snippet_session();
+            return false;
+        }
+        let stops_len = self
+            .documents
+            .get(&doc)
+            .and_then(Document::editable_opt)
+            .map_or(0, |editable| editable.snippet_stops().len());
+        let target = if forward {
+            session.current + 1
+        } else {
+            match session.current.checked_sub(1) {
+                Some(previous) => previous,
+                None => return false,
+            }
+        };
+        if target >= stops_len {
+            // Walked past the final stop — the snippet is done.
+            self.clear_snippet_session();
+            return false;
+        }
+        let range = self
+            .documents
+            .get(&doc)
+            .and_then(Document::editable_opt)
+            .map(|editable| editable.snippet_stops()[target].clone());
+        let Some(range) = range else {
+            self.clear_snippet_session();
+            return false;
+        };
+        if let Some(session) = self.snippet_session.as_mut() {
+            session.current = target;
+        }
+        if let Some(pane) = self.layout.active_editor_mut(self.focus) {
+            pane.view.selections.set_single(Selection {
+                anchor: CharIdx(range.start),
+                head: CharIdx(range.end),
+            });
+        }
+        self.ensure_cursor_visible();
+        self.dirty = true;
+        true
+    }
+
+    fn clear_snippet_session(&mut self) {
+        if let Some(session) = self.snippet_session.take()
+            && let Some(document) = self.documents.get_mut(&session.doc)
+            && let Some(editable) = document.editable_opt_mut()
+        {
+            editable.clear_snippet_stops();
+        }
     }
 
     fn indent_selected_lines(&mut self, outdent: bool) {
@@ -3440,6 +3557,8 @@ impl Editor {
     }
 
     fn collapse_selections(&mut self) {
+        // Esc also leaves snippet mode, so a later Tab indents again.
+        self.clear_snippet_session();
         let Some(pane) = self.layout.active_editor_mut(self.focus) else {
             return;
         };
@@ -6452,6 +6571,13 @@ struct CompletionState {
     anchor: CharIdx,
 }
 
+/// A snippet being filled in. The stops themselves live on the document (so edits
+/// shift them); this just remembers which document and which stop is current.
+struct SnippetSession {
+    doc: DocumentId,
+    current: usize,
+}
+
 #[derive(Debug)]
 struct CompletionCandidate {
     label: String,
@@ -7107,6 +7233,35 @@ mod tests {
         assert_eq!(buffer.text.to_string(), "for item in iter {\n    \n}");
         let range = buffer.view.selections.primary().range();
         assert_eq!(buffer.text.slice(range).to_string(), "item");
+    }
+
+    #[test]
+    fn tab_walks_snippet_stops_and_tracks_edits() {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("x.rs")]);
+        for character in "for".chars() {
+            editor.update(AppEvent::TextInput(character));
+        }
+        editor.update(Command::ToggleCompletion.into());
+        editor.update(Command::PickerConfirm.into());
+
+        // First stop selects "item".
+        {
+            let buffer = editor.active_buffer().unwrap();
+            let range = buffer.view.selections.primary().range();
+            assert_eq!(buffer.text.slice(range).to_string(), "item");
+        }
+
+        // Overwrite the first placeholder; the later stops must shift with the edit.
+        editor.update(AppEvent::TextInput('x'));
+        // Tab moves to the second stop, "iter", now three columns earlier.
+        editor.update(Command::Indent.into());
+        {
+            let buffer = editor.active_buffer().unwrap();
+            assert!(buffer.text.to_string().starts_with("for x in iter {"));
+            let range = buffer.view.selections.primary().range();
+            assert_eq!(buffer.text.slice(range).to_string(), "iter");
+        }
     }
 
     #[test]
