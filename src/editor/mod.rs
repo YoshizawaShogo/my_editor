@@ -3617,7 +3617,23 @@ impl Editor {
                 let Some(anchor) = self.drag_anchor else {
                     return;
                 };
-                let Some(head) = self.mouse_position(mouse.column, mouse.row) else {
+                // Extend past the viewport: when the drag reaches the top or bottom
+                // edge of the text area, scroll a line at a time so the selection can
+                // grow beyond what's on screen. Terminals only emit drag events on
+                // movement, so holding still at the edge just stops scrolling — no
+                // timer, and no runaway once the document end is reached (scroll_at
+                // clamps and mouse_position then lands on the last position).
+                let text_bottom = self.terminal_size.1.saturating_sub(2);
+                let head = if mouse.row == 0 {
+                    self.scroll_at(mouse.column, -1);
+                    self.mouse_position(mouse.column, 0)
+                } else if mouse.row >= text_bottom {
+                    self.scroll_at(mouse.column, 1);
+                    self.mouse_position(mouse.column, text_bottom)
+                } else {
+                    self.mouse_position(mouse.column, mouse.row)
+                };
+                let Some(head) = head else {
                     return;
                 };
                 let Some(pane) = self.layout.active_editor_mut(self.focus) else {
@@ -6835,6 +6851,54 @@ mod tests {
         assert_eq!(editor.active_buffer().unwrap().text.to_string(), "two");
         editor.update(Command::Paste.into());
         assert_eq!(editor.active_buffer().unwrap().text.to_string(), "one\ntwo");
+    }
+
+    #[test]
+    fn drag_selection_auto_scrolls_past_the_bottom_edge() {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::Resize { cols: 20, rows: 6 }); // text rows 0..=4
+        let content: String = (0..30).map(|index| format!("line{index}\n")).collect();
+        editor.update(AppEvent::TextPaste(content));
+        editor.update(
+            Command::Move {
+                direction: Direction::Left,
+                unit: Unit::Document,
+                extend: false,
+            }
+            .into(),
+        );
+        let top_before = editor.active_buffer().unwrap().view.scroll.top_line;
+
+        let mouse = |kind, row| {
+            AppEvent::Mouse(MouseInput {
+                event: MouseEvent {
+                    kind,
+                    column: 5,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                clicks: 1,
+            })
+        };
+        editor.update(mouse(MouseEventKind::Down(MouseButton::Left), 0));
+        // Each drag event at the bottom text row (rows - 2) scrolls one line, the
+        // way a terminal reports a drag held past the edge.
+        for _ in 0..3 {
+            editor.update(mouse(MouseEventKind::Drag(MouseButton::Left), 4));
+        }
+
+        let buffer = editor.active_buffer().unwrap();
+        assert!(
+            buffer.view.scroll.top_line > top_before,
+            "the view should scroll down as the drag holds at the bottom edge"
+        );
+        let head_line = buffer
+            .text
+            .char_to_line(buffer.view.selections.primary().head.0);
+        assert!(
+            head_line > 4,
+            "selection head should extend below the initial viewport, got line {head_line}"
+        );
     }
 
     #[test]
