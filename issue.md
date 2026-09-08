@@ -55,3 +55,32 @@ have the observer treat that as "file not on disk yet" (clear any external-chang
 flag, don't touch the status line). Confirm save then creates it and the state
 settles. Needs a test: open missing path → no error status; save → file created,
 status clean.
+
+## 4. BUG: Python LSP appears not to work; an empty popup box shows
+
+**Symptom:** Editing a `.py` file, the Python language features don't work
+(no useful completion/diagnostics), the status line reads `<lsp> python:
+coloring`, and an empty popup rectangle is drawn in the top-right.
+
+**Findings:**
+- **`pylsp` is not installed** on this machine (`my_editor --status` shows
+  `✗ pylsp`, and `which pylsp` fails). The config points python's LSP at `pylsp`,
+  so with it absent the server never really comes up — that is the primary reason
+  Python "doesn't work". First step: install it
+  (`pip install python-lsp-server`) and retest.
+- Independent of that, **an empty popup is being rendered** (the top-right box
+  with no content). A completion/hover/signature popup with nothing in it should
+  not be shown. Worth confirming the guards: completion is gated on
+  `!items.is_empty()` at src/editor/mod.rs:1397/1805, but check `completion_view`
+  (mod.rs:904), `hover_view` (932), and `signature_help_view` (936) plus their
+  render sites (render/mod.rs draw_completion:541, signature_help:180) for a path
+  that yields an empty-but-Some view.
+- The `<lsp> python: coloring` status is suspicious: python has no tree-sitter
+  grammar wired (only json/toml/markdown/rust/bash/csh), so "coloring" may be a
+  stale/misleading LSP phase label when the server failed to start.
+
+**Suggested direction (not yet done):** (1) surface a clear "pylsp not found"
+state the way shellcheck silently no-ops rather than showing a half-alive LSP;
+(2) never render an empty popup; (3) reconsider the status label when the server
+did not start. Revisit after installing pylsp to separate "tool missing" from
+real bugs.
