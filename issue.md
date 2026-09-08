@@ -63,11 +63,11 @@ status clean.
 coloring`, and an empty popup rectangle is drawn in the top-right.
 
 **Findings:**
-- **`pylsp` is not installed** on this machine (`my_editor --status` shows
-  `✗ pylsp`, and `which pylsp` fails). The config points python's LSP at `pylsp`,
-  so with it absent the server never really comes up — that is the primary reason
-  Python "doesn't work". First step: install it
-  (`pip install python-lsp-server`) and retest.
+- `pylsp` **is now installed** (`my_editor --status` shows
+  `✓ pylsp /home/shogo/.local/bin/pylsp`; clangd is present too). So a missing
+  tool is *no longer* the explanation — the Python trouble is a real bug to
+  investigate now that the server is available. Retest and capture what pylsp
+  actually returns (completion/hover/diagnostics) vs. what the editor shows.
 - Independent of that, **an empty popup is being rendered** (the top-right box
   with no content). A completion/hover/signature popup with nothing in it should
   not be shown. Worth confirming the guards: completion is gated on
@@ -84,3 +84,48 @@ state the way shellcheck silently no-ops rather than showing a half-alive LSP;
 (2) never render an empty popup; (3) reconsider the status label when the server
 did not start. Revisit after installing pylsp to separate "tool missing" from
 real bugs.
+
+## 5. Refactor roadmap for editor/mod.rs (module placement)
+
+Done so far (safe, behavior-preserving, each verified + committed):
+- Tests → `editor/tests.rs`.
+- Jump history → `editor/navigate.rs`.
+- Snippet filling → `editor/snippet_session.rs`.
+- Diff view → `editor/diff_view.rs`.
+
+These were clean because they own no shared types (or none at all) and their
+methods are cohesive. mod.rs went 10029 → ~6.1k lines.
+
+**Blocker for the rest.** The remaining concerns (completion, lsp, search,
+picker, shell/terminal, notifications) cannot be split cleanly yet because of two
+coupling knots:
+
+1. **God dispatch methods.** `update`, `apply_command`, `apply_lsp`, and
+   `confirm_picker` each handle many concerns in one body. For example
+   `apply_lsp` builds completion candidates, and `confirm_picker` applies a chosen
+   completion, a picked file, a search hit, and a rename — so completion logic
+   lives in three places at once. Until each of these is decomposed (one arm →
+   one method per concern), the concern's code can't all move to one module.
+2. **Shared types with private fields.** `CompletionCandidate`/`CompletionState`
+   are constructed in `apply_lsp` (mod.rs) and consumed in `confirm_picker`
+   (mod.rs) as well as in the completion methods; `SearchState` is stored inside
+   `layout::RightPane::Search`, so it is shared with the layout module. Moving
+   such a type to a concern submodule would force most of its fields to
+   `pub(super)`, which *raises* coupling rather than lowering it — the opposite of
+   the goal.
+
+**Recommended order (needs your OK — it is a bigger change than the moves above):**
+1. Decompose the dispatch god-methods: give `apply_lsp` one handler per response
+   kind, and split `confirm_picker` into `confirm_completion` / `confirm_search` /
+   `confirm_rename` / `confirm_file`. Behavior-preserving, each verified.
+2. Once completion logic is in dedicated methods, move them + the completion types
+   into `editor/completion.rs` (types now have a single owning module).
+3. Repeat for lsp (`editor/lsp.rs`: LspServer, PendingLsp, SignatureHelp*, the
+   request/response methods, the hover/signature free fns), search
+   (`editor/search.rs`; decide whether `SearchState` stays with layout or the
+   variant becomes a thin handle), picker, and shell/terminal.
+4. Group the remaining pure free functions with their concern modules.
+
+This is the "where should each type/function live" design. Step 1 is the
+prerequisite and the main decision: it is a real (if mechanical) change to central
+control flow, so it is left here rather than done unprompted.
