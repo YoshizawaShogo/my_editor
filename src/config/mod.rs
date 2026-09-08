@@ -28,6 +28,8 @@ impl Default for Config {
                     lsp: Some(vec!["clangd".to_owned()]),
                     ..LanguageConfig::new("c", &["c", "h"], Some("//"))
                 },
+                // The bash grammar also colours .sh and .csh (see highlight::grammar).
+                LanguageConfig::new("bash", &["sh", "bash", "csh"], Some("#")),
                 LanguageConfig {
                     name: "make".to_owned(),
                     filenames: vec![

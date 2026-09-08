@@ -130,11 +130,13 @@ fn cached_query(
     static TOML: OnceLock<Option<Query>> = OnceLock::new();
     static MARKDOWN: OnceLock<Option<Query>> = OnceLock::new();
     static RUST: OnceLock<Option<Query>> = OnceLock::new();
+    static BASH: OnceLock<Option<Query>> = OnceLock::new();
     let slot = match language_name {
         "json" => &JSON,
         "toml" => &TOML,
         "markdown" => &MARKDOWN,
         "rust" => &RUST,
+        "bash" => &BASH,
         _ => return None,
     };
     slot.get_or_init(|| Query::new(language, query_source).ok())
@@ -179,6 +181,13 @@ fn grammar(name: &str) -> Option<(Language, &'static str)> {
             tree_sitter_rust::LANGUAGE.into(),
             tree_sitter_rust::HIGHLIGHTS_QUERY,
         )),
+        // Also drives .sh and .csh — the bash grammar is a close enough fit that
+        // comments, strings and keywords colour sensibly even where the dialects
+        // diverge.
+        "bash" => Some((
+            tree_sitter_bash::LANGUAGE.into(),
+            tree_sitter_bash::HIGHLIGHT_QUERY,
+        )),
         _ => None,
     }
 }
@@ -193,6 +202,15 @@ mod tests {
 
         assert!(spans.iter().any(|span| span.kind.contains("string")));
         assert!(spans.iter().any(|span| span.kind.contains("number")));
+    }
+
+    #[test]
+    fn bash_comments_strings_and_keywords_are_highlighted() {
+        let spans = highlight("bash", "# note\nif true; then\n  echo \"hi\"\nfi\n");
+
+        assert!(spans.iter().any(|span| span.kind.contains("comment")));
+        assert!(spans.iter().any(|span| span.kind.contains("string")));
+        assert!(spans.iter().any(|span| span.kind.contains("keyword")));
     }
 
     #[test]
