@@ -1071,8 +1071,13 @@ impl Editor {
                                 path: path.to_path_buf(),
                             });
                             // Shell scripts have no language server; shellcheck
-                            // fills that gap by relinting on each save.
-                            if document.language.as_deref() == Some("bash") {
+                            // fills that gap by relinting on each save. csh shares
+                            // the "bash" language for highlighting but shellcheck
+                            // rejects it (SC1071: sh/bash/dash/ksh only), so skip
+                            // it rather than surface that error on every save.
+                            let is_csh =
+                                path.extension().and_then(|ext| ext.to_str()) == Some("csh");
+                            if document.language.as_deref() == Some("bash") && !is_csh {
                                 effects.push(Effect::RunShellcheck {
                                     doc: id,
                                     path: path.to_path_buf(),
@@ -6883,6 +6888,25 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::RunShellcheck { doc, .. } if *doc == id)),
             "saving a .sh file should request a shellcheck run, got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn saving_a_csh_file_does_not_request_shellcheck() {
+        // csh maps to the "bash" language for highlighting, but shellcheck cannot
+        // lint it (SC1071), so no run should be requested.
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from("login.csh")]);
+
+        let effects = editor.update(AppEvent::Io(IoEvent::FileSaved {
+            id: DocumentId(1),
+            result: Ok(()),
+        }));
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RunShellcheck { .. }))
         );
     }
 
