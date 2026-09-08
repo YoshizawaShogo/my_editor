@@ -10,6 +10,7 @@ pub mod lsp;
 pub mod position;
 pub mod render;
 pub mod runtime;
+pub mod status;
 pub mod terminal;
 pub mod view;
 

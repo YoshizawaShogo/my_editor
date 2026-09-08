@@ -1,4 +1,7 @@
-use my_editor::{Result, error::install_panic_hook, runtime::Runtime, terminal::TerminalSession};
+use my_editor::{
+    Result, config::Config, error::install_panic_hook, runtime::Runtime, status,
+    terminal::TerminalSession,
+};
 use std::path::PathBuf;
 
 fn main() {
@@ -27,13 +30,23 @@ fn cap_malloc_arenas() {
 }
 
 fn run() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--status` is a doctor command: print tool availability and exit without
+    // ever entering raw mode, so it stays usable from scripts and CI.
+    if args.iter().any(|arg| arg == "--status") {
+        print!("{}", status::tool_report(&Config::default(), status::which));
+        return Ok(());
+    }
+
     let tokio = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let terminal = TerminalSession::enter()?;
     let cwd = std::env::current_dir()?;
-    let paths = std::env::args()
-        .skip(1)
+    let paths = args
+        .into_iter()
+        // Flags are not file arguments.
+        .filter(|arg| !arg.starts_with("--"))
         .map(PathBuf::from)
         .map(|path| {
             if path.is_absolute() {
