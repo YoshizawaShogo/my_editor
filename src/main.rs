@@ -34,7 +34,14 @@ fn run() -> Result<()> {
     // `--status` is a doctor command: print tool availability and exit without
     // ever entering raw mode, so it stays usable from scripts and CI.
     if args.iter().any(|arg| arg == "--status") {
-        print!("{}", status::tool_report(&Config::default(), status::which));
+        // Colour only for an interactive terminal, and honour NO_COLOR, so piped
+        // or redirected output stays plain.
+        let color = std::io::IsTerminal::is_terminal(&std::io::stdout())
+            && std::env::var_os("NO_COLOR").is_none();
+        print!(
+            "{}",
+            status::tool_report(&Config::default(), status::which, color)
+        );
         return Ok(());
     }
 
