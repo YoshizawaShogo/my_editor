@@ -139,14 +139,22 @@ impl Editable {
         at: Option<Instant>,
     ) {
         let targets: Vec<_> = selections.iter().copied().collect();
-        let replacements = targets
-            .iter()
-            .map(|selection| {
-                let selected = self.text.slice(selection.range()).to_string();
-                format!("{opening}{selected}{closing}")
-            })
-            .collect();
-        let cursor_backs = vec![1; targets.len()];
+        let mut replacements = Vec::with_capacity(targets.len());
+        let mut cursor_backs = Vec::with_capacity(targets.len());
+        for selection in &targets {
+            let range = selection.range();
+            let selected = self.text.slice(range.clone()).to_string();
+            if range.is_empty() && !self.should_auto_close(range.start) {
+                // A bare caret with a regular character right after it (as in `A=B`
+                // before `B`): insert just the opening character, no auto-close.
+                replacements.push(opening.to_string());
+                cursor_backs.push(0);
+            } else {
+                // Wrapping a selection, or at a spot where auto-closing helps.
+                replacements.push(format!("{opening}{selected}{closing}"));
+                cursor_backs.push(1);
+            }
+        }
         self.replace_ranges(
             selections,
             targets,
@@ -155,6 +163,18 @@ impl Editable {
             None,
             Some(cursor_backs),
         );
+    }
+
+    /// Whether a freshly typed opening bracket/quote at `at` should also drop its
+    /// closing half. Mirrors VS Code: only when nothing presses right after the
+    /// caret — end of the text or line, whitespace, or a closing bracket. A
+    /// regular character following inserts the single opening character alone.
+    fn should_auto_close(&self, at: usize) -> bool {
+        if at >= self.text.len_chars() {
+            return true;
+        }
+        let next = self.text.char(at);
+        next.is_whitespace() || matches!(next, ')' | ']' | '}')
     }
 
     pub fn skip_closing_character(&self, selections: &mut Selections, closing: char) -> bool {
@@ -1165,6 +1185,43 @@ mod tests {
             assert_eq!(editable.text().to_string(), "");
             assert_eq!(selections.primary().head, CharIdx(0));
         }
+    }
+
+    #[test]
+    fn quote_before_a_word_does_not_auto_close() {
+        // `A=B` with the caret right before `B`: typing a quote inserts one quote,
+        // not a pair, because a regular character follows.
+        let mut editable = Editable::new("A=B");
+        let mut selections = Selections::single(Selection::caret(CharIdx(2)));
+
+        editable.insert_pair(&mut selections, '"', '"', None);
+
+        assert_eq!(editable.text().to_string(), "A=\"B");
+        assert_eq!(selections.primary().head, CharIdx(3));
+    }
+
+    #[test]
+    fn quote_at_end_of_line_still_auto_closes() {
+        // Nothing after the caret: the pair is still completed.
+        let mut editable = Editable::new("A=");
+        let mut selections = Selections::single(Selection::caret(CharIdx(2)));
+
+        editable.insert_pair(&mut selections, '"', '"', None);
+
+        assert_eq!(editable.text().to_string(), "A=\"\"");
+        assert_eq!(selections.primary().head, CharIdx(3));
+    }
+
+    #[test]
+    fn pair_before_a_closing_bracket_auto_closes() {
+        // Typing `"` inside `()` completes the pair, since a closing bracket
+        // follows rather than a word character.
+        let mut editable = Editable::new("()");
+        let mut selections = Selections::single(Selection::caret(CharIdx(1)));
+
+        editable.insert_pair(&mut selections, '"', '"', None);
+
+        assert_eq!(editable.text().to_string(), "(\"\")");
     }
 
     #[test]
