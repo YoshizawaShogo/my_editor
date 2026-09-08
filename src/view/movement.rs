@@ -52,33 +52,87 @@ fn move_document(text: &Rope, direction: Direction) -> CharIdx {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Regular,
+    Whitespace,
+    Separator,
+}
+
+fn classify(character: char) -> CharClass {
+    if is_word(character) {
+        CharClass::Regular
+    } else if character.is_whitespace() {
+        CharClass::Whitespace
+    } else {
+        CharClass::Separator
+    }
+}
+
+/// Word motion matching VS Code's default `cursorWordLeft`/`cursorWordRight`:
+/// moving right lands on the *end* of the next word, moving left on the *start*
+/// of the previous word. Whitespace is skipped, and a lone separator wedged
+/// between two words (`foo.bar`) is passed over transparently, while a run of two
+/// or more separators (`foo::bar`, `a === b`) is a stop of its own.
 fn move_word(text: &Rope, index: CharIdx, direction: Direction) -> CharIdx {
-    // Word motion stops at every run boundary rather than jumping a whole word
-    // plus its trailing gap in one step: a press lands on the end of the current
-    // word, the next press skips the following symbols/whitespace to the next
-    // word's start. Whether the current run is word characters or not decides
-    // which kind of run we consume this step.
+    let len = text.len_chars();
     match direction {
-        Direction::Left | Direction::Up => {
-            let mut cursor = index.0;
-            if cursor == 0 {
-                return CharIdx(0);
-            }
-            let in_word = is_word(text.char(cursor - 1));
-            while cursor > 0 && is_word(text.char(cursor - 1)) == in_word {
-                cursor -= 1;
-            }
-            CharIdx(cursor)
-        }
         Direction::Right | Direction::Down => {
-            let len = text.len_chars();
             let mut cursor = index.0;
+            while cursor < len && classify(text.char(cursor)) == CharClass::Whitespace {
+                cursor += 1;
+            }
             if cursor >= len {
                 return CharIdx(len);
             }
-            let in_word = is_word(text.char(cursor));
-            while cursor < len && is_word(text.char(cursor)) == in_word {
+            if classify(text.char(cursor)) == CharClass::Regular {
+                while cursor < len && classify(text.char(cursor)) == CharClass::Regular {
+                    cursor += 1;
+                }
+                return CharIdx(cursor);
+            }
+            // A separator run: stop at its end, unless it is a single separator
+            // immediately followed by a word, which is skipped through to that
+            // word's end.
+            let start = cursor;
+            while cursor < len && classify(text.char(cursor)) == CharClass::Separator {
                 cursor += 1;
+            }
+            if cursor - start == 1
+                && cursor < len
+                && classify(text.char(cursor)) == CharClass::Regular
+            {
+                while cursor < len && classify(text.char(cursor)) == CharClass::Regular {
+                    cursor += 1;
+                }
+            }
+            CharIdx(cursor)
+        }
+        Direction::Left | Direction::Up => {
+            let mut cursor = index.0;
+            while cursor > 0 && classify(text.char(cursor - 1)) == CharClass::Whitespace {
+                cursor -= 1;
+            }
+            if cursor == 0 {
+                return CharIdx(0);
+            }
+            if classify(text.char(cursor - 1)) == CharClass::Regular {
+                while cursor > 0 && classify(text.char(cursor - 1)) == CharClass::Regular {
+                    cursor -= 1;
+                }
+                return CharIdx(cursor);
+            }
+            let end = cursor;
+            while cursor > 0 && classify(text.char(cursor - 1)) == CharClass::Separator {
+                cursor -= 1;
+            }
+            if end - cursor == 1
+                && cursor > 0
+                && classify(text.char(cursor - 1)) == CharClass::Regular
+            {
+                while cursor > 0 && classify(text.char(cursor - 1)) == CharClass::Regular {
+                    cursor -= 1;
+                }
             }
             CharIdx(cursor)
         }
@@ -181,12 +235,11 @@ mod tests {
         assert_eq!(moved.head, CharIdx(3));
     }
 
-    #[test]
-    fn word_movement_right_stops_at_each_run_boundary() {
-        let text = Rope::from_str("one  two");
-        let stops: Vec<usize> = std::iter::successors(Some(CharIdx(0)), |index| {
+    fn right_stops(text: &str, from: usize) -> Vec<usize> {
+        let rope = Rope::from_str(text);
+        std::iter::successors(Some(CharIdx(from)), |index| {
             let next = move_head(
-                &text,
+                &rope,
                 Selection::caret(*index),
                 Direction::Right,
                 Unit::Word,
@@ -196,18 +249,14 @@ mod tests {
             (next != *index).then_some(next)
         })
         .map(|index| index.0)
-        .collect();
-
-        // End of "one", start of "two", end of "two" — the gap is its own stop.
-        assert_eq!(stops, vec![0, 3, 5, 8]);
+        .collect()
     }
 
-    #[test]
-    fn word_movement_left_mirrors_run_boundaries() {
-        let text = Rope::from_str("one  two");
-        let stops: Vec<usize> = std::iter::successors(Some(CharIdx(8)), |index| {
+    fn left_stops(text: &str, from: usize) -> Vec<usize> {
+        let rope = Rope::from_str(text);
+        std::iter::successors(Some(CharIdx(from)), |index| {
             let next = move_head(
-                &text,
+                &rope,
                 Selection::caret(*index),
                 Direction::Left,
                 Unit::Word,
@@ -217,8 +266,31 @@ mod tests {
             (next != *index).then_some(next)
         })
         .map(|index| index.0)
-        .collect();
+        .collect()
+    }
 
-        assert_eq!(stops, vec![8, 5, 3, 0]);
+    #[test]
+    fn word_movement_right_lands_on_word_ends() {
+        // VS Code style: end of each word, skipping whitespace between them — no
+        // separate stop on the gap.
+        assert_eq!(right_stops("one  two", 0), vec![0, 3, 8]);
+    }
+
+    #[test]
+    fn word_movement_left_lands_on_word_starts() {
+        assert_eq!(left_stops("one  two", 8), vec![8, 5, 0]);
+    }
+
+    #[test]
+    fn word_movement_skips_a_lone_separator_but_stops_on_a_run() {
+        // "foo.bar baz(qux)": a single '.' or '(' between words is transparent, so
+        // the stops are the word ends (right) / starts (left).
+        assert_eq!(
+            right_stops("foo.bar baz(qux)", 0),
+            vec![0, 3, 7, 11, 15, 16]
+        );
+        assert_eq!(left_stops("foo.bar baz(qux)", 16), vec![16, 12, 8, 4, 0]);
+        // A run of two separators is its own stop.
+        assert_eq!(right_stops("foo::bar", 0), vec![0, 3, 5, 8]);
     }
 }
