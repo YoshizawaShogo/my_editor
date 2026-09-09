@@ -860,7 +860,11 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
     } else {
         Some(layout.find_top)
     };
-    if let Some(top) = field_top {
+    // Only while the pane holds focus — otherwise the caret would sit in the
+    // query box while typing went to the buffer.
+    if let Some(top) = field_top
+        && search.focused
+    {
         let cursor_x = area.x + 1 + search.field_cursor as u16;
         let cursor_y = row_at(top + 1);
         if cursor_x < area.right() && cursor_y < area.bottom() {

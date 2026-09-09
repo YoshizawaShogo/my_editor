@@ -1011,6 +1011,43 @@ fn a_buffer_result_row_marks_the_match_and_dims_the_location_column() {
 }
 
 #[test]
+fn typing_after_opening_a_result_still_edits_the_query() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 40, rows: 24 });
+    editor.update(AppEvent::TextPaste("foo foo".to_owned()));
+    let before = editor.active_buffer().unwrap().text.to_string();
+    editor.update(Command::OpenSearch.into());
+    for character in "foo".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+
+    editor.open_search_hit(0);
+    editor.update(AppEvent::TextInput('x'));
+
+    // The caret is drawn in the query box, so the keystroke has to land there —
+    // it used to go to the document while the caret stayed in the find field.
+    assert_eq!(editor.search_view().unwrap().query, "foox");
+    assert_eq!(
+        editor.active_buffer().unwrap().text.to_string(),
+        before,
+        "the keystroke leaked into the buffer"
+    );
+}
+
+#[test]
+fn the_find_caret_is_only_drawn_while_the_pane_has_focus() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 40, rows: 24 });
+    editor.update(AppEvent::TextPaste("foo".to_owned()));
+    editor.update(Command::OpenSearch.into());
+    assert!(editor.search_view().unwrap().focused);
+
+    // Focus the document; the pane stays open but must stop claiming the caret.
+    editor.focus = Focus::Editor(Side::Left);
+    assert!(!editor.search_view().unwrap().focused);
+}
+
+#[test]
 fn no_result_is_marked_current_until_one_is_opened() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 40, rows: 24 });

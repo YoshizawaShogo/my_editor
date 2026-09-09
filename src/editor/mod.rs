@@ -960,6 +960,8 @@ impl Editor {
             exclude: search.exclude_input.clone(),
             filters: search.filters.clone(),
             items,
+            // The pane takes focus as an overlay; a picker on top steals it.
+            focused: self.focus == Focus::Overlay && self.picker.is_none(),
             current: search.current,
             total: search.hits.len(),
             field_cursor: search.field_cursor,
@@ -4133,7 +4135,12 @@ impl Editor {
             search.current = Some(index);
         }
         self.record_jump_origin();
-        self.focus = Focus::Editor(Side::Left);
+        // Keep focus in the find pane (it holds focus as an overlay): the pane
+        // stays open, its caret stays drawn, and typing has to keep going to the
+        // query. Moving focus to the buffer here left the caret sitting in the
+        // find field while keystrokes landed in the document. The jump still
+        // lands — `active_editor_mut` resolves Overlay to the left pane.
+        self.focus = Focus::Overlay;
         let effects = match hit {
             SearchHit::Buffer { doc, range } => {
                 let mut view = View::new(doc);
@@ -6035,6 +6042,9 @@ pub struct SearchView {
     pub exclude: String,
     pub filters: SearchFilters,
     pub items: Vec<SearchResultItem>,
+    /// Whether the pane holds input focus. The caret is only drawn when it does,
+    /// so it never sits in the query box while keystrokes go to the buffer.
+    pub focused: bool,
     pub current: Option<usize>,
     pub total: usize,
     pub field_cursor: usize,
