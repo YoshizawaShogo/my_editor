@@ -67,7 +67,7 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
     if editor.search_pane_visible() {
         let (left, divider, right) = split_panes(areas[0]);
         if let Some(buffer) = editor.active_buffer() {
-            draw_buffer(frame, left, &buffer, false);
+            draw_buffer(frame, left, &buffer, editor.document_focused());
             draw_status(frame, areas[1], editor, &buffer);
         } else if let Some(buffer) = editor.active_large_buffer() {
             draw_large_buffer(frame, left, &buffer);
@@ -2595,6 +2595,44 @@ mod tests {
         assert_eq!(buffer[(before, row)].fg, FG);
         let separator = column_of(separator_glyph);
         assert_eq!(buffer[(separator, row)].fg, MUTED);
+    }
+
+    #[test]
+    fn the_caret_follows_focus_between_the_document_and_the_find_pane() {
+        let backend = TestBackend::new(40, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 40, rows: 14 });
+        editor.update(crate::editor::AppEvent::TextPaste("foo".to_owned()));
+        editor.update(crate::editor::Command::OpenSearch.into());
+        for character in "foo".chars() {
+            editor.update(crate::editor::AppEvent::TextInput(character));
+        }
+
+        // The pane has focus: the caret sits in its query box, right of centre.
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+        let in_pane = ratatui::backend::Backend::get_cursor_position(terminal.backend_mut())
+            .expect("no caret");
+        let (pane_x, _, _, _) = editor.search_pane_rect();
+        assert!(in_pane.x >= pane_x, "caret was not in the find pane");
+
+        // Click the document; the caret has to move there, not vanish.
+        editor.update(crate::editor::AppEvent::Mouse(crate::editor::MouseInput {
+            event: crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 2,
+                row: 0,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+        let in_document = ratatui::backend::Backend::get_cursor_position(terminal.backend_mut())
+            .expect("no caret");
+        assert!(
+            in_document.x < pane_x,
+            "caret stayed out of the document: {in_document:?}"
+        );
     }
 
     #[test]

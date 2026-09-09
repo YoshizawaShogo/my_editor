@@ -722,7 +722,28 @@ impl Editor {
         if let Some(RightPane::Search(_)) = std::mem::replace(&mut self.layout.right, right) {
             self.finish_progress("grep");
         }
+        // Focus must not outlive the pane it pointed at. `Overlay` belongs to the
+        // find pane and `Side::Right` to whatever sits on the right, so either
+        // one is stranded once that pane is replaced or removed — and a stranded
+        // focus swallows every keystroke, since no overlay claims it and no
+        // editor pane has it. Every right-pane change funnels through here, so
+        // this is the one place the rule has to hold.
+        let stranded = match &self.layout.right {
+            None => !matches!(self.focus, Focus::Editor(Side::Left) | Focus::Shell),
+            Some(RightPane::Search(_)) => false,
+            Some(_) => self.focus == Focus::Overlay,
+        };
+        if stranded {
+            self.focus = Focus::Editor(Side::Left);
+        }
         self.dirty = true;
+    }
+
+    /// Collapse to a single pane, for tests that need to exercise what happens
+    /// to focus when the right pane goes away underneath it.
+    #[cfg(test)]
+    pub(crate) fn test_show_only(&mut self, doc: DocumentId) {
+        self.show_only(View::new(doc));
     }
 
     /// Show `view` in the left pane on its own, closing the right pane.
@@ -1024,6 +1045,13 @@ impl Editor {
 
     pub fn shell_focused(&self) -> bool {
         self.focus == Focus::Shell
+    }
+
+    /// Whether the caret belongs in the document rather than in an overlay's own
+    /// input. The find pane can hold focus while staying on screen, so a visible
+    /// pane no longer implies the document has given up the caret.
+    pub fn document_focused(&self) -> bool {
+        matches!(self.focus, Focus::Editor(_) | Focus::Completion(_))
     }
 
     /// Whether anything occupies the right half, whatever kind of pane it is.
@@ -4311,6 +4339,12 @@ impl Editor {
         {
             return None;
         }
+        // Any click inside the pane hands it focus. The document can hold focus
+        // while the pane stays open, so clicking back into it has to take the
+        // caret back — otherwise the field looks active but keystrokes keep
+        // going to the buffer. This is the counterpart to `apply_mouse` giving
+        // focus to the document when a click lands outside the pane.
+        self.focus = Focus::Overlay;
         let search = self.search()?;
         let directory = search.scope == SearchScope::Directory;
         let replace_enabled = search.replacement.is_some();

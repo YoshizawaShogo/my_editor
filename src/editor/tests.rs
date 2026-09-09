@@ -1256,6 +1256,71 @@ fn typing_after_opening_a_result_still_edits_the_query() {
     );
 }
 
+/// Click at a terminal cell.
+fn click_at(editor: &mut Editor, column: u16, row: u16) {
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+}
+
+#[test]
+fn focus_moves_both_ways_between_the_document_and_the_find_pane() {
+    let mut editor = find_pane_with("hello", "hello");
+    let (pane_x, pane_y, _, _) = editor.search_pane_rect();
+    let layout = crate::editor::search_pane_layout(false, false);
+    let field_row = pane_y + layout.find_top + 1;
+
+    // Pane → document.
+    click_at(&mut editor, 1, 0);
+    assert!(!editor.search_view().unwrap().focused);
+    editor.update(AppEvent::TextInput('a'));
+    assert_eq!(editor.search_view().unwrap().query, "hello");
+
+    // Document → pane. This is the leg that was missing: the field looked
+    // active but keystrokes kept going to the buffer.
+    click_at(&mut editor, pane_x + 1, field_row);
+    assert!(editor.search_view().unwrap().focused);
+    let document = editor.active_buffer().unwrap().text.to_string();
+    editor.update(AppEvent::TextInput('b'));
+    // The click landed on the field's first column, so the caret is there.
+    assert_eq!(editor.search_view().unwrap().query, "bhello");
+    assert_eq!(editor.active_buffer().unwrap().text.to_string(), document);
+
+    // And back again, so the round trip is repeatable.
+    click_at(&mut editor, 1, 0);
+    assert!(!editor.search_view().unwrap().focused);
+}
+
+#[test]
+fn closing_the_right_pane_never_strands_focus_on_it() {
+    // A focus of Overlay or Side::Right outlives its pane if nothing resets it,
+    // and a stranded focus swallows every keystroke.
+    let mut editor = find_pane_with("hello", "hello");
+    assert!(editor.search_view().unwrap().focused);
+
+    // Something that shows one pane on its own while the find pane holds focus.
+    let doc = editor.active_buffer().unwrap().view.doc;
+    editor.test_show_only(doc);
+
+    assert!(editor.search_view().is_none(), "the pane should be gone");
+    editor.update(AppEvent::TextInput('z'));
+    assert!(
+        editor
+            .active_buffer()
+            .unwrap()
+            .text
+            .to_string()
+            .contains('z'),
+        "the keystroke went nowhere"
+    );
+}
+
 #[test]
 fn clicking_the_document_with_the_find_pane_open_returns_focus_to_it() {
     let mut editor = find_pane_with("hello world", "hello");
