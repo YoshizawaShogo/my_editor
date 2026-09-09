@@ -1370,6 +1370,10 @@ impl Editor {
                         serde_json::from_value::<lsp_types::CompletionResponse>(value)
                             .map_err(|error| error.to_string())
                     }) {
+                        let language = self
+                            .documents
+                            .get(&doc)
+                            .and_then(|document| document.language.clone());
                         let matcher = SkimMatcherV2::default();
                         let mut items: Vec<_> = match response {
                             lsp_types::CompletionResponse::Array(items) => items,
@@ -1390,13 +1394,7 @@ impl Editor {
                                 .insert_text
                                 .clone()
                                 .unwrap_or_else(|| item.label.clone());
-                            let callable = matches!(
-                                item.kind,
-                                Some(
-                                    lsp_types::CompletionItemKind::FUNCTION
-                                        | lsp_types::CompletionItemKind::METHOD
-                                )
-                            );
+                            let callable = kind_is_callable(item.kind, language.as_deref());
                             if callable && add_parentheses && !insert.contains('(') {
                                 insert.push_str("()");
                             }
@@ -1425,10 +1423,6 @@ impl Editor {
                         items.sort_by_key(|right| std::cmp::Reverse(right.0));
                         // Offer language snippets alongside the server's results,
                         // ranked to the top so `for`, `fn`, … are easy to reach.
-                        let language = self
-                            .documents
-                            .get(&doc)
-                            .and_then(|document| document.language.clone());
                         let mut merged = language
                             .as_deref()
                             .map(|language| snippet_candidates(language, &prefix))
@@ -5973,6 +5967,24 @@ enum PendingLsp {
         doc: DocumentId,
         version: i32,
     },
+}
+
+/// Whether picking a completion of this kind should insert `()` and put the
+/// caret between them.
+///
+/// Functions, methods and constructors are called by name in every language the
+/// editor targets. A class is only *called* by name where the class name is the
+/// constructor — true in Python (`enumerate(…)`, `range(…)`, `dict()`), but not
+/// in Rust, where a struct is built with `Foo::new()` or `Foo { … }` and `Foo()`
+/// would be wrong. Servers report Python builtins like `enumerate` as `CLASS`,
+/// so without the language check they would never get parentheses.
+fn kind_is_callable(kind: Option<lsp_types::CompletionItemKind>, language: Option<&str>) -> bool {
+    use lsp_types::CompletionItemKind as Kind;
+    match kind {
+        Some(Kind::FUNCTION | Kind::METHOD | Kind::CONSTRUCTOR) => true,
+        Some(Kind::CLASS) => language == Some("python"),
+        _ => false,
+    }
 }
 
 fn hover_text(contents: lsp_types::HoverContents) -> String {

@@ -3340,6 +3340,75 @@ fn function_completion_in_an_import_statement_does_not_add_parentheses() {
     );
 }
 
+/// Drive one completion round-trip and return the resulting buffer text.
+fn complete_once(language: &str, path: &str, typed: &str, item: serde_json::Value) -> String {
+    let mut editor = Editor::default();
+    let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
+    document.path = Some(PathBuf::from(path));
+    document.language = Some(language.to_owned());
+    editor.test_register_server(language, 1).ready = true;
+    editor.test_open_doc(DocumentId(0), 1);
+    editor.update(AppEvent::TextPaste(typed.to_owned()));
+
+    let request = editor
+        .request_completion(true)
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::LspRequest { id, .. } => Some(id),
+            _ => None,
+        })
+        .unwrap();
+    editor.update(AppEvent::Lsp(LspEvent::Response {
+        id: request,
+        result: Ok(serde_json::json!([item])),
+    }));
+    editor.update(Command::PickerConfirm.into());
+    editor.active_buffer().unwrap().text.to_string()
+}
+
+#[test]
+fn a_python_class_completion_is_called_and_gets_parentheses() {
+    // pylsp reports builtins like `enumerate` as CLASS (kind 7), not FUNCTION —
+    // in Python the class name *is* the call, so it still takes parentheses.
+    assert_eq!(
+        complete_once(
+            "python",
+            "main.py",
+            "enum",
+            serde_json::json!({"label": "enumerate", "insertText": "enumerate", "kind": 7}),
+        ),
+        "enumerate()"
+    );
+}
+
+#[test]
+fn a_rust_struct_completion_is_not_called_and_keeps_no_parentheses() {
+    // A Rust type is not constructed by calling its name (`Vec::new()`), so the
+    // same CLASS kind must not gain parentheses here.
+    assert_eq!(
+        complete_once(
+            "rust",
+            "main.rs",
+            "Ve",
+            serde_json::json!({"label": "Vec", "insertText": "Vec", "kind": 7}),
+        ),
+        "Vec"
+    );
+}
+
+#[test]
+fn a_constructor_completion_gets_parentheses() {
+    assert_eq!(
+        complete_once(
+            "python",
+            "main.py",
+            "Poi",
+            serde_json::json!({"label": "Point", "insertText": "Point", "kind": 4}),
+        ),
+        "Point()"
+    );
+}
+
 #[test]
 fn malformed_automatic_completion_response_does_not_replace_the_status() {
     let mut editor = Editor::default();
