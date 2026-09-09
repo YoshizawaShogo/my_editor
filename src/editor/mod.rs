@@ -282,6 +282,11 @@ impl Editor {
                                 return effects;
                             }
                         }
+                        MouseEventKind::Drag(MouseButton::Left)
+                            if self.drag_search_selection(mouse.event.column, mouse.event.row) =>
+                        {
+                            return Vec::new();
+                        }
                         MouseEventKind::ScrollDown if over_pane => {
                             self.scroll_search_results(3);
                             return Vec::new();
@@ -2866,7 +2871,15 @@ impl Editor {
             Command::SearchCursorLeft => self.move_search_cursor(false),
             Command::SearchCursorRight => self.move_search_cursor(true),
             Command::SearchSelectAll => self.select_all_search_field(),
-            Command::SearchCopy => return self.copy_search_selection(false),
+            Command::SearchSelectLeft => self.extend_search_selection(false),
+            Command::SearchSelectRight => self.extend_search_selection(true),
+            Command::SearchCopy => {
+                if self.search().is_some() {
+                    return self.copy_search_selection(false);
+                }
+                // The picker, go-to-line and rename overlays keep Ctrl+C as cancel.
+                self.close_picker();
+            }
             Command::SearchCut => return self.copy_search_selection(true),
             Command::SearchPaste => return self.paste_search_field(),
             Command::SearchUndo => return self.undo_search_field(false),
@@ -3703,6 +3716,12 @@ impl Editor {
                 let right_half = mouse.column > divider;
                 if self.layout.right_editor().is_some() {
                     self.focus = Focus::Editor(if right_half { Side::Right } else { Side::Left });
+                } else if self.search().is_some() {
+                    // The find pane holds focus as an overlay. Clicking the
+                    // document has to hand focus back, or keystrokes keep going
+                    // to the query box. (A click inside the pane never reaches
+                    // here — `search_pane_click` consumes it.)
+                    self.focus = Focus::Editor(Side::Left);
                 } else if self.layout.is_shell() {
                     if right_half {
                         self.focus = Focus::Shell;
@@ -4344,7 +4363,7 @@ impl Editor {
             return Some(Vec::new());
         }
         if in_box(relative, layout.find_top) {
-            self.focus_search_field(None, false);
+            self.focus_search_field(None, false, Some(self.search_field_index_at(column)));
             return Some(Vec::new());
         }
         if relative == layout.replace_checkbox_row {
@@ -4359,19 +4378,27 @@ impl Editor {
         if let Some(top) = layout.replace_top
             && in_box(relative, top)
         {
-            self.focus_search_field(None, true);
+            self.focus_search_field(None, true, Some(self.search_field_index_at(column)));
             return Some(Vec::new());
         }
         if let Some(top) = layout.include_top
             && in_box(relative, top)
         {
-            self.focus_search_field(Some(SearchFilterField::Include), false);
+            self.focus_search_field(
+                Some(SearchFilterField::Include),
+                false,
+                Some(self.search_field_index_at(column)),
+            );
             return Some(Vec::new());
         }
         if let Some(top) = layout.exclude_top
             && in_box(relative, top)
         {
-            self.focus_search_field(Some(SearchFilterField::Exclude), false);
+            self.focus_search_field(
+                Some(SearchFilterField::Exclude),
+                false,
+                Some(self.search_field_index_at(column)),
+            );
             return Some(Vec::new());
         }
         if relative > layout.results_top {
@@ -4382,13 +4409,90 @@ impl Editor {
         Some(Vec::new())
     }
 
-    fn focus_search_field(&mut self, filter: Option<SearchFilterField>, replace: bool) {
+    /// Focus one of the pane's fields. `cursor` is the caret's character index —
+    /// where a click landed — or None to sit at the end. The caret doubles as the
+    /// anchor so a drag from here extends a selection; equal anchor and caret
+    /// read as no selection, so a plain click just moves the caret.
+    fn focus_search_field(
+        &mut self,
+        filter: Option<SearchFilterField>,
+        replace: bool,
+        cursor: Option<usize>,
+    ) {
         if let Some(search) = self.search_mut() {
+            let replace = replace && search.replacement.is_some();
+            // The undo history holds snapshots of one field's text; carrying it
+            // across a switch would restore it into the wrong field.
+            if (search.editing_filter, search.editing_replace) != (filter, replace) {
+                search.field_undo.clear();
+                search.field_redo.clear();
+            }
             search.editing_filter = filter;
-            search.editing_replace = replace && search.replacement.is_some();
-            search.field_cursor = search_field_len(search);
+            search.editing_replace = replace;
+            let at = cursor.unwrap_or(usize::MAX).min(search_field_len(search));
+            search.field_cursor = at;
+            search.field_anchor = Some(at);
             self.dirty = true;
         }
+    }
+
+    /// Character index in the active field for a click at `column`, measured from
+    /// the field box's inner edge.
+    fn search_field_index_at(&self, column: u16) -> usize {
+        let (pane_x, _, _, _) = self.search_pane_rect();
+        usize::from(column.saturating_sub(pane_x + 1))
+    }
+
+    /// Shift+Left / Shift+Right: move the caret, keeping (or starting) a
+    /// selection anchored where it was.
+    fn extend_search_selection(&mut self, right: bool) {
+        if let Some(search) = self.search_mut() {
+            let len = search_field_len(search);
+            let anchor = search.field_anchor.unwrap_or(search.field_cursor);
+            search.field_anchor = Some(anchor);
+            search.field_cursor = if right {
+                (search.field_cursor + 1).min(len)
+            } else {
+                search.field_cursor.saturating_sub(1)
+            };
+            self.dirty = true;
+        }
+    }
+
+    /// Dragging inside the active field sweeps a selection out from the press
+    /// point. Returns false when the drag is not over that field, so a drag
+    /// across the results does not move the caret.
+    fn drag_search_selection(&mut self, column: u16, row: u16) -> bool {
+        let (pane_x, pane_y, pane_width, _) = self.search_pane_rect();
+        if column < pane_x || column >= pane_x + pane_width || row < pane_y {
+            return false;
+        }
+        let Some(search) = self.search() else {
+            return false;
+        };
+        let layout = search_pane_layout(
+            search.scope == SearchScope::Directory,
+            search.replacement.is_some(),
+        );
+        // The box the caret currently lives in.
+        let top = match (search.editing_filter, search.editing_replace) {
+            (Some(SearchFilterField::Include), _) => layout.include_top,
+            (Some(SearchFilterField::Exclude), _) => layout.exclude_top,
+            (None, true) => layout.replace_top,
+            (None, false) => Some(layout.find_top),
+        };
+        let relative = row - pane_y;
+        // A 3-row box; the value sits on its middle row.
+        if top.is_none_or(|top| relative != top + 1) {
+            return false;
+        }
+        let at = self.search_field_index_at(column);
+        if let Some(search) = self.search_mut() {
+            let len = search_field_len(search);
+            search.field_cursor = at.min(len);
+            self.dirty = true;
+        }
+        true
     }
 
     fn cycle_search_scope(&mut self) -> Vec<Effect> {

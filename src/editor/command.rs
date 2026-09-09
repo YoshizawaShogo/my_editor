@@ -32,6 +32,9 @@ pub enum Command {
     /// Editing the find pane's active field: the same Ctrl bindings the buffer
     /// uses, so the query box behaves like a text field rather than a prompt.
     SearchSelectAll,
+    /// Shift+Left / Shift+Right: extend the field's selection.
+    SearchSelectLeft,
+    SearchSelectRight,
     SearchCopy,
     SearchCut,
     SearchPaste,

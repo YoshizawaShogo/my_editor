@@ -1058,6 +1058,74 @@ fn the_find_field_selects_all_and_typing_replaces_the_selection() {
 }
 
 #[test]
+fn shift_arrows_extend_the_find_field_selection() {
+    let mut editor = find_pane_with("foo", "foo");
+
+    // The caret sits at the end; select the last two characters leftwards.
+    editor.update(Command::SearchSelectLeft.into());
+    editor.update(Command::SearchSelectLeft.into());
+    assert_eq!(editor.search_view().unwrap().field_selection, Some(1..3));
+
+    // Shrinking the selection back works too.
+    editor.update(Command::SearchSelectRight.into());
+    assert_eq!(editor.search_view().unwrap().field_selection, Some(2..3));
+
+    // A plain arrow drops the selection rather than extending it.
+    editor.update(Command::SearchCursorLeft.into());
+    assert_eq!(editor.search_view().unwrap().field_selection, None);
+
+    // The selection is what Cut takes: the caret is at 1, so this selects and
+    // removes the leading "f".
+    editor.update(Command::SearchSelectLeft.into());
+    assert_eq!(editor.search_view().unwrap().field_selection, Some(0..1));
+    editor.update(Command::SearchCut.into());
+    assert_eq!(editor.search_view().unwrap().query, "oo");
+}
+
+#[test]
+fn dragging_in_the_find_field_selects_and_dragging_over_results_does_not() {
+    let mut editor = find_pane_with("foo", "foo");
+    let (pane_x, pane_y, _, _) = editor.search_pane_rect();
+    let layout = crate::editor::search_pane_layout(false, false);
+    // The value sits on the middle row of the 3-row Find box.
+    let field_row = pane_y + layout.find_top + 1;
+    let press = |column: u16, row: u16, kind: MouseEventKind| {
+        AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        })
+    };
+
+    // Press at the start of the field, drag two characters right.
+    editor.update(press(
+        pane_x + 1,
+        field_row,
+        MouseEventKind::Down(MouseButton::Left),
+    ));
+    assert_eq!(editor.search_view().unwrap().field_selection, None);
+    editor.update(press(
+        pane_x + 3,
+        field_row,
+        MouseEventKind::Drag(MouseButton::Left),
+    ));
+    assert_eq!(editor.search_view().unwrap().field_selection, Some(0..2));
+
+    // A drag over the result list must not drag the caret with it.
+    let before = editor.search_view().unwrap().field_selection;
+    editor.update(press(
+        pane_x + 5,
+        pane_y + layout.results_top + 1,
+        MouseEventKind::Drag(MouseButton::Left),
+    ));
+    assert_eq!(editor.search_view().unwrap().field_selection, before);
+}
+
+#[test]
 fn the_find_field_cuts_copies_and_pastes_through_the_shared_register() {
     let mut editor = find_pane_with("foo", "foo");
 
@@ -1121,6 +1189,37 @@ fn typing_after_opening_a_result_still_edits_the_query() {
         editor.active_buffer().unwrap().text.to_string(),
         before,
         "the keystroke leaked into the buffer"
+    );
+}
+
+#[test]
+fn clicking_the_document_with_the_find_pane_open_returns_focus_to_it() {
+    let mut editor = find_pane_with("hello world", "hello");
+    assert!(editor.search_view().unwrap().focused);
+
+    // Click in the document (left half of an 40-column terminal).
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+
+    // Focus leaves the pane, so typing edits the document rather than the query.
+    assert!(!editor.search_view().unwrap().focused);
+    editor.update(AppEvent::TextInput('x'));
+    assert_eq!(editor.search_view().unwrap().query, "hello");
+    assert!(
+        editor
+            .active_buffer()
+            .unwrap()
+            .text
+            .to_string()
+            .contains('x'),
+        "the keystroke never reached the document"
     );
 }
 

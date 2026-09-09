@@ -104,10 +104,9 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
     if ctrl && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5')) {
         return Some(Command::ToggleSplit.into());
     }
-    if matches!(focus, Focus::Overlay | Focus::Completion(_))
-        && ctrl
-        && key.code == KeyCode::Char('c')
-    {
+    // Overlay is deliberately absent: the find pane maps Ctrl+C to a copy, and
+    // its handler falls back to cancelling for the other overlays.
+    if matches!(focus, Focus::Completion(_)) && ctrl && key.code == KeyCode::Char('c') {
         return Some(Command::Cancel.into());
     }
     if matches!(focus, Focus::Shell) {
@@ -132,6 +131,12 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
             KeyCode::Up => Some(Command::PickerUp.into()),
             KeyCode::Down => Some(Command::PickerDown.into()),
             KeyCode::Backspace => Some(Command::PickerBackspace.into()),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Some(Command::SearchSelectLeft.into())
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Some(Command::SearchSelectRight.into())
+            }
             KeyCode::Left => Some(Command::SearchCursorLeft.into()),
             KeyCode::Right => Some(Command::SearchCursorRight.into()),
             KeyCode::Tab => Some(Command::SearchToggleField.into()),
@@ -408,11 +413,17 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_cancels_an_overlay_and_uses_shell_copy_dispatch() {
+    fn ctrl_c_copies_in_an_overlay_and_uses_shell_copy_dispatch() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let mut pending = KeyChordState::default();
+        // In an overlay Ctrl+C is a copy for the find pane; the handler falls
+        // back to cancelling for the overlays that have nothing to copy.
         assert_eq!(
             translate(raw_key(key), &Focus::Overlay, &mut pending),
+            Some(AppEvent::Command(Command::SearchCopy))
+        );
+        assert_eq!(
+            translate(raw_key(key), &Focus::Completion(Side::Left), &mut pending),
             Some(AppEvent::Command(Command::Cancel))
         );
         assert_eq!(
