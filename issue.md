@@ -4,26 +4,19 @@ Refactoring / hardening notes that need a human call. Each item says what was
 found, the options, and a recommendation. Nothing here has been acted on beyond
 what the linked commit states.
 
-## 1. Wire `cargo deny` into an automated gate?
+## 1. Wire `cargo deny` into an automated gate? — RESOLVED (option a, guarded)
 
-**Status:** `deny.toml` is now thorough (graph / advisories / bans / licenses /
-sources) and `cargo deny check` passes clean (exit 0, no warnings). But it is
-**not run automatically** — the git hooks only run `cargo fmt`, `cargo clippy`,
-and `cargo test`. So a newly introduced vulnerable/unmaintained crate, a
-disallowed license, or a non-crates.io source would not be caught until someone
-runs `cargo deny` by hand.
+**Resolution:** `.githooks/pre-push` now runs `cargo deny check` after
+`cargo test`, but only when `cargo-deny` is on PATH — a push from a machine
+without the tool prints a skip notice instead of failing. This enforces the
+supply-chain gate where the tool exists (addressing the "requires cargo-deny
+installed" con) without blocking other environments.
 
-**Options:**
-- (a) Add `cargo deny check` to `.githooks/pre-push` (alongside `cargo test`).
-  Pro: enforced before publishing. Con: requires `cargo-deny` installed on the
-  machine (like cargo itself); slows push; needs network for the advisory DB
-  unless `--offline`/cached.
-- (b) Leave it manual / to a future CI. Pro: no local friction. Con: not enforced.
+## 2. License allow-list is trimmed to what is currently used — NO ACTION (intended)
 
-**Recommendation:** (a) in pre-push, but only once you are comfortable
-`cargo-deny` is reliably installed in your environments. Low urgency.
+This is a deliberate review gate, not a bug. Left as-is: a new non-listed
+license should fail `cargo deny check` so it gets reviewed before landing.
 
-## 2. License allow-list is trimmed to what is currently used
 
 `deny.toml` allows only the licenses present in the tree today (MIT, Apache-2.0,
 Apache-2.0 WITH LLVM-exception, Unicode-3.0, Zlib, BSL-1.0). This is stricter than
@@ -118,7 +111,12 @@ state the way shellcheck silently no-ops rather than showing a half-alive LSP;
 did not start. Revisit after installing pylsp to separate "tool missing" from
 real bugs.
 
-## 5. Refactor roadmap for editor/mod.rs (module placement)
+## 5. Refactor roadmap for editor/mod.rs (module placement) — DEFERRED
+
+Deliberately left for later: this is a large, central control-flow change
+(decomposing god dispatch methods) that the note itself says needs an explicit
+OK before starting. Not attempted in the bug-fixing pass. The plan below stands
+for when you want to take it on.
 
 Done so far (safe, behavior-preserving, each verified + committed):
 - Tests → `editor/tests.rs`.
