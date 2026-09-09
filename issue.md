@@ -63,7 +63,33 @@ flag, don't touch the status line). Confirm save then creates it and the state
 settles. Needs a test: open missing path → no error status; save → file created,
 status clean.
 
-## 4. BUG: Python LSP appears not to work; an empty popup box shows
+## 4. BUG: Python LSP appears not to work; an empty popup box shows — RESOLVED
+
+**Root cause (found):** pylsp is healthy and speaks LSP fine, but it advertises
+**no `semanticTokensProvider`** (verified: its initialize reply has
+completion/hover/signature/definition, but no semantic tokens). The editor
+requested `textDocument/semanticTokens/full` unconditionally and gated the
+status on `semantic_ready_version()` becoming `Some`, so for pylsp it sat
+forever on `<lsp> python: coloring` — looking dead even though completion,
+hover, diagnostics and go-to-definition all work. Separately, a hover reply with
+empty contents produced `self.hover = Some("")`, drawing a blank popup box.
+
+**Fix (done):**
+- `open_lsp_document` / `request_semantic_tokens_inner` only request semantic
+  tokens when the server's initialize reply carried a semantic-tokens legend.
+- `document_language_status` only waits on semantic tokens when the server
+  provides them; otherwise it proceeds to hover/ready. A legend-less server
+  (pylsp) now reaches `<lsp> python: ready`.
+- The hover handler drops blank parts, so empty hover contents no longer open a
+  popup.
+- Tests: `a_server_without_semantic_tokens_opens_without_requesting_them_and_reaches_ready`
+  and `an_empty_hover_response_does_not_open_a_blank_popup`; the rust lifecycle
+  tests now emulate a legend-carrying server.
+
+Not verified here (headless): the actual completion/diagnostics UX in a live
+`.py` session. The status/semantic/popup bugs that made it *look* broken are
+fixed; re-test interactively to confirm completion and diagnostics feel right.
+The original report is kept below for context.
 
 **Symptom:** Editing a `.py` file, the Python language features don't work
 (no useful completion/diagnostics), the status line reads `<lsp> python:

@@ -1210,6 +1210,36 @@ fn selecting_a_range_dismisses_hover_without_requesting_another() {
 }
 
 #[test]
+fn an_empty_hover_response_does_not_open_a_blank_popup() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::TextPaste("value".to_owned()));
+    let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
+    document.path = Some(PathBuf::from("/tmp/hover.rs"));
+    document.language = Some("rust".to_owned());
+    editor.test_register_server("rust", 1).ready = true;
+    editor.test_open_doc(DocumentId(0), 1);
+    editor.pending_lsp.insert(
+        42,
+        PendingLsp::Hover {
+            doc: DocumentId(0),
+            line: 0,
+        },
+    );
+
+    editor.update(AppEvent::Lsp(LspEvent::Response {
+        id: 42,
+        result: Ok(serde_json::json!({
+            "contents": {"kind": "markdown", "value": ""}
+        })),
+    }));
+
+    assert!(
+        editor.hover_view().is_none(),
+        "blank hover contents should not open a popup"
+    );
+}
+
+#[test]
 fn edits_preserve_shifted_semantic_colors_and_ignore_old_responses() {
     let mut editor = Editor::default();
     let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
@@ -2682,7 +2712,10 @@ fn file_opened_after_lsp_initialization_gets_did_open_and_semantic_tokens() {
         server: 1,
         incremental_sync: true,
         hover_provider: true,
-        semantic_tokens_legend: None,
+        semantic_tokens_legend: Some(crate::lsp::SemanticTokensLegend {
+            token_types: vec!["function".to_owned()],
+            token_modifiers: Vec::new(),
+        }),
         signature_help_triggers: Vec::new(),
     }));
 
@@ -2702,6 +2735,62 @@ fn file_opened_after_lsp_initialization_gets_did_open_and_semantic_tokens() {
         Effect::LspRequest { server: 1, method, params, .. }
             if method == "textDocument/semanticTokens/full" && params.contains("second.rs")
     )));
+}
+
+#[test]
+fn a_server_without_semantic_tokens_opens_without_requesting_them_and_reaches_ready() {
+    // pylsp advertises no semanticTokensProvider. The editor must not request
+    // tokens it will never get, nor sit forever on the "coloring" status.
+    let mut editor = Editor::default();
+    editor.open_paths([PathBuf::from("/tmp/script.py")]);
+    editor.update(AppEvent::Io(IoEvent::FileLoaded {
+        id: DocumentId(1),
+        result: Ok("x = 1\n".to_owned()),
+    }));
+    editor.update(AppEvent::Lsp(LspEvent::Spawned {
+        server: 1,
+        language: "python".to_owned(),
+    }));
+    let effects = editor.update(AppEvent::Lsp(LspEvent::Initialized {
+        server: 1,
+        incremental_sync: true,
+        hover_provider: true,
+        semantic_tokens_legend: None,
+        signature_help_triggers: Vec::new(),
+    }));
+
+    // didOpen is still sent, but no semantic-tokens request.
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::LspSend { server: 1, message } if message.contains("textDocument/didOpen")
+    )));
+    assert!(!effects.iter().any(|effect| matches!(
+        effect,
+        Effect::LspRequest { method, .. } if method == "textDocument/semanticTokens/full"
+    )));
+
+    // The status must not be stuck on "coloring"; once hover answers it is ready.
+    assert_ne!(
+        editor.active_buffer().unwrap().language_status,
+        "<lsp> python: coloring"
+    );
+    let hover_probe = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::LspRequest { id, method, .. } if method == "textDocument/hover" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    editor.update(AppEvent::Lsp(LspEvent::Response {
+        id: hover_probe,
+        result: Ok(serde_json::json!({
+            "contents": {"kind": "markdown", "value": "int"}
+        })),
+    }));
+    assert_eq!(
+        editor.active_buffer().unwrap().language_status,
+        "<lsp> python: ready"
+    );
 }
 
 #[test]
@@ -2852,7 +2941,10 @@ fn status_reports_language_and_lsp_lifecycle() {
         server: 1,
         incremental_sync: true,
         hover_provider: true,
-        semantic_tokens_legend: None,
+        semantic_tokens_legend: Some(crate::lsp::SemanticTokensLegend {
+            token_types: vec!["function".to_owned()],
+            token_modifiers: Vec::new(),
+        }),
         signature_help_triggers: Vec::new(),
     }));
     assert_eq!(

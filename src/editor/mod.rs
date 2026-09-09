@@ -1499,8 +1499,12 @@ impl Editor {
                         {
                             lsp.mark_hover_ready();
                         }
+                        // Drop blank hover text: a server may answer with empty
+                        // contents for a position it knows nothing about, and a
+                        // lone "" would otherwise render as an empty popup box.
                         let mut parts = hover
                             .map(|hover| hover_text(hover.contents))
+                            .filter(|text| !text.trim().is_empty())
                             .into_iter()
                             .collect::<Vec<_>>();
                         if let Some(message) = self
@@ -2228,9 +2232,16 @@ impl Editor {
     #[cfg(test)]
     fn test_register_server(&mut self, language: &str, id: u64) -> &mut LspServer {
         self.lsp_servers.insert(language.to_owned(), id);
-        self.servers
-            .entry(id)
-            .or_insert_with(|| LspServer::new(language.to_owned()))
+        self.servers.entry(id).or_insert_with(|| {
+            let mut server = LspServer::new(language.to_owned());
+            // Default to a semantic-tokens-capable server (like rust-analyzer);
+            // tests exercising a server without them (like pylsp) clear this.
+            server.semantic_legend = Some(crate::lsp::SemanticTokensLegend {
+                token_types: vec!["function".to_owned()],
+                token_modifiers: Vec::new(),
+            });
+            server
+        })
     }
 
     /// Stand a document up as already opened at `version`, for tests that skip
@@ -2279,28 +2290,35 @@ impl Editor {
         if let Some(lsp) = self.doc_lsp_mut(doc) {
             lsp.mark_opened();
         }
-        let request = self.next_lsp_request;
-        self.next_lsp_request += 1;
-        self.pending_lsp
-            .insert(request, PendingLsp::SemanticTokens { doc, version: 1 });
-        let mut effects = vec![
-            Effect::LspSend {
-                server,
-                message: serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/didOpen",
-                    "params": {
-                        "textDocument": {
-                            "uri": format!("file://{}", path.display()),
-                            "languageId": language,
-                            "version": 1,
-                            "text": text
-                        }
+        let mut effects = vec![Effect::LspSend {
+            server,
+            message: serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": format!("file://{}", path.display()),
+                        "languageId": language,
+                        "version": 1,
+                        "text": text
                     }
-                })
-                .to_string(),
-            },
-            Effect::LspRequest {
+                }
+            })
+            .to_string(),
+        }];
+        // Only ask for semantic tokens if the server advertised them. pylsp, for
+        // one, has no semanticTokensProvider, so requesting would draw an error
+        // and the status would sit forever on "coloring" waiting for tokens that
+        // never come.
+        if self
+            .server(server)
+            .is_some_and(|server| server.semantic_legend.is_some())
+        {
+            let request = self.next_lsp_request;
+            self.next_lsp_request += 1;
+            self.pending_lsp
+                .insert(request, PendingLsp::SemanticTokens { doc, version: 1 });
+            effects.push(Effect::LspRequest {
                 server,
                 id: request,
                 method: "textDocument/semanticTokens/full".to_owned(),
@@ -2308,8 +2326,8 @@ impl Editor {
                     "textDocument": {"uri": format!("file://{}", path.display())}
                 })
                 .to_string(),
-            },
-        ];
+            });
+        }
         effects.extend(self.request_hover_probe(doc));
         effects
     }
@@ -2415,6 +2433,14 @@ impl Editor {
             return Vec::new();
         };
         if !self.server_ready(server) || !self.doc_is_opened(doc) {
+            return Vec::new();
+        }
+        // A server without a semantic-tokens legend (e.g. pylsp) never provides
+        // them; don't send a request it will only reject.
+        if self
+            .server(server)
+            .is_none_or(|server| server.semantic_legend.is_none())
+        {
             return Vec::new();
         }
         let request = self.next_lsp_request;
@@ -4892,12 +4918,16 @@ impl Editor {
         if !lsp.is_opened() {
             return format!("<lsp> {language}: opening");
         }
-        match lsp.semantic_ready_version() {
-            None => return format!("<lsp> {language}: coloring"),
-            Some(version) if version < lsp.version() => {
-                return format!("<lsp> {language}: updating");
+        // Only wait on semantic tokens if the server actually provides them;
+        // otherwise the status would sit on "coloring" forever (e.g. pylsp).
+        if server.semantic_legend.is_some() {
+            match lsp.semantic_ready_version() {
+                None => return format!("<lsp> {language}: coloring"),
+                Some(version) if version < lsp.version() => {
+                    return format!("<lsp> {language}: updating");
+                }
+                Some(_) => {}
             }
-            Some(_) => {}
         }
         if !lsp.is_hover_ready() {
             return format!("<lsp> {language}: checking hover");
