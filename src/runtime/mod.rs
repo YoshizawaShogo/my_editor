@@ -83,21 +83,29 @@ impl Runtime {
         for effect in std::mem::take(&mut self.startup_effects) {
             self.execute(effect).await?;
         }
-        let mut disk_check = tokio::time::interval_at(
-            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
-            std::time::Duration::from_secs(2),
-        );
+        let mut disk_poll = DiskPollPolicy::new();
+        let disk_check = tokio::time::sleep(disk_poll.period());
+        tokio::pin!(disk_check);
 
         while !self.editor.should_quit() {
             tokio::select! {
                 Some(raw) = self.raw_rx.recv() => {
+                    if disk_poll.note_activity() {
+                        disk_check
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + disk_poll.period());
+                    }
                     self.enqueue_raw_input(raw);
                 }
                 Some(event) = self.rx.recv() => {
                     self.process_events(event).await?;
                 }
-                _ = disk_check.tick() => {
+                _ = &mut disk_check => {
                     let _ = self.tx.send(AppEvent::Tick);
+                    let period = disk_poll.after_tick(self.editor.has_notifications());
+                    disk_check
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + period);
                 }
                 else => break,
             }
@@ -1185,6 +1193,49 @@ fn apply_file_edits(path: &Path, edits_json: &str) -> std::result::Result<(), St
     atomic_write(path, contents.as_bytes())
 }
 
+/// Cadence of the external-change poll over open files. Every 2s while the user
+/// is active; with no input the period doubles up to a minute, so an untouched
+/// editor stops waking the process (each tick costs ~3 wakeups, which was the
+/// whole idle CPU cost). Any input snaps it back, and a visible toast keeps the
+/// fast cadence so it expires on time.
+struct DiskPollPolicy {
+    period: std::time::Duration,
+}
+
+impl DiskPollPolicy {
+    const ACTIVE: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+    fn new() -> Self {
+        Self {
+            period: Self::ACTIVE,
+        }
+    }
+
+    fn period(&self) -> std::time::Duration {
+        self.period
+    }
+
+    /// Input arrived. Returns true when the poll had backed off, so the caller
+    /// re-arms the timer to fire at the active cadence instead of waiting out a
+    /// long idle period.
+    fn note_activity(&mut self) -> bool {
+        let backed_off = self.period > Self::ACTIVE;
+        self.period = Self::ACTIVE;
+        backed_off
+    }
+
+    /// A poll just fired; returns how long to wait for the next one.
+    fn after_tick(&mut self, toast_visible: bool) -> std::time::Duration {
+        self.period = if toast_visible {
+            Self::ACTIVE
+        } else {
+            (self.period * 2).min(Self::MAX)
+        };
+        self.period
+    }
+}
+
 /// Observe a file's on-disk state. A missing file is not an error: opening a
 /// path in order to create it is a normal workflow, so `NotFound` maps to
 /// `Ok(None)` ("no file on disk yet") rather than a status-line error.
@@ -1822,6 +1873,31 @@ mod tests {
             Path::new("/workspace"),
         );
         assert_eq!(configuration.result, Some(serde_json::json!([null, null])));
+    }
+
+    #[test]
+    fn disk_poll_backs_off_while_idle_and_snaps_back_on_input() {
+        use std::time::Duration;
+        let mut policy = DiskPollPolicy::new();
+        assert_eq!(policy.period(), Duration::from_secs(2));
+
+        // Idle: 2 → 4 → 8 → 16 → 32 → 60, capped.
+        let periods: Vec<u64> = (0..6).map(|_| policy.after_tick(false).as_secs()).collect();
+        assert_eq!(periods, vec![4, 8, 16, 32, 60, 60]);
+
+        // Any input restores the active cadence and reports the backoff so the
+        // timer gets re-armed promptly.
+        assert!(policy.note_activity());
+        assert_eq!(policy.period(), Duration::from_secs(2));
+        assert!(!policy.note_activity(), "already active: nothing to re-arm");
+    }
+
+    #[test]
+    fn disk_poll_stays_fast_while_a_toast_is_visible() {
+        let mut policy = DiskPollPolicy::new();
+        policy.after_tick(false);
+        policy.after_tick(false);
+        assert_eq!(policy.after_tick(true).as_secs(), 2);
     }
 
     #[test]

@@ -496,6 +496,12 @@ impl Editor {
         std::mem::take(&mut self.dirty)
     }
 
+    /// Whether a toast is on screen. The runtime keeps its poll timer at the
+    /// fast cadence while one is visible so it expires on time.
+    pub fn has_notifications(&self) -> bool {
+        !self.notifications.is_empty()
+    }
+
     pub fn active_buffer(&self) -> Option<ActiveBuffer<'_>> {
         let focus = if self.focus == Focus::Shell {
             Focus::Editor(Side::Left)
