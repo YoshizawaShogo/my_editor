@@ -837,9 +837,12 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
         let lines = search
             .items
             .iter()
+            .enumerate()
             .skip(search.results_scroll)
             .take(usize::from(inner.height))
-            .map(search_result_line)
+            .map(|(index, item)| {
+                search_result_line(item, search.current == Some(index), inner.width)
+            })
             .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().bg(POPUP_BG)),
@@ -868,8 +871,17 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
 
 /// One result row: the `path:line ┆ ` column dimmed, the line text in the normal
 /// foreground, and the matched span picked out so the hit is findable at a glance.
-fn search_result_line(item: &crate::editor::SearchResultItem) -> Line<'static> {
+fn search_result_line(
+    item: &crate::editor::SearchResultItem,
+    current: bool,
+    width: u16,
+) -> Line<'static> {
     let matched = item.matched.clone().unwrap_or(0..0);
+    // The row the editor is parked on carries the selection background across its
+    // full width, so a click has a visible anchor in the list as well as in the
+    // buffer. The location column brightens with it to stay legible.
+    let background = if current { SELECTION_STRONG } else { POPUP_BG };
+    let prefix_fg = if current { FG } else { MUTED };
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut run = String::new();
     let mut run_style = None;
@@ -880,9 +892,9 @@ fn search_result_line(item: &crate::editor::SearchResultItem) -> Line<'static> {
                 .bg(SEARCH_MATCH_BG)
                 .add_modifier(Modifier::BOLD)
         } else if index < item.prefix_len {
-            Style::default().fg(MUTED)
+            Style::default().fg(prefix_fg).bg(background)
         } else {
-            Style::default().fg(FG)
+            Style::default().fg(FG).bg(background)
         };
         if run_style != Some(style) {
             if let Some(previous) = run_style {
@@ -894,6 +906,16 @@ fn search_result_line(item: &crate::editor::SearchResultItem) -> Line<'static> {
     }
     if let Some(style) = run_style {
         spans.push(Span::styled(run, style));
+    }
+    // Carry the highlight to the pane edge rather than stopping at the text.
+    if current {
+        let used = item.text.chars().count() as u16;
+        if used < width {
+            spans.push(Span::styled(
+                " ".repeat(usize::from(width - used)),
+                Style::default().bg(background),
+            ));
+        }
     }
     Line::from(spans)
 }
@@ -2528,6 +2550,46 @@ mod tests {
         assert_eq!(buffer[(before, row)].fg, FG);
         let separator = column_of(separator_glyph);
         assert_eq!(buffer[(separator, row)].fg, MUTED);
+    }
+
+    #[test]
+    fn the_opened_result_row_carries_the_selection_background() {
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 40, rows: 12 });
+        editor.update(crate::editor::AppEvent::TextPaste("bar foo".to_owned()));
+        editor.update(crate::editor::Command::OpenSearch.into());
+        for character in "foo".chars() {
+            editor.update(crate::editor::AppEvent::TextInput(character));
+        }
+        editor.open_search_hit(0);
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let separator_glyph = crate::editor::SEARCH_COLUMN_SEPARATOR.trim();
+        let row = (0..12)
+            .find(|row| {
+                (0..40)
+                    .map(|column| buffer[(column, *row)].symbol())
+                    .collect::<String>()
+                    .contains(separator_glyph)
+            })
+            .expect("result row missing");
+        let line: String = (0..40)
+            .map(|column| buffer[(column, row)].symbol())
+            .collect();
+        let byte = line.find("bar").expect("line text missing");
+        let text_column = line[..byte].chars().count() as u16;
+
+        // The clicked row is filled to the pane edge, so it reads as focused.
+        assert_eq!(buffer[(text_column, row)].bg, SELECTION_STRONG);
+        let last = (0..40)
+            .rev()
+            .find(|column| buffer[(*column, row)].bg == SELECTION_STRONG)
+            .expect("row highlight missing");
+        assert!(last > text_column, "highlight stops at the text: {line:?}");
     }
 
     #[test]

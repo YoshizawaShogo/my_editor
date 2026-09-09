@@ -1011,6 +1011,25 @@ fn a_buffer_result_row_marks_the_match_and_dims_the_location_column() {
 }
 
 #[test]
+fn no_result_is_marked_current_until_one_is_opened() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 40, rows: 24 });
+    editor.update(AppEvent::TextPaste("foo foo".to_owned()));
+    editor.update(Command::OpenSearch.into());
+    for character in "foo".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+
+    // Typing a query must not claim the first row is focused.
+    assert_eq!(editor.search_view().unwrap().current, None);
+
+    editor.open_search_hit(1);
+
+    // Opening one marks it, so the pane shows which hit the editor sits on.
+    assert_eq!(editor.search_view().unwrap().current, Some(1));
+}
+
+#[test]
 fn result_separators_line_up_across_line_numbers_of_different_widths() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 40, rows: 24 });

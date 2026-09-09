@@ -4090,7 +4090,7 @@ impl Editor {
                 include_hidden: self.config.search.include_hidden,
             },
             hits: Vec::new(),
-            current: 0,
+            current: None,
             grep_token: None,
             field_cursor: 0,
             results_scroll: 0,
@@ -4117,7 +4117,7 @@ impl Editor {
 
     /// Jump to the file for the given result index, leaving the pane open. The
     /// match lands selected, so a click has a visible result at the destination.
-    fn open_search_hit(&mut self, index: usize) -> Vec<Effect> {
+    pub(crate) fn open_search_hit(&mut self, index: usize) -> Vec<Effect> {
         let Some((hit, options, query)) = self.search().and_then(|search| {
             Some((
                 search.hits.get(index).cloned()?,
@@ -4127,6 +4127,11 @@ impl Editor {
         }) else {
             return Vec::new();
         };
+        // Mark the row as the current hit so the pane shows which result the
+        // editor is parked on.
+        if let Some(search) = self.search_mut() {
+            search.current = Some(index);
+        }
         self.record_jump_origin();
         self.focus = Focus::Editor(Side::Left);
         let effects = match hit {
@@ -4393,7 +4398,7 @@ impl Editor {
         if query.is_empty() {
             if let Some(search) = self.search_mut() {
                 search.hits.clear();
-                search.current = 0;
+                search.current = None;
             }
             self.dirty = true;
             return Vec::new();
@@ -4463,7 +4468,9 @@ impl Editor {
         }
         if let Some(search) = self.search_mut() {
             search.hits = hits;
-            search.current = search.current.min(search.hits.len().saturating_sub(1));
+            search.current = search
+                .current
+                .filter(|current| *current < search.hits.len());
         }
         self.dirty = true;
         Vec::new()
@@ -5787,7 +5794,9 @@ struct SearchState {
     exclude_input: String,
     filters: SearchFilters,
     hits: Vec<SearchHit>,
-    current: usize,
+    /// Index of the hit the editor is parked on, once one has been opened. None
+    /// until then, so the list does not claim a row is focused before it is.
+    current: Option<usize>,
     grep_token: Option<u64>,
     field_cursor: usize,
     results_scroll: usize,
@@ -6026,7 +6035,7 @@ pub struct SearchView {
     pub exclude: String,
     pub filters: SearchFilters,
     pub items: Vec<SearchResultItem>,
-    pub current: usize,
+    pub current: Option<usize>,
     pub total: usize,
     pub field_cursor: usize,
     pub results_scroll: usize,
