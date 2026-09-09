@@ -4,6 +4,8 @@ use tree_sitter::{
     InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
 };
 
+mod csh;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HighlightSpan {
     pub start_byte: usize,
@@ -29,7 +31,11 @@ impl std::fmt::Debug for IncrementalHighlighter {
 
 impl IncrementalHighlighter {
     pub fn new(language_name: &str, source: &str) -> Option<Self> {
-        grammar(language_name)?;
+        // csh has no tree-sitter grammar; it is highlighted by a regex pass that
+        // recomputes on every reparse, so there is no tree to maintain.
+        if language_name != "csh" {
+            grammar(language_name)?;
+        }
         let mut highlighter = Self {
             language_name: language_name.to_owned(),
             tree: None,
@@ -57,6 +63,10 @@ impl IncrementalHighlighter {
     }
 
     pub fn reparse(&mut self, source: &str, incremental: bool) {
+        if self.language_name == "csh" {
+            self.spans = csh::highlight(source);
+            return;
+        }
         let Some((language, query_source)) = grammar(&self.language_name) else {
             return;
         };
@@ -76,6 +86,9 @@ impl IncrementalHighlighter {
 }
 
 pub fn highlight(language_name: &str, source: &str) -> Vec<HighlightSpan> {
+    if language_name == "csh" {
+        return csh::highlight(source);
+    }
     let Some((language, query_source)) = grammar(language_name) else {
         return Vec::new();
     };
@@ -131,14 +144,14 @@ fn cached_query(
     static MARKDOWN: OnceLock<Option<Query>> = OnceLock::new();
     static RUST: OnceLock<Option<Query>> = OnceLock::new();
     static BASH: OnceLock<Option<Query>> = OnceLock::new();
-    static CSH: OnceLock<Option<Query>> = OnceLock::new();
+    static TCL: OnceLock<Option<Query>> = OnceLock::new();
     let slot = match language_name {
         "json" => &JSON,
         "toml" => &TOML,
         "markdown" => &MARKDOWN,
         "rust" => &RUST,
         "bash" => &BASH,
-        "csh" => &CSH,
+        "tcl" => &TCL,
         _ => return None,
     };
     slot.get_or_init(|| Query::new(language, query_source).ok())
@@ -183,11 +196,13 @@ fn grammar(name: &str) -> Option<(Language, &'static str)> {
             tree_sitter_rust::LANGUAGE.into(),
             tree_sitter_rust::HIGHLIGHTS_QUERY,
         )),
-        // The bash grammar also drives csh: a close enough fit that comments,
-        // strings and keywords colour sensibly even where the dialects diverge.
-        "bash" | "csh" => Some((
+        "bash" => Some((
             tree_sitter_bash::LANGUAGE.into(),
             tree_sitter_bash::HIGHLIGHT_QUERY,
+        )),
+        "tcl" => Some((
+            tree_sitter_tcl::LANGUAGE.into(),
+            include_str!("tcl_highlights.scm"),
         )),
         _ => None,
     }
@@ -212,6 +227,86 @@ mod tests {
         assert!(spans.iter().any(|span| span.kind.contains("comment")));
         assert!(spans.iter().any(|span| span.kind.contains("string")));
         assert!(spans.iter().any(|span| span.kind.contains("keyword")));
+    }
+
+    #[test]
+    fn tcl_comments_strings_numbers_keywords_and_procs_are_highlighted() {
+        // The number lives inside an `expr`: Tcl only parses digits as a number
+        // node there, not as a bare command argument.
+        let source = "# greet\nproc greet {name} {\n    set count [expr {3 + 1}]\n    puts \"hi $name\"\n}\n";
+        let spans = highlight("tcl", source);
+        let kinds = |needle: &str| spans.iter().any(|span| span.kind.contains(needle));
+
+        assert!(kinds("comment"), "no comment span: {spans:?}");
+        assert!(kinds("string"), "no string span: {spans:?}");
+        assert!(kinds("number"), "no number span: {spans:?}");
+        assert!(kinds("keyword"), "no keyword span: {spans:?}");
+        assert!(kinds("function"), "no function span: {spans:?}");
+        // The proc's name is coloured as a function.
+        let greet = source.match_indices("greet").nth(1).unwrap().0;
+        assert!(
+            spans.iter().any(|span| span.kind.contains("function")
+                && span.start_byte <= greet
+                && greet < span.end_byte),
+            "proc name not highlighted as function: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn csh_keywords_comments_strings_and_numbers_are_highlighted() {
+        let source = "#!/bin/csh\nset name = \"world\"\nif ( $name == \"world\" ) then\n    echo \"hi $name\"\nendif\nforeach item ( a b c )\n    echo $item 42\nend\n";
+        let spans = highlight("csh", source);
+
+        let keywords: Vec<_> = spans
+            .iter()
+            .filter(|span| span.kind.contains("keyword"))
+            .map(|span| &source[span.start_byte..span.end_byte])
+            .collect();
+
+        assert!(spans.iter().any(|span| span.kind.contains("comment")));
+        assert!(spans.iter().any(|span| span.kind.contains("string")));
+        assert!(spans.iter().any(|span| span.kind.contains("number")));
+        // The csh control-flow words the bash grammar used to miss now colour.
+        for expected in ["set", "if", "then", "endif", "foreach", "end"] {
+            assert!(
+                keywords.contains(&expected),
+                "expected csh keyword {expected:?} highlighted, got {keywords:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn csh_keywords_inside_comments_and_strings_are_not_highlighted() {
+        let source = "# set foreach\necho \"set if endif\"\n";
+        let spans = highlight("csh", source);
+
+        assert!(
+            !spans.iter().any(|span| span.kind.contains("keyword")),
+            "keyword coloured inside comment/string: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn csh_incremental_highlighter_recomputes_on_reparse() {
+        let text = Rope::from_str("set x = 1\n");
+        let mut highlighter = IncrementalHighlighter::new("csh", &text.to_string()).unwrap();
+        assert!(
+            highlighter
+                .spans()
+                .iter()
+                .any(|s| s.kind.contains("keyword"))
+        );
+
+        let updated = "set x = 1\nforeach i ( a )\nend\n";
+        highlighter.reparse(updated, true);
+        let keywords: Vec<_> = highlighter
+            .spans()
+            .iter()
+            .filter(|s| s.kind.contains("keyword"))
+            .map(|s| &updated[s.start_byte..s.end_byte])
+            .collect();
+        assert!(keywords.contains(&"foreach"), "got {keywords:?}");
+        assert!(keywords.contains(&"end"), "got {keywords:?}");
     }
 
     #[test]

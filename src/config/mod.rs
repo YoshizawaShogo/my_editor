@@ -30,11 +30,12 @@ impl Default for Config {
                 },
                 LanguageConfig::new("bash", &["sh", "bash"], Some("#")),
                 // csh is its own language (its control flow differs from bash, so
-                // snippets and shellcheck must treat it separately), but reuses the
-                // bash tree-sitter grammar for highlighting (see highlight::grammar).
+                // snippets and shellcheck must treat it separately) and is syntax
+                // highlighted by a regex pass rather than tree-sitter (see
+                // highlight::csh).
                 LanguageConfig::new("csh", &["csh"], Some("#")),
-                // Recognised for comment toggling and ctags go-to-definition; no
-                // tree-sitter grammar is wired, so highlighting stays plain.
+                // Highlighted via the bca-tree-sitter-tcl grammar with a vendored
+                // query (see highlight::grammar / tcl_highlights.scm).
                 LanguageConfig::new("tcl", &["tcl"], Some("#")),
                 LanguageConfig {
                     name: "make".to_owned(),
