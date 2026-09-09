@@ -763,6 +763,7 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
         "Find",
         &search.query,
         active_query,
+        search.field_selection.as_ref(),
     );
 
     // Replace checkbox toggles the replacement field; the run button sits to its
@@ -793,6 +794,7 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
             "Replace",
             search.replacement.as_deref().unwrap_or(""),
             active_replace,
+            search.field_selection.as_ref(),
         );
     }
 
@@ -804,6 +806,7 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
             "include (-name)",
             &search.include,
             active_include,
+            search.field_selection.as_ref(),
         );
     }
     if let Some(top) = layout.exclude_top {
@@ -814,6 +817,7 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
             "exclude (-name)",
             &search.exclude,
             active_exclude,
+            search.field_selection.as_ref(),
         );
     }
 
@@ -931,6 +935,7 @@ fn draw_search_field(
     title: &str,
     value: &str,
     active: bool,
+    selection: Option<&std::ops::Range<usize>>,
 ) {
     let y = pane.y + top;
     if y >= pane.bottom() {
@@ -947,8 +952,36 @@ fn draw_search_field(
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // Selected text is filled, so Ctrl+A (and what Ctrl+C/Ctrl+X will take) is
+    // visible rather than implied.
+    let line = match selection {
+        Some(range) if active && !range.is_empty() => {
+            let styled = |text: String, selected: bool| {
+                Span::styled(
+                    text,
+                    Style::default()
+                        .fg(FG)
+                        .bg(if selected { SELECTION_STRONG } else { POPUP_BG }),
+                )
+            };
+            let take = |from: usize, to: usize| -> String {
+                value
+                    .chars()
+                    .skip(from)
+                    .take(to.saturating_sub(from))
+                    .collect()
+            };
+            let end = value.chars().count();
+            Line::from(vec![
+                styled(take(0, range.start), false),
+                styled(take(range.start, range.end), true),
+                styled(take(range.end, end), false),
+            ])
+        }
+        _ => Line::styled(value.to_owned(), Style::default().fg(FG).bg(POPUP_BG)),
+    };
     frame.render_widget(
-        Paragraph::new(value.to_owned()).style(Style::default().fg(FG).bg(POPUP_BG)),
+        Paragraph::new(line).style(Style::default().bg(POPUP_BG)),
         inner,
     );
 }

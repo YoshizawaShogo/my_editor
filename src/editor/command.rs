@@ -29,6 +29,14 @@ pub enum Command {
     CycleSearchScope,
     SearchCursorLeft,
     SearchCursorRight,
+    /// Editing the find pane's active field: the same Ctrl bindings the buffer
+    /// uses, so the query box behaves like a text field rather than a prompt.
+    SearchSelectAll,
+    SearchCopy,
+    SearchCut,
+    SearchPaste,
+    SearchUndo,
+    SearchRedo,
     SearchToggleField,
     SearchToggleCase,
     SearchToggleWholeWord,

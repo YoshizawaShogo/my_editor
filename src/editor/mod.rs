@@ -737,7 +737,7 @@ impl Editor {
         };
         self.finish_progress("grep");
         self.dirty = true;
-        Some(search)
+        Some(*search)
     }
 
     /// Columns available to the focused file pane. Only a second file pane can
@@ -965,6 +965,7 @@ impl Editor {
             current: search.current,
             total: search.hits.len(),
             field_cursor: search.field_cursor,
+            field_selection: self.search_selection(),
             results_scroll: search.results_scroll,
         })
     }
@@ -2864,6 +2865,12 @@ impl Editor {
             Command::CycleSearchScope => return self.cycle_search_scope(),
             Command::SearchCursorLeft => self.move_search_cursor(false),
             Command::SearchCursorRight => self.move_search_cursor(true),
+            Command::SearchSelectAll => self.select_all_search_field(),
+            Command::SearchCopy => return self.copy_search_selection(false),
+            Command::SearchCut => return self.copy_search_selection(true),
+            Command::SearchPaste => return self.paste_search_field(),
+            Command::SearchUndo => return self.undo_search_field(false),
+            Command::SearchRedo => return self.undo_search_field(true),
             Command::PickerUp => self.move_picker(-1),
             Command::PickerDown => self.move_picker(1),
             Command::PickerBackspace => {
@@ -4095,9 +4102,12 @@ impl Editor {
             current: None,
             grep_token: None,
             field_cursor: 0,
+            field_anchor: None,
+            field_undo: Vec::new(),
+            field_redo: Vec::new(),
             results_scroll: 0,
         };
-        self.set_right_pane(Some(RightPane::Search(search)));
+        self.set_right_pane(Some(RightPane::Search(Box::new(search))));
         self.focus = Focus::Overlay;
         Vec::new()
     }
@@ -4526,23 +4536,86 @@ impl Editor {
         }
     }
 
-    fn insert_search_char(&mut self, character: char) {
-        let cursor = self.search().map_or(0, |search| search.field_cursor);
-        let Some(field) = self.active_search_field_mut() else {
-            return;
-        };
-        let byte = char_byte_index(field, cursor);
-        field.insert(byte, character);
-        if let Some(search) = self.search_mut() {
-            search.field_cursor = cursor + 1;
+    fn active_search_field(&self) -> Option<&str> {
+        let search = self.search()?;
+        match search.editing_filter {
+            Some(SearchFilterField::Include) => Some(search.include_input.as_str()),
+            Some(SearchFilterField::Exclude) => Some(search.exclude_input.as_str()),
+            None if search.editing_replace => search.replacement.as_deref(),
+            None => Some(search.query.as_str()),
         }
     }
 
+    /// The active field's selection as an ordered char range, if one is active.
+    fn search_selection(&self) -> Option<std::ops::Range<usize>> {
+        let search = self.search()?;
+        let anchor = search.field_anchor?;
+        let cursor = search.field_cursor;
+        (anchor != cursor).then(|| anchor.min(cursor)..anchor.max(cursor))
+    }
+
+    fn search_selected_text(&self) -> Option<String> {
+        let range = self.search_selection()?;
+        let field = self.active_search_field()?;
+        Some(
+            field
+                .chars()
+                .skip(range.start)
+                .take(range.len())
+                .collect::<String>(),
+        )
+    }
+
+    /// Snapshot the active field before mutating it, so Ctrl+Z can come back.
+    /// Any edit invalidates the redo stack, as in the buffer's own history.
+    fn push_search_undo(&mut self) {
+        let Some(text) = self.active_search_field().map(str::to_owned) else {
+            return;
+        };
+        let Some(search) = self.search_mut() else {
+            return;
+        };
+        let cursor = search.field_cursor;
+        search.field_undo.push(FieldSnapshot { text, cursor });
+        search.field_redo.clear();
+    }
+
+    /// Replace the selection (or insert at the caret when there is none) and
+    /// leave the caret after the inserted text. Used by typing, paste and cut.
+    fn replace_search_selection(&mut self, with: &str) {
+        let selection = self.search_selection();
+        let cursor = self.search().map_or(0, |search| search.field_cursor);
+        let range = selection.unwrap_or(cursor..cursor);
+        let Some(field) = self.active_search_field_mut() else {
+            return;
+        };
+        let start = char_byte_index(field, range.start);
+        let end = char_byte_index(field, range.end);
+        field.replace_range(start..end, with);
+        if let Some(search) = self.search_mut() {
+            search.field_cursor = range.start + with.chars().count();
+            search.field_anchor = None;
+        }
+    }
+
+    fn insert_search_char(&mut self, character: char) {
+        self.push_search_undo();
+        let mut buffer = [0u8; 4];
+        self.replace_search_selection(character.encode_utf8(&mut buffer));
+    }
+
     fn backspace_search_char(&mut self) {
+        // With a selection, Backspace deletes it rather than one character.
+        if self.search_selection().is_some() {
+            self.push_search_undo();
+            self.replace_search_selection("");
+            return;
+        }
         let cursor = self.search().map_or(0, |search| search.field_cursor);
         if cursor == 0 {
             return;
         }
+        self.push_search_undo();
         if let Some(field) = self.active_search_field_mut() {
             let end = char_byte_index(field, cursor);
             let start = char_byte_index(field, cursor - 1);
@@ -4550,6 +4623,7 @@ impl Editor {
         }
         if let Some(search) = self.search_mut() {
             search.field_cursor = cursor - 1;
+            search.field_anchor = None;
         }
     }
 
@@ -4561,6 +4635,127 @@ impl Editor {
             } else {
                 search.field_cursor.saturating_sub(1)
             };
+            // Moving the caret drops the selection, as in the buffer.
+            search.field_anchor = None;
+            self.dirty = true;
+        }
+    }
+
+    fn select_all_search_field(&mut self) {
+        if let Some(search) = self.search_mut() {
+            let len = search_field_len(search);
+            search.field_anchor = Some(0);
+            search.field_cursor = len;
+            self.dirty = true;
+        }
+    }
+
+    /// Ctrl+C / Ctrl+X in the find pane. Copies the selection into the same
+    /// register the buffer uses, so it can be pasted either side.
+    fn copy_search_selection(&mut self, cut: bool) -> Vec<Effect> {
+        let Some(text) = self.search_selected_text() else {
+            return Vec::new();
+        };
+        self.clipboard.store(vec![text]);
+        if cut {
+            self.push_search_undo();
+            self.replace_search_selection("");
+            self.dirty = true;
+            return self.refresh_search();
+        }
+        self.dirty = true;
+        Vec::new()
+    }
+
+    fn paste_search_field(&mut self) -> Vec<Effect> {
+        let fragments = self.clipboard.fragments().to_vec();
+        if fragments.is_empty() {
+            return Vec::new();
+        }
+        // The fields are single-line; a multi-line register joins with spaces
+        // rather than pasting newlines that the field cannot show.
+        let text = fragments.join(" ").replace(['\n', '\r'], " ");
+        self.push_search_undo();
+        self.replace_search_selection(&text);
+        self.dirty = true;
+        self.refresh_search()
+    }
+
+    fn undo_search_field(&mut self, redo: bool) -> Vec<Effect> {
+        let Some(current) = self.active_search_field().map(str::to_owned) else {
+            return Vec::new();
+        };
+        let Some(search) = self.search_mut() else {
+            return Vec::new();
+        };
+        let cursor = search.field_cursor;
+        let stack = if redo {
+            &mut search.field_redo
+        } else {
+            &mut search.field_undo
+        };
+        let Some(snapshot) = stack.pop() else {
+            return Vec::new();
+        };
+        let restored = snapshot.clone();
+        let opposite = FieldSnapshot {
+            text: current,
+            cursor,
+        };
+        if redo {
+            search.field_undo.push(opposite);
+        } else {
+            search.field_redo.push(opposite);
+        }
+        search.field_cursor = restored.cursor;
+        search.field_anchor = None;
+        if let Some(field) = self.active_search_field_mut() {
+            *field = restored.text;
+        }
+        self.dirty = true;
+        self.refresh_search()
+    }
+
+    /// Walk the result list with the arrow keys, opening each hit as it is
+    /// reached so Up/Down previews matches the way clicking a row does.
+    fn step_search_result(&mut self, amount: isize) {
+        let Some(search) = self.search() else { return };
+        let count = search.hits.len();
+        if count == 0 {
+            return;
+        }
+        let next = match search.current {
+            // Nothing opened yet: the first step lands on an end of the list.
+            None if amount < 0 => count - 1,
+            None => 0,
+            Some(current) if amount < 0 => current.saturating_sub(amount.unsigned_abs()),
+            Some(current) => (current + amount as usize).min(count - 1),
+        };
+        self.open_search_hit(next);
+        self.scroll_result_into_view(next);
+    }
+
+    /// Keep the current row inside the visible slice of the result list.
+    fn scroll_result_into_view(&mut self, index: usize) {
+        let (_, _, _, pane_height) = self.search_pane_rect();
+        let Some(search) = self.search() else { return };
+        let layout = search_pane_layout(
+            search.scope == SearchScope::Directory,
+            search.replacement.is_some(),
+        );
+        // The list starts below its own border and ends at the pane's bottom.
+        let visible = usize::from(
+            pane_height
+                .saturating_sub(layout.results_top)
+                .saturating_sub(1),
+        )
+        .max(1);
+        if let Some(search) = self.search_mut() {
+            if index < search.results_scroll {
+                search.results_scroll = index;
+            } else if index >= search.results_scroll + visible {
+                search.results_scroll = index + 1 - visible;
+            }
             self.dirty = true;
         }
     }
@@ -4714,7 +4909,7 @@ impl Editor {
             return;
         }
         if self.search().is_some() {
-            // Results are browsed with the mouse wheel, not the keyboard.
+            self.step_search_result(amount);
             return;
         }
         let Some(picker) = &mut self.picker else {
@@ -5806,7 +6001,22 @@ struct SearchState {
     current: Option<usize>,
     grep_token: Option<u64>,
     field_cursor: usize,
+    /// Where a selection started, when one is active. The selection runs between
+    /// this and `field_cursor`, in characters.
+    field_anchor: Option<usize>,
+    /// Undo/redo for the field being edited. Snapshots rather than a diff: the
+    /// fields are one line long, so whole-value history costs nothing and keeps
+    /// undo correct across a paste, a cut and a select-all overwrite alike.
+    field_undo: Vec<FieldSnapshot>,
+    field_redo: Vec<FieldSnapshot>,
     results_scroll: usize,
+}
+
+/// A find-pane field and caret, captured before an edit so it can be restored.
+#[derive(Clone, Debug)]
+struct FieldSnapshot {
+    text: String,
+    cursor: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6048,6 +6258,8 @@ pub struct SearchView {
     pub current: Option<usize>,
     pub total: usize,
     pub field_cursor: usize,
+    /// Selected range in the active field, in characters, when one is active.
+    pub field_selection: Option<std::ops::Range<usize>>,
     pub results_scroll: usize,
 }
 

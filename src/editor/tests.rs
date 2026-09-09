@@ -1010,6 +1010,96 @@ fn a_buffer_result_row_marks_the_match_and_dims_the_location_column() {
     assert_eq!(item.prefix_len, 1 + SEARCH_COLUMN_SEPARATOR.chars().count());
 }
 
+/// Open the find pane on a buffer and type `query` into it.
+fn find_pane_with(text: &str, query: &str) -> Editor {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 40, rows: 24 });
+    editor.update(AppEvent::TextPaste(text.to_owned()));
+    editor.update(Command::OpenSearch.into());
+    for character in query.chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+    editor
+}
+
+#[test]
+fn the_find_field_undoes_and_redoes_edits() {
+    let mut editor = find_pane_with("foo", "foo");
+
+    editor.update(Command::SearchUndo.into());
+    assert_eq!(editor.search_view().unwrap().query, "fo");
+    editor.update(Command::SearchUndo.into());
+    assert_eq!(editor.search_view().unwrap().query, "f");
+
+    editor.update(Command::SearchRedo.into());
+    assert_eq!(editor.search_view().unwrap().query, "fo");
+    editor.update(Command::SearchRedo.into());
+    assert_eq!(editor.search_view().unwrap().query, "foo");
+
+    // Nothing left to redo: the command is a no-op rather than a panic.
+    editor.update(Command::SearchRedo.into());
+    assert_eq!(editor.search_view().unwrap().query, "foo");
+}
+
+#[test]
+fn the_find_field_selects_all_and_typing_replaces_the_selection() {
+    let mut editor = find_pane_with("foo", "foo");
+
+    editor.update(Command::SearchSelectAll.into());
+    assert_eq!(editor.search_view().unwrap().field_selection, Some(0..3));
+
+    editor.update(AppEvent::TextInput('x'));
+    assert_eq!(editor.search_view().unwrap().query, "x");
+    assert_eq!(editor.search_view().unwrap().field_selection, None);
+
+    // One undo restores the whole overwritten value, not one character.
+    editor.update(Command::SearchUndo.into());
+    assert_eq!(editor.search_view().unwrap().query, "foo");
+}
+
+#[test]
+fn the_find_field_cuts_copies_and_pastes_through_the_shared_register() {
+    let mut editor = find_pane_with("foo", "foo");
+
+    editor.update(Command::SearchSelectAll.into());
+    editor.update(Command::SearchCut.into());
+    assert_eq!(editor.search_view().unwrap().query, "");
+
+    editor.update(Command::SearchPaste.into());
+    assert_eq!(editor.search_view().unwrap().query, "foo");
+
+    // Copy leaves the field alone but refills the register.
+    editor.update(Command::SearchSelectAll.into());
+    editor.update(Command::SearchCopy.into());
+    assert_eq!(editor.search_view().unwrap().query, "foo");
+    editor.update(Command::SearchCursorRight.into());
+    editor.update(Command::SearchPaste.into());
+    assert_eq!(editor.search_view().unwrap().query, "foofoo");
+}
+
+#[test]
+fn arrow_keys_walk_the_result_list_and_open_each_hit() {
+    let mut editor = find_pane_with("foo foo foo", "foo");
+    assert_eq!(editor.search_view().unwrap().total, 3);
+    assert_eq!(editor.search_view().unwrap().current, None);
+
+    // The first Down lands on the top result rather than skipping one.
+    editor.update(Command::PickerDown.into());
+    assert_eq!(editor.search_view().unwrap().current, Some(0));
+    editor.update(Command::PickerDown.into());
+    assert_eq!(editor.search_view().unwrap().current, Some(1));
+    editor.update(Command::PickerUp.into());
+    assert_eq!(editor.search_view().unwrap().current, Some(0));
+
+    // Stepping past either end stays put instead of wrapping.
+    editor.update(Command::PickerUp.into());
+    assert_eq!(editor.search_view().unwrap().current, Some(0));
+
+    // Walking the list moves the buffer with it, as clicking does.
+    let selection = editor.active_buffer().unwrap().view.selections.primary();
+    assert!(!selection.is_caret());
+}
+
 #[test]
 fn typing_after_opening_a_result_still_edits_the_query() {
     let mut editor = Editor::default();

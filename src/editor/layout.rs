@@ -28,7 +28,10 @@ pub(super) enum RightPane {
     Editor(EditorPane),
     /// A second file, aligned against the left one line by line.
     Diff(DiffPane),
-    Search(SearchState),
+    /// Boxed: the find pane carries by far the most state of any variant
+    /// (four fields plus their edit history and the hit list), and inlining it
+    /// would bloat every `RightPane` to that size.
+    Search(Box<SearchState>),
     /// The shell. Carries no state of its own: the session outlives the pane,
     /// so it lives in [`super::Editor::shell`] and this only says it is on
     /// screen — the same way an [`EditorPane`] names a document that is kept in

@@ -135,6 +135,13 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
             KeyCode::Left => Some(Command::SearchCursorLeft.into()),
             KeyCode::Right => Some(Command::SearchCursorRight.into()),
             KeyCode::Tab => Some(Command::SearchToggleField.into()),
+            // Ctrl bindings mirror the buffer's, so the field edits the same way.
+            KeyCode::Char('a') if ctrl => Some(Command::SearchSelectAll.into()),
+            KeyCode::Char('c') if ctrl => Some(Command::SearchCopy.into()),
+            KeyCode::Char('x') if ctrl => Some(Command::SearchCut.into()),
+            KeyCode::Char('v') if ctrl => Some(Command::SearchPaste.into()),
+            KeyCode::Char('z') if ctrl => Some(Command::SearchUndo.into()),
+            KeyCode::Char('y') if ctrl => Some(Command::SearchRedo.into()),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Some(Command::SearchToggleCase.into())
             }
