@@ -4293,7 +4293,7 @@ impl Editor {
     }
 
     /// The right-half rectangle occupied by the search pane: `(x, y, width, height)`.
-    fn search_pane_rect(&self) -> (u16, u16, u16, u16) {
+    pub(crate) fn search_pane_rect(&self) -> (u16, u16, u16, u16) {
         let (cols, rows) = self.terminal_size;
         let content_height = rows.saturating_sub(1);
         let x = split_left_width(cols).saturating_add(1);
@@ -4346,9 +4346,7 @@ impl Editor {
         }
         if in_box(relative, layout.find_top) {
             self.focus_search_field(None, false, Some(self.search_field_index_at(column)));
-            // Results were frozen while the document had focus; putting the caret
-            // back in a field re-runs the search so they match the buffer again.
-            return Some(self.refresh_search());
+            return Some(Vec::new());
         }
         if relative == layout.replace_checkbox_row {
             // The run button lives to the right of a ticked checkbox on this row.
@@ -4363,7 +4361,7 @@ impl Editor {
             && in_box(relative, top)
         {
             self.focus_search_field(None, true, Some(self.search_field_index_at(column)));
-            return Some(self.refresh_search());
+            return Some(Vec::new());
         }
         if let Some(top) = layout.include_top
             && in_box(relative, top)
@@ -4373,7 +4371,7 @@ impl Editor {
                 false,
                 Some(self.search_field_index_at(column)),
             );
-            return Some(self.refresh_search());
+            return Some(Vec::new());
         }
         if let Some(top) = layout.exclude_top
             && in_box(relative, top)
@@ -4383,7 +4381,15 @@ impl Editor {
                 false,
                 Some(self.search_field_index_at(column)),
             );
-            return Some(self.refresh_search());
+            return Some(Vec::new());
+        }
+        if relative == layout.results_top {
+            // The header row carries the hit count and the reload button.
+            let (start, end) = search_reload_button_range(pane_x, pane_width);
+            if column >= start && column < end {
+                return Some(self.refresh_search());
+            }
+            return Some(Vec::new());
         }
         if relative > layout.results_top {
             let index = usize::from(relative - layout.results_top - 1)
@@ -6267,6 +6273,20 @@ pub(crate) struct SearchPaneLayout {
 pub(crate) fn search_run_button_range(inner_x: u16) -> (u16, u16) {
     let start = inner_x + SEARCH_REPLACE_CHECKBOX.chars().count() as u16 + 2;
     (start, start + SEARCH_RUN_BUTTON.chars().count() as u16)
+}
+
+/// Re-runs the search on demand. Results are a snapshot: they do not follow the
+/// buffer, and edits made outside the editor cannot be noticed at all, so the
+/// refresh is a button rather than something inferred from a document changing.
+pub(crate) const SEARCH_RELOAD_BUTTON: &str = "[ Reload ]";
+
+/// Sits flush with the right edge of the result list's header row. ASCII like
+/// the other buttons: a symbol such as `⟳` is double-width in some terminals,
+/// which would slide the drawn button out from under this hit range.
+pub(crate) fn search_reload_button_range(pane_x: u16, pane_width: u16) -> (u16, u16) {
+    let width = SEARCH_RELOAD_BUTTON.chars().count() as u16;
+    let start = pane_x + pane_width.saturating_sub(width);
+    (start, start + width)
 }
 
 pub(crate) fn search_pane_layout(directory: bool, replace_enabled: bool) -> SearchPaneLayout {

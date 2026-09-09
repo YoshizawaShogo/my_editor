@@ -835,7 +835,15 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
             .title(Span::styled(
                 format!(" {} 件 ", search.total),
                 Style::default().fg(MUTED),
-            ));
+            ))
+            // Results are a snapshot; this re-runs the search on demand.
+            .title(
+                Line::from(Span::styled(
+                    crate::editor::SEARCH_RELOAD_BUTTON,
+                    Style::default().fg(FG),
+                ))
+                .right_aligned(),
+            );
         let inner = block.inner(results_area);
         frame.render_widget(block, results_area);
         let lines = search
@@ -2587,6 +2595,30 @@ mod tests {
         assert_eq!(buffer[(before, row)].fg, FG);
         let separator = column_of(separator_glyph);
         assert_eq!(buffer[(separator, row)].fg, MUTED);
+    }
+
+    #[test]
+    fn the_reload_button_is_drawn_where_the_click_handler_looks_for_it() {
+        let backend = TestBackend::new(40, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 40, rows: 14 });
+        editor.update(crate::editor::AppEvent::TextPaste("foo".to_owned()));
+        editor.update(crate::editor::Command::OpenSearch.into());
+        for character in "foo".chars() {
+            editor.update(crate::editor::AppEvent::TextInput(character));
+        }
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let (pane_x, pane_y, pane_width, _) = editor.search_pane_rect();
+        let layout = crate::editor::search_pane_layout(false, false);
+        let (start, end) = crate::editor::search_reload_button_range(pane_x, pane_width);
+        let drawn: String = (start..end)
+            .map(|column| buffer[(column, pane_y + layout.results_top)].symbol())
+            .collect();
+        assert_eq!(drawn, crate::editor::SEARCH_RELOAD_BUTTON);
     }
 
     #[test]

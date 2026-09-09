@@ -1058,7 +1058,7 @@ fn the_find_field_selects_all_and_typing_replaces_the_selection() {
 }
 
 #[test]
-fn editing_the_document_leaves_the_results_frozen_until_the_field_is_clicked() {
+fn editing_the_document_leaves_the_results_frozen_until_reload_is_clicked() {
     let mut editor = find_pane_with("foo bar", "foo");
     let before = editor.search_view().unwrap().items[0].text.clone();
     let matched = editor.search_view().unwrap().items[0].matched.clone();
@@ -1089,15 +1089,28 @@ fn editing_the_document_leaves_the_results_frozen_until_the_field_is_clicked() {
         .collect();
     assert_eq!(highlighted, "foo");
 
-    // Putting the caret back in the Find field re-runs the search, so the rows
-    // catch up with the edited buffer.
-    let (pane_x, pane_y, _, _) = editor.search_pane_rect();
+    // Clicking a field only moves the caret — re-running the search there would
+    // re-walk a whole repository just because attention returned to the pane.
+    let (pane_x, pane_y, pane_width, _) = editor.search_pane_rect();
     let layout = crate::editor::search_pane_layout(false, false);
     editor.update(AppEvent::Mouse(MouseInput {
         event: MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: pane_x + 1,
             row: pane_y + layout.find_top + 1,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+    assert_eq!(editor.search_view().unwrap().items[0].text, before);
+
+    // The reload button on the results header is what refreshes them.
+    let (reload_start, _) = crate::editor::search_reload_button_range(pane_x, pane_width);
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: reload_start,
+            row: pane_y + layout.results_top,
             modifiers: KeyModifiers::NONE,
         },
         clicks: 1,
