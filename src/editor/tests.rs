@@ -1058,6 +1058,57 @@ fn the_find_field_selects_all_and_typing_replaces_the_selection() {
 }
 
 #[test]
+fn editing_the_document_leaves_the_results_frozen_until_the_field_is_clicked() {
+    let mut editor = find_pane_with("foo bar", "foo");
+    let before = editor.search_view().unwrap().items[0].text.clone();
+    let matched = editor.search_view().unwrap().items[0].matched.clone();
+
+    // Click into the document and type ahead of the match. The stored hit range
+    // is frozen, so re-reading the live line here would slide the highlight off.
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+    for character in "xyz".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+
+    let item = &editor.search_view().unwrap().items[0];
+    assert_eq!(item.text, before, "the preview followed the buffer");
+    assert_eq!(item.matched, matched, "the highlight drifted");
+    let highlighted: String = item
+        .text
+        .chars()
+        .skip(item.matched.clone().unwrap().start)
+        .take(item.matched.clone().unwrap().len())
+        .collect();
+    assert_eq!(highlighted, "foo");
+
+    // Putting the caret back in the Find field re-runs the search, so the rows
+    // catch up with the edited buffer.
+    let (pane_x, pane_y, _, _) = editor.search_pane_rect();
+    let layout = crate::editor::search_pane_layout(false, false);
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: pane_x + 1,
+            row: pane_y + layout.find_top + 1,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+    assert_eq!(
+        editor.search_view().unwrap().items[0].text,
+        format!("1{SEARCH_COLUMN_SEPARATOR}xyzfoo bar")
+    );
+}
+
+#[test]
 fn shift_arrows_extend_the_find_field_selection() {
     let mut editor = find_pane_with("foo", "foo");
 

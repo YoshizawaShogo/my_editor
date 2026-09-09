@@ -883,44 +883,26 @@ impl Editor {
             .iter()
             .take(500)
             .map(|hit| match hit {
-                SearchHit::Buffer { doc, range } => {
+                SearchHit::Buffer {
+                    doc,
+                    range,
+                    preview,
+                } => {
                     // Show the matched line's text instead of raw char offsets: a
                     // "foo.rs  120..125" tells the reader nothing about the match.
                     // The file path only earns its space when several buffers are
                     // in scope; for a single-buffer search it is just noise.
-                    match self
-                        .documents
-                        .get(doc)
-                        .and_then(|document| document.editable_opt())
-                    {
-                        Some(editable) => {
-                            let (line, column) = crate::position::char_idx_to_line_col(
-                                editable.text(),
-                                CharIdx(range.start),
-                            );
-                            let raw = editable.text().line(line).to_string();
-                            let line_text = raw.trim().to_owned();
-                            let location = if search.scope == SearchScope::AllBuffers {
-                                format!("{}:{}", self.document_label(*doc), line + 1)
-                            } else {
-                                (line + 1).to_string()
-                            };
-                            // The row shows the trimmed line, so shift the match by
-                            // the whitespace `trim` removed.
-                            let trimmed_away =
-                                raw.chars().take_while(|c| c.is_whitespace()).count();
-                            let start = column.saturating_sub(trimmed_away);
-                            let end = start + range.end.saturating_sub(range.start);
-                            let limit = line_text.chars().count();
-                            let matched = (start < limit).then(|| start..end.min(limit));
-                            (location, line_text, matched)
-                        }
-                        None => (
-                            self.document_label(*doc),
-                            format!("{}..{}", range.start, range.end),
-                            None,
-                        ),
-                    }
+                    // Straight from the snapshot — reading the document here would
+                    // drift as soon as it was edited.
+                    let location = if search.scope == SearchScope::AllBuffers {
+                        format!("{}:{}", self.document_label(*doc), preview.line + 1)
+                    } else {
+                        (preview.line + 1).to_string()
+                    };
+                    let limit = preview.text.chars().count();
+                    let end = preview.column + range.end.saturating_sub(range.start);
+                    let matched = (preview.column < limit).then(|| preview.column..end.min(limit));
+                    (location, preview.text.clone(), matched)
                 }
                 SearchHit::Disk(hit) => {
                     // grep reports the line but not the column, so re-run the
@@ -4171,7 +4153,7 @@ impl Editor {
         // lands — `active_editor_mut` resolves Overlay to the left pane.
         self.focus = Focus::Overlay;
         let effects = match hit {
-            SearchHit::Buffer { doc, range } => {
+            SearchHit::Buffer { doc, range, .. } => {
                 let mut view = View::new(doc);
                 view.selections.set_single(Selection {
                     anchor: CharIdx(range.start),
@@ -4260,7 +4242,7 @@ impl Editor {
         }
         let mut by_document: HashMap<DocumentId, Vec<Selection>> = HashMap::new();
         for hit in search.hits {
-            if let SearchHit::Buffer { doc, range } = hit {
+            if let SearchHit::Buffer { doc, range, .. } = hit {
                 by_document.entry(doc).or_default().push(Selection {
                     anchor: CharIdx(range.start),
                     head: CharIdx(range.end),
@@ -4364,7 +4346,9 @@ impl Editor {
         }
         if in_box(relative, layout.find_top) {
             self.focus_search_field(None, false, Some(self.search_field_index_at(column)));
-            return Some(Vec::new());
+            // Results were frozen while the document had focus; putting the caret
+            // back in a field re-runs the search so they match the buffer again.
+            return Some(self.refresh_search());
         }
         if relative == layout.replace_checkbox_row {
             // The run button lives to the right of a ticked checkbox on this row.
@@ -4379,7 +4363,7 @@ impl Editor {
             && in_box(relative, top)
         {
             self.focus_search_field(None, true, Some(self.search_field_index_at(column)));
-            return Some(Vec::new());
+            return Some(self.refresh_search());
         }
         if let Some(top) = layout.include_top
             && in_box(relative, top)
@@ -4389,7 +4373,7 @@ impl Editor {
                 false,
                 Some(self.search_field_index_at(column)),
             );
-            return Some(Vec::new());
+            return Some(self.refresh_search());
         }
         if let Some(top) = layout.exclude_top
             && in_box(relative, top)
@@ -4399,7 +4383,7 @@ impl Editor {
                 false,
                 Some(self.search_field_index_at(column)),
             );
-            return Some(Vec::new());
+            return Some(self.refresh_search());
         }
         if relative > layout.results_top {
             let index = usize::from(relative - layout.results_top - 1)
@@ -4581,9 +4565,19 @@ impl Editor {
             for matched in pattern.find_iter(&contents) {
                 let start = contents[..matched.start()].chars().count();
                 let end = start + matched.as_str().chars().count();
+                // Snapshot the row now, while `range` still describes this text.
+                let (line, column) =
+                    crate::position::char_idx_to_line_col(editable.text(), CharIdx(start));
+                let raw = editable.text().line(line).to_string();
+                let trimmed_away = raw.chars().take_while(|c| c.is_whitespace()).count();
                 hits.push(SearchHit::Buffer {
                     doc: *id,
                     range: start..end,
+                    preview: HitPreview {
+                        line,
+                        text: raw.trim().to_owned(),
+                        column: column.saturating_sub(trimmed_away),
+                    },
                 });
             }
         }
@@ -6084,8 +6078,24 @@ enum SearchHit {
     Buffer {
         doc: DocumentId,
         range: std::ops::Range<usize>,
+        preview: HitPreview,
     },
     Disk(GrepHit),
+}
+
+/// What a buffer hit looked like when the search ran. Captured here rather than
+/// re-read from the document at draw time: `range` is frozen at search time, so
+/// reading live text would pair a moved line with a stale offset and slide the
+/// highlight off the match as soon as the buffer was edited. Grep hits already
+/// carry their own snapshot in `GrepHit::text`.
+#[derive(Clone, Debug)]
+struct HitPreview {
+    /// 0-based line the match sits on.
+    line: usize,
+    /// The line, trimmed — as shown in the results.
+    text: String,
+    /// Match start within `text`, in characters.
+    column: usize,
 }
 
 #[derive(Debug)]
