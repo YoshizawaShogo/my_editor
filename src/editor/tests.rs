@@ -1011,6 +1011,41 @@ fn a_buffer_result_row_marks_the_match_and_dims_the_location_column() {
 }
 
 #[test]
+fn result_separators_line_up_across_line_numbers_of_different_widths() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 40, rows: 24 });
+    // Hits on line 1 and line 10: a 1-digit and a 2-digit line number.
+    let mut text = String::from("foo\n");
+    text.push_str(&"x\n".repeat(8));
+    text.push_str("foo\n");
+    editor.update(AppEvent::TextPaste(text));
+    editor.update(Command::OpenSearch.into());
+    for character in "foo".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+
+    let view = editor.search_view().unwrap();
+    assert_eq!(view.total, 2);
+    // The narrower line number is padded, so the separator sits in one column
+    // and the match offsets stay correct against the padded prefix.
+    let widths: Vec<usize> = view.items.iter().map(|item| item.prefix_len).collect();
+    assert_eq!(
+        widths[0], widths[1],
+        "separator column is ragged: {widths:?}"
+    );
+    for item in &view.items {
+        let matched = item.matched.clone().expect("match located");
+        let highlighted: String = item
+            .text
+            .chars()
+            .skip(matched.start)
+            .take(matched.len())
+            .collect();
+        assert_eq!(highlighted, "foo", "row {:?}", item.text);
+    }
+}
+
+#[test]
 fn clicking_the_run_button_replaces_every_match() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 40, rows: 24 });
@@ -2690,6 +2725,47 @@ fn save_conflict_requires_explicit_overwrite_confirmation() {
             ..
         }]
     ));
+}
+
+#[test]
+fn opening_a_grep_hit_selects_the_match_so_the_jump_is_visible() {
+    let mut editor = Editor::default();
+    editor.update(Command::OpenSearch.into());
+    editor.update(Command::CycleSearchScope.into());
+    editor.update(Command::CycleSearchScope.into());
+    for character in "needle".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+    let token = editor.search().unwrap().grep_token.unwrap();
+    editor.update(AppEvent::Grep(GrepEvent::Hits {
+        token,
+        hits: vec![GrepHit {
+            path: PathBuf::from("/tmp/grep_jump.txt"),
+            line: 0,
+            text: "a needle here".to_owned(),
+        }],
+    }));
+
+    editor.open_search_hit(0);
+    // grep gives no column, so the match is re-located in the line: landing on
+    // column 0 would leave a click with nothing to show for it.
+    let id = editor
+        .documents
+        .iter()
+        .find_map(|(id, document)| {
+            (document.path.as_deref() == Some(std::path::Path::new("/tmp/grep_jump.txt")))
+                .then_some(*id)
+        })
+        .expect("document opened");
+    editor.update(AppEvent::Io(IoEvent::FileLoaded {
+        id,
+        result: Ok("a needle here\n".to_owned()),
+    }));
+
+    let selection = editor.active_buffer().unwrap().view.selections.primary();
+    assert!(!selection.is_caret(), "the jump left a bare caret");
+    let range = selection.range();
+    assert_eq!((range.start, range.end), (2, 8), "\"needle\" not selected");
 }
 
 #[test]

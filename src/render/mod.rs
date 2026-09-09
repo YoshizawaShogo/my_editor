@@ -51,6 +51,11 @@ const POPUP_BG: Color = Color::Rgb(0x1e, 0x21, 0x32);
 // of it. Kept in Iceberg's cyan family (cf. CODE_TYPE #89b8c2).
 const OCCURRENCE_BG: Color = Color::Rgb(0x24, 0x49, 0x4c);
 const MATCHING_BRACKET_BG: Color = Color::Rgb(0x4a, 0x50, 0x68);
+// Behind a match in the find results. Those rows sit on POPUP_BG, which is
+// lighter than the buffer background, so an amber foreground alone washes out —
+// the match gets a filled block, the way occurrences do in the buffer.
+const SEARCH_MATCH_BG: Color = Color::Rgb(0x8a, 0x5d, 0x1a);
+const SEARCH_MATCH_FG: Color = Color::Rgb(0xff, 0xf4, 0xdd);
 
 pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
     let areas = Layout::default()
@@ -871,7 +876,8 @@ fn search_result_line(item: &crate::editor::SearchResultItem) -> Line<'static> {
     for (index, character) in item.text.chars().enumerate() {
         let style = if matched.contains(&index) {
             Style::default()
-                .fg(CODE_NUMBER)
+                .fg(SEARCH_MATCH_FG)
+                .bg(SEARCH_MATCH_BG)
                 .add_modifier(Modifier::BOLD)
         } else if index < item.prefix_len {
             Style::default().fg(MUTED)
@@ -2472,6 +2478,56 @@ mod tests {
         assert!(screen.contains("file"), "scope tabs missing: {screen:?}");
         // "foo" occurs twice in the current buffer.
         assert!(screen.contains("2 件"), "result count missing: {screen:?}");
+    }
+
+    #[test]
+    fn a_find_result_fills_the_match_and_dims_the_location_column() {
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 40, rows: 12 });
+        editor.update(crate::editor::AppEvent::TextPaste("bar foo".to_owned()));
+        editor.update(crate::editor::Command::OpenSearch.into());
+        for character in "foo".chars() {
+            editor.update(crate::editor::AppEvent::TextInput(character));
+        }
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // The result row is the one carrying the dashed column separator — the
+        // editor pane also shows "bar foo", so match on the separator instead.
+        let separator_glyph = crate::editor::SEARCH_COLUMN_SEPARATOR.trim();
+        let row = (0..12)
+            .find(|row| {
+                (0..40)
+                    .map(|column| buffer[(column, *row)].symbol())
+                    .collect::<String>()
+                    .contains(separator_glyph)
+            })
+            .expect("result row missing");
+        let line: String = (0..40)
+            .map(|column| buffer[(column, row)].symbol())
+            .collect();
+        // `┆` is multi-byte, so convert byte offsets to screen columns.
+        let column_of = |needle: &str| -> u16 {
+            let byte = line
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing"));
+            line[..byte].chars().count() as u16
+        };
+        let match_column = column_of("foo");
+
+        // The match is a filled block, not a bare tint, so it reads against the
+        // lighter popup background.
+        assert_eq!(buffer[(match_column, row)].bg, SEARCH_MATCH_BG);
+        assert_eq!(buffer[(match_column, row)].fg, SEARCH_MATCH_FG);
+        // The text before it is ordinary foreground, and the location column dim.
+        let before = column_of("bar");
+        assert_eq!(buffer[(before, row)].bg, POPUP_BG);
+        assert_eq!(buffer[(before, row)].fg, FG);
+        let separator = column_of(separator_glyph);
+        assert_eq!(buffer[(separator, row)].fg, MUTED);
     }
 
     #[test]

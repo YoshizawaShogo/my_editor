@@ -133,7 +133,10 @@ pub struct Editor {
     nav_forward: Vec<(DocumentId, CharIdx)>,
     /// Caret positions to restore once a freshly opened document finishes loading,
     /// used by jumps that open a file whose text is not in memory yet.
-    pending_caret_jumps: HashMap<DocumentId, lsp_types::Position>,
+    /// Where to put the caret once a freshly opened document loads. A range with
+    /// start == end lands a bare caret; a wider one selects, so a jump to a search
+    /// hit arrives with the match highlighted rather than silently placing a caret.
+    pending_caret_jumps: HashMap<DocumentId, lsp_types::Range>,
     pending_self_disk_updates: HashMap<DocumentId, usize>,
     /// The shell, alive from the first Ctrl+O until it exits. Independent of
     /// [`RightPane::Shell`], which only says whether it is currently on screen:
@@ -428,7 +431,10 @@ impl Editor {
                 Vec::new()
             }
             AppEvent::CtagsDefinition(event) => match event.location {
-                Some((path, line)) => self.open_path_at(path, lsp_types::Position::new(line, 0)),
+                Some((path, line)) => {
+                    let at = lsp_types::Position::new(line, 0);
+                    self.open_path_at(path, lsp_types::Range::new(at, at))
+                }
                 None => {
                     self.notify(ToastLevel::Info, "定義が見つかりません");
                     Vec::new()
@@ -619,7 +625,7 @@ impl Editor {
     }
 
     /// Open a single file and place the caret at `position` once its text loads.
-    fn open_path_at(&mut self, path: PathBuf, position: lsp_types::Position) -> Vec<Effect> {
+    fn open_path_at(&mut self, path: PathBuf, range: lsp_types::Range) -> Vec<Effect> {
         let effects = self.open_paths([path.clone()]);
         let Some(id) = self
             .documents
@@ -628,7 +634,7 @@ impl Editor {
         else {
             return effects;
         };
-        self.pending_caret_jumps.insert(id, position);
+        self.pending_caret_jumps.insert(id, range);
         // 再読込が走らないケース(未保存編集のある既存バッファ)は FileLoaded が
         // 来ないので、その場でジャンプを適用する。
         if !effects
@@ -643,31 +649,42 @@ impl Editor {
     /// Move the caret to the position recorded by [`Self::open_path_at`] now that
     /// the document `id` has loaded and can resolve the UTF-16 LSP column.
     fn apply_pending_caret_jump(&mut self, id: DocumentId) {
-        let Some(position) = self.pending_caret_jumps.remove(&id) else {
+        let Some(range) = self.pending_caret_jumps.remove(&id) else {
             return;
         };
         let Some(document) = self.documents.get(&id) else {
             return;
         };
-        let caret = document.editable_opt().map(|editable| {
-            crate::position::lsp_position_to_char_idx(
-                editable.text(),
-                position.line as usize,
-                position.character as usize,
-            )
+        let selection = document.editable_opt().map(|editable| {
+            let at = |position: lsp_types::Position| {
+                crate::position::lsp_position_to_char_idx(
+                    editable.text(),
+                    position.line as usize,
+                    position.character as usize,
+                )
+            };
+            let (start, end) = (at(range.start), at(range.end));
+            if start == end {
+                Selection::caret(start)
+            } else {
+                Selection {
+                    anchor: start,
+                    head: end,
+                }
+            }
         });
         for pane in self.layout.panes_mut() {
             if pane.view.doc != id {
                 continue;
             }
-            match caret {
-                Some(index) => pane.view.selections.set_single(Selection::caret(index)),
+            match selection {
+                Some(selection) => pane.view.selections.set_single(selection),
                 // Large files have no editable text to hold a caret; scroll the
                 // target line into view instead.
-                None => pane.view.scroll.top_line = position.line as usize,
+                None => pane.view.scroll.top_line = range.start.line as usize,
             }
         }
-        if caret.is_some() {
+        if selection.is_some() {
             self.reveal_caret_with_context();
         }
     }
@@ -853,7 +870,10 @@ impl Editor {
         // Locating the match inside a grep line needs the same pattern the search
         // ran with; built once rather than per hit.
         let pattern = search_pattern(&search.query, search.options).ok();
-        let items = search
+        // Each row is built as (location, text, match-within-text), then the
+        // location column is padded to a common width so the dashed separator
+        // forms a straight line even where line numbers differ in digits.
+        let rows: Vec<(String, String, Option<std::ops::Range<usize>>)> = search
             .hits
             .iter()
             .take(500)
@@ -880,54 +900,52 @@ impl Editor {
                             } else {
                                 (line + 1).to_string()
                             };
-                            let prefix = format!("{location}{SEARCH_COLUMN_SEPARATOR}");
                             // The row shows the trimmed line, so shift the match by
-                            // the whitespace `trim` removed plus the prefix width.
+                            // the whitespace `trim` removed.
                             let trimmed_away =
                                 raw.chars().take_while(|c| c.is_whitespace()).count();
-                            let start =
-                                prefix.chars().count() + column.saturating_sub(trimmed_away);
+                            let start = column.saturating_sub(trimmed_away);
                             let end = start + range.end.saturating_sub(range.start);
-                            let text = format!("{prefix}{line_text}");
-                            let limit = text.chars().count();
-                            SearchResultItem {
-                                prefix_len: prefix.chars().count(),
-                                matched: (start < limit).then(|| start..end.min(limit)),
-                                text,
-                            }
+                            let limit = line_text.chars().count();
+                            let matched = (start < limit).then(|| start..end.min(limit));
+                            (location, line_text, matched)
                         }
-                        None => SearchResultItem {
-                            text: format!(
-                                "{}{SEARCH_COLUMN_SEPARATOR}{}..{}",
-                                self.document_label(*doc),
-                                range.start,
-                                range.end
-                            ),
-                            prefix_len: 0,
-                            matched: None,
-                        },
+                        None => (
+                            self.document_label(*doc),
+                            format!("{}..{}", range.start, range.end),
+                            None,
+                        ),
                     }
                 }
                 SearchHit::Disk(hit) => {
                     // grep reports the line but not the column, so re-run the
                     // pattern over the line to place the highlight.
                     let line_text = hit.text.trim();
-                    let prefix = format!(
-                        "{}:{}{SEARCH_COLUMN_SEPARATOR}",
-                        self.display_path(&hit.path),
-                        hit.line + 1
-                    );
-                    let prefix_len = prefix.chars().count();
+                    let location = format!("{}:{}", self.display_path(&hit.path), hit.line + 1);
                     let matched = pattern.as_ref().and_then(|pattern| {
                         let found = pattern.find(line_text)?;
-                        let start = prefix_len + line_text[..found.start()].chars().count();
+                        let start = line_text[..found.start()].chars().count();
                         Some(start..start + found.as_str().chars().count())
                     });
-                    SearchResultItem {
-                        text: format!("{prefix}{line_text}"),
-                        prefix_len,
-                        matched,
-                    }
+                    (location, line_text.to_owned(), matched)
+                }
+            })
+            .collect();
+        let location_width = rows
+            .iter()
+            .map(|(location, _, _)| location.chars().count())
+            .max()
+            .unwrap_or(0);
+        let items = rows
+            .into_iter()
+            .map(|(location, line_text, matched)| {
+                let pad = location_width - location.chars().count();
+                let prefix = format!("{location}{}{SEARCH_COLUMN_SEPARATOR}", " ".repeat(pad));
+                let prefix_len = prefix.chars().count();
+                SearchResultItem {
+                    text: format!("{prefix}{line_text}"),
+                    prefix_len,
+                    matched: matched.map(|range| prefix_len + range.start..prefix_len + range.end),
                 }
             })
             .collect();
@@ -1524,7 +1542,13 @@ impl Editor {
                                 // The file is not open yet, so its text is not loaded.
                                 // Remember where to land and apply it once the read
                                 // completes, otherwise the caret sits at the top.
-                                effects.extend(self.open_path_at(path, location.range.start));
+                                effects.extend(self.open_path_at(
+                                    path,
+                                    lsp_types::Range::new(
+                                        location.range.start,
+                                        location.range.start,
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -4091,12 +4115,16 @@ impl Editor {
         }
     }
 
-    /// Jump to and open the file for the given result index, closing the pane.
+    /// Jump to the file for the given result index, leaving the pane open. The
+    /// match lands selected, so a click has a visible result at the destination.
     fn open_search_hit(&mut self, index: usize) -> Vec<Effect> {
-        let Some(hit) = self
-            .search()
-            .and_then(|search| search.hits.get(index).cloned())
-        else {
+        let Some((hit, options, query)) = self.search().and_then(|search| {
+            Some((
+                search.hits.get(index).cloned()?,
+                search.options,
+                search.query.clone(),
+            ))
+        }) else {
             return Vec::new();
         };
         self.record_jump_origin();
@@ -4126,8 +4154,24 @@ impl Editor {
                     Vec::new()
                 } else {
                     // Not open yet: land on the matched line once it loads instead
-                    // of opening at the top of the file.
-                    self.open_path_at(hit.path, lsp_types::Position::new(hit.line as u32, 0))
+                    // of opening at the top of the file. grep reports the line but
+                    // not the column, so re-run the pattern to select the match
+                    // itself — landing on a bare column 0 gives no sign of a hit.
+                    let columns = search_pattern(&query, options)
+                        .ok()
+                        .and_then(|pattern| pattern.find(&hit.text))
+                        .map_or((0, 0), |found| {
+                            let start = hit.text[..found.start()].chars().count() as u32;
+                            (start, start + found.as_str().chars().count() as u32)
+                        });
+                    let line = hit.line as u32;
+                    self.open_path_at(
+                        hit.path,
+                        lsp_types::Range::new(
+                            lsp_types::Position::new(line, columns.0),
+                            lsp_types::Position::new(line, columns.1),
+                        ),
+                    )
                 }
             }
         };
