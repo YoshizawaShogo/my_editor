@@ -834,7 +834,7 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
             .iter()
             .skip(search.results_scroll)
             .take(usize::from(inner.height))
-            .map(|item| Line::styled(item.clone(), Style::default().fg(FG)))
+            .map(search_result_line)
             .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().bg(POPUP_BG)),
@@ -859,6 +859,37 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
             frame.set_cursor_position((cursor_x, cursor_y));
         }
     }
+}
+
+/// One result row: the `path:line ┆ ` column dimmed, the line text in the normal
+/// foreground, and the matched span picked out so the hit is findable at a glance.
+fn search_result_line(item: &crate::editor::SearchResultItem) -> Line<'static> {
+    let matched = item.matched.clone().unwrap_or(0..0);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_style = None;
+    for (index, character) in item.text.chars().enumerate() {
+        let style = if matched.contains(&index) {
+            Style::default()
+                .fg(CODE_NUMBER)
+                .add_modifier(Modifier::BOLD)
+        } else if index < item.prefix_len {
+            Style::default().fg(MUTED)
+        } else {
+            Style::default().fg(FG)
+        };
+        if run_style != Some(style) {
+            if let Some(previous) = run_style {
+                spans.push(Span::styled(std::mem::take(&mut run), previous));
+            }
+            run_style = Some(style);
+        }
+        run.push(character);
+    }
+    if let Some(style) = run_style {
+        spans.push(Span::styled(run, style));
+    }
+    Line::from(spans)
 }
 
 fn draw_search_field(
@@ -1106,7 +1137,24 @@ pub fn edge_badge_hit(
 
 fn draw_picker(frame: &mut Frame<'_>, picker: &crate::editor::PickerView) {
     let viewport = overlay_area(frame);
-    let width = viewport.width.saturating_sub(4).clamp(1, 70);
+    // 70 columns is the comfortable default, but a long path should not be cut
+    // off when the terminal has room: grow to fit the widest row, up to the
+    // viewport. `picker_item_line` measures in chars, so size in chars too.
+    const PICKER_DEFAULT_WIDTH: u16 = 70;
+    let widest = picker
+        .items
+        .iter()
+        .map(|item| item.label.chars().count())
+        .chain(std::iter::once(
+            picker.title.chars().count() + picker.query.chars().count() + 2,
+        ))
+        .max()
+        .unwrap_or(0);
+    // +2 for the popup's left and right borders.
+    let wanted = u16::try_from(widest.saturating_add(2)).unwrap_or(u16::MAX);
+    let width = wanted
+        .max(PICKER_DEFAULT_WIDTH)
+        .clamp(1, viewport.width.saturating_sub(4).max(1));
     let available_height = viewport.height.saturating_sub(1).max(1);
     let ellipsis_rows = u16::from(picker.has_before) + u16::from(picker.has_after);
     let height = (picker.items.len() as u16 + 3 + ellipsis_rows)

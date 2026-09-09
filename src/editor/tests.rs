@@ -943,7 +943,7 @@ fn clicking_the_gap_between_toggles_flips_the_nearer_one() {
 }
 
 #[test]
-fn clicking_a_result_opens_it_and_closes_the_pane() {
+fn clicking_a_result_opens_it_and_keeps_the_pane_open() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 40, rows: 24 });
     editor.update(AppEvent::TextPaste("foo foo".to_owned()));
@@ -964,7 +964,10 @@ fn clicking_a_result_opens_it_and_closes_the_pane() {
         clicks: 1,
     }));
 
-    assert!(editor.search_view().is_none());
+    // The pane stays open so the remaining hits can be walked one click at a
+    // time; only the left editor moves to the match.
+    let view = editor.search_view().expect("find pane stays open");
+    assert_eq!(view.total, 2);
     assert_eq!(
         editor
             .active_buffer()
@@ -975,6 +978,36 @@ fn clicking_a_result_opens_it_and_closes_the_pane() {
             .head,
         CharIdx(3)
     );
+}
+
+#[test]
+fn a_buffer_result_row_marks_the_match_and_dims_the_location_column() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 40, rows: 24 });
+    editor.update(AppEvent::TextPaste("    let foo = 1;".to_owned()));
+    editor.update(Command::OpenSearch.into());
+    for character in "foo".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+
+    let view = editor.search_view().unwrap();
+    let item = &view.items[0];
+    // The row reads "1 ┆ let foo = 1;" — the leading indent is trimmed, so the
+    // highlight has to be shifted by both the prefix and the trimmed whitespace.
+    assert_eq!(
+        item.text,
+        format!("1{}let foo = 1;", SEARCH_COLUMN_SEPARATOR)
+    );
+    let matched = item.matched.clone().expect("match located");
+    let highlighted: String = item
+        .text
+        .chars()
+        .skip(matched.start)
+        .take(matched.len())
+        .collect();
+    assert_eq!(highlighted, "foo");
+    // Everything up to and including the separator is the dimmed location column.
+    assert_eq!(item.prefix_len, 1 + SEARCH_COLUMN_SEPARATOR.chars().count());
 }
 
 #[test]

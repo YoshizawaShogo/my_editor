@@ -850,6 +850,9 @@ impl Editor {
 
     pub fn search_view(&self) -> Option<SearchView> {
         let search = self.search()?;
+        // Locating the match inside a grep line needs the same pattern the search
+        // ran with; built once rather than per hit.
+        let pattern = search_pattern(&search.query, search.options).ok();
         let items = search
             .hits
             .iter()
@@ -866,33 +869,65 @@ impl Editor {
                         .and_then(|document| document.editable_opt())
                     {
                         Some(editable) => {
-                            let (line, _) = crate::position::char_idx_to_line_col(
+                            let (line, column) = crate::position::char_idx_to_line_col(
                                 editable.text(),
                                 CharIdx(range.start),
                             );
-                            let line_text =
-                                editable.text().line(line).to_string().trim().to_owned();
-                            if search.scope == SearchScope::AllBuffers {
-                                format!("{}:{}  {}", self.document_label(*doc), line + 1, line_text)
+                            let raw = editable.text().line(line).to_string();
+                            let line_text = raw.trim().to_owned();
+                            let location = if search.scope == SearchScope::AllBuffers {
+                                format!("{}:{}", self.document_label(*doc), line + 1)
                             } else {
-                                format!("{}  {}", line + 1, line_text)
+                                (line + 1).to_string()
+                            };
+                            let prefix = format!("{location}{SEARCH_COLUMN_SEPARATOR}");
+                            // The row shows the trimmed line, so shift the match by
+                            // the whitespace `trim` removed plus the prefix width.
+                            let trimmed_away =
+                                raw.chars().take_while(|c| c.is_whitespace()).count();
+                            let start =
+                                prefix.chars().count() + column.saturating_sub(trimmed_away);
+                            let end = start + range.end.saturating_sub(range.start);
+                            let text = format!("{prefix}{line_text}");
+                            let limit = text.chars().count();
+                            SearchResultItem {
+                                prefix_len: prefix.chars().count(),
+                                matched: (start < limit).then(|| start..end.min(limit)),
+                                text,
                             }
                         }
-                        None => format!(
-                            "{}  {}..{}",
-                            self.document_label(*doc),
-                            range.start,
-                            range.end
-                        ),
+                        None => SearchResultItem {
+                            text: format!(
+                                "{}{SEARCH_COLUMN_SEPARATOR}{}..{}",
+                                self.document_label(*doc),
+                                range.start,
+                                range.end
+                            ),
+                            prefix_len: 0,
+                            matched: None,
+                        },
                     }
                 }
                 SearchHit::Disk(hit) => {
-                    format!(
-                        "{}:{}  {}",
-                        hit.path.display(),
-                        hit.line + 1,
-                        hit.text.trim()
-                    )
+                    // grep reports the line but not the column, so re-run the
+                    // pattern over the line to place the highlight.
+                    let line_text = hit.text.trim();
+                    let prefix = format!(
+                        "{}:{}{SEARCH_COLUMN_SEPARATOR}",
+                        self.display_path(&hit.path),
+                        hit.line + 1
+                    );
+                    let prefix_len = prefix.chars().count();
+                    let matched = pattern.as_ref().and_then(|pattern| {
+                        let found = pattern.find(line_text)?;
+                        let start = prefix_len + line_text[..found.start()].chars().count();
+                        Some(start..start + found.as_str().chars().count())
+                    });
+                    SearchResultItem {
+                        text: format!("{prefix}{line_text}"),
+                        prefix_len,
+                        matched,
+                    }
                 }
             })
             .collect();
@@ -4073,7 +4108,9 @@ impl Editor {
                     anchor: CharIdx(range.start),
                     head: CharIdx(range.end),
                 });
-                self.show_only(view);
+                // Show the hit in the left pane but keep the find pane open, so a
+                // list of matches can be walked one click at a time.
+                self.layout.left = EditorPane { view };
                 // The fresh view is scrolled to the top; reveal the match with
                 // surrounding context rather than pinning it to the bottom edge.
                 self.reveal_caret_with_context();
@@ -4085,7 +4122,7 @@ impl Editor {
                 }) {
                     let mut view = View::new(*doc);
                     view.scroll.top_line = hit.line;
-                    self.show_only(view);
+                    self.layout.left = EditorPane { view };
                     Vec::new()
                 } else {
                     // Not open yet: land on the matched line once it loads instead
@@ -4094,7 +4131,7 @@ impl Editor {
                 }
             }
         };
-        self.take_search();
+        self.dirty = true;
         effects
     }
 
@@ -4878,13 +4915,16 @@ impl Editor {
         self.dirty = true;
     }
 
+    /// How a document is named in pickers and search results: relative to the
+    /// workspace root, so a list of hits stays readable instead of repeating the
+    /// same long absolute prefix on every row.
     fn document_label(&self, id: DocumentId) -> String {
         self.documents
             .get(&id)
             .and_then(|document| document.path.as_ref())
             .map_or_else(
                 || format!("Untitled {}", id.0),
-                |path| path.display().to_string(),
+                |path| self.display_path(path),
             )
     }
 
@@ -5918,6 +5958,19 @@ pub(crate) fn search_toggle_click_ranges(inner_x: u16) -> [(u16, u16); 3] {
     [(inner_x, split0), (split0, split1), (split1, end)]
 }
 
+/// Divides a result row's location column from its text. A dashed vertical rules
+/// it off clearly while staying distinct from the solid `│` of a pane border.
+pub const SEARCH_COLUMN_SEPARATOR: &str = " ┆ ";
+
+/// One row of the find results: the whole line, how much of it is the location
+/// column (so the renderer can dim it), and where the match sits (to highlight).
+/// Both ranges are in characters.
+pub struct SearchResultItem {
+    pub text: String,
+    pub prefix_len: usize,
+    pub matched: Option<std::ops::Range<usize>>,
+}
+
 pub struct SearchView {
     pub query: String,
     pub replacement: Option<String>,
@@ -5928,7 +5981,7 @@ pub struct SearchView {
     pub include: String,
     pub exclude: String,
     pub filters: SearchFilters,
-    pub items: Vec<String>,
+    pub items: Vec<SearchResultItem>,
     pub current: usize,
     pub total: usize,
     pub field_cursor: usize,
