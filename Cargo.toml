@@ -36,3 +36,7 @@ tree-sitter-bash = "0.25.1"
 # stateless, allocation-free external scanner. It carries no highlights query,
 # so we vendor our own (src/highlight/tcl_highlights.scm).
 tree-sitter-tcl = { package = "bca-tree-sitter-tcl", version = "2.2.0" }
+# Python grammar (official tree-sitter repo). Ships its own HIGHLIGHTS_QUERY.
+# Colours Python locally; pylsp provides no semantic tokens, so tree-sitter is
+# the only colour source for .py files.
+tree-sitter-python = "0.25.0"

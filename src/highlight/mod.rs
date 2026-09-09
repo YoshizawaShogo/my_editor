@@ -145,6 +145,7 @@ fn cached_query(
     static RUST: OnceLock<Option<Query>> = OnceLock::new();
     static BASH: OnceLock<Option<Query>> = OnceLock::new();
     static TCL: OnceLock<Option<Query>> = OnceLock::new();
+    static PYTHON: OnceLock<Option<Query>> = OnceLock::new();
     let slot = match language_name {
         "json" => &JSON,
         "toml" => &TOML,
@@ -152,6 +153,7 @@ fn cached_query(
         "rust" => &RUST,
         "bash" => &BASH,
         "tcl" => &TCL,
+        "python" => &PYTHON,
         _ => return None,
     };
     slot.get_or_init(|| Query::new(language, query_source).ok())
@@ -203,6 +205,10 @@ fn grammar(name: &str) -> Option<(Language, &'static str)> {
         "tcl" => Some((
             tree_sitter_tcl::LANGUAGE.into(),
             include_str!("tcl_highlights.scm"),
+        )),
+        "python" => Some((
+            tree_sitter_python::LANGUAGE.into(),
+            tree_sitter_python::HIGHLIGHTS_QUERY,
         )),
         _ => None,
     }
@@ -307,6 +313,19 @@ mod tests {
             .collect();
         assert!(keywords.contains(&"foreach"), "got {keywords:?}");
         assert!(keywords.contains(&"end"), "got {keywords:?}");
+    }
+
+    #[test]
+    fn python_comments_strings_numbers_keywords_and_functions_are_highlighted() {
+        let source = "# note\ndef greet(name):\n    count = 42\n    return f\"hi {name}\"\n";
+        let spans = highlight("python", source);
+        let has = |needle: &str| spans.iter().any(|span| span.kind.contains(needle));
+
+        assert!(has("comment"), "no comment span: {spans:?}");
+        assert!(has("string"), "no string span: {spans:?}");
+        assert!(has("number"), "no number span: {spans:?}");
+        assert!(has("keyword"), "no keyword span: {spans:?}");
+        assert!(has("function"), "no function span: {spans:?}");
     }
 
     #[test]

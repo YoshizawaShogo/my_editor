@@ -79,6 +79,9 @@ empty contents produced `self.hover = Some("")`, drawing a blank popup box.
   and `an_empty_hover_response_does_not_open_a_blank_popup`; the rust lifecycle
   tests now emulate a legend-carrying server.
 
+Colouring: pylsp provides no semantic tokens, so `.py` colour now comes from a
+wired `tree-sitter-python` grammar (like bash/rust/tcl), independent of the LSP.
+
 Not verified here (headless): the actual completion/diagnostics UX in a live
 `.py` session. The status/semantic/popup bugs that made it *look* broken are
 fixed; re-test interactively to confirm completion and diagnostics feel right.
