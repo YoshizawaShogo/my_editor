@@ -435,9 +435,16 @@ impl Editor {
                 }
             },
             AppEvent::Tick => {
+                let toasts_before = self.notifications.len();
                 self.notifications
                     .retain(|toast| toast.created.elapsed() < toast.ttl);
-                self.dirty = true;
+                // Redraw only when a toast is on screen (it needs to expire on
+                // time) or one just did. Idle with nothing visible changing must
+                // not force a repaint every tick — external edits still trigger a
+                // redraw through DiskStateObserved.
+                if !self.notifications.is_empty() || self.notifications.len() != toasts_before {
+                    self.dirty = true;
+                }
                 let files = self
                     .documents
                     .iter()

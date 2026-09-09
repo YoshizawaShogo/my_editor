@@ -2434,6 +2434,36 @@ fn observing_a_missing_file_is_not_an_error_and_clears_external_change() {
 }
 
 #[test]
+fn an_idle_tick_checks_disk_state_without_forcing_a_redraw() {
+    let mut editor = Editor::default();
+    editor.take_dirty(); // clear any startup dirty
+
+    let effects = editor.update(AppEvent::Tick);
+
+    // The tick still polls disk state, but with nothing visible changing it must
+    // not mark the editor dirty — that would repaint every 2s while idle.
+    assert!(
+        !editor.take_dirty(),
+        "an idle tick should not force a redraw"
+    );
+    assert!(matches!(effects.as_slice(), [Effect::CheckDiskStates(_)]));
+}
+
+#[test]
+fn a_tick_with_a_visible_toast_keeps_redrawing() {
+    let mut editor = Editor::default();
+    editor.notify(ToastLevel::Error, "boom");
+    editor.take_dirty(); // clear the dirty the toast itself set
+
+    editor.update(AppEvent::Tick);
+
+    assert!(
+        editor.take_dirty(),
+        "a visible toast must keep repainting so it can expire on time"
+    );
+}
+
+#[test]
 fn save_refreshes_current_buffer_highlighting_and_semantic_tokens() {
     let mut editor = Editor::default();
     let path = PathBuf::from("/tmp/save-test.rs");
