@@ -1174,6 +1174,14 @@ impl Editor {
                     let Some(document) = self.documents.get_mut(&id) else {
                         return effects;
                     };
+                    let Some(state) = state else {
+                        // No file on disk yet (e.g. a path opened to be created).
+                        // Not an error: forget any prior state and clear the
+                        // external-change flag without touching the status line.
+                        document.disk_state = None;
+                        document.external_changed = false;
+                        return effects;
+                    };
                     let changed = document.disk_state.is_some_and(|old| old != state);
                     document.disk_state = Some(state);
                     if changed && !self_saved {

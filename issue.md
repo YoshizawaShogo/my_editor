@@ -33,7 +33,14 @@ That is the intended review gate, but if you would rather not be interrupted,
 widen the list to the common-permissive set instead. No action needed unless the
 friction bites.
 
-## 3. BUG: opening a non-existent file spams a persistent "file state" error
+## 3. BUG: opening a non-existent file spams a persistent "file state" error — RESOLVED
+
+**Resolution:** `disk_state` now maps `ErrorKind::NotFound` to `Ok(None)` ("no
+file on disk yet") instead of an `Err` string, and the `DiskStateObserved`
+observer treats `Ok(None)` as "not on disk yet": it clears `disk_state` and the
+external-change flag without touching the status line. Covered by
+`observing_a_missing_file_is_not_an_error_and_clears_external_change`. The
+original report is kept below for context.
 
 **Symptom:** Opening a path that does not exist (e.g. `bash_practice/d.txt`)
 leaves the status line stuck showing

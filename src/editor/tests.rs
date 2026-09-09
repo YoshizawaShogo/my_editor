@@ -2327,7 +2327,7 @@ fn save_emits_write_effect_and_marks_the_document_saved() {
     };
     editor.update(AppEvent::Io(IoEvent::DiskStateObserved {
         id: DocumentId(1),
-        result: Ok(before),
+        result: Ok(Some(before)),
     }));
     editor.update(AppEvent::TextInput('x'));
 
@@ -2357,10 +2357,10 @@ fn save_emits_write_effect_and_marks_the_document_saved() {
 
     let effects = editor.update(AppEvent::Io(IoEvent::DiskStateObserved {
         id: DocumentId(1),
-        result: Ok(crate::document::DiskState {
+        result: Ok(Some(crate::document::DiskState {
             size: 5,
             modified_nanos: 2,
-        }),
+        })),
     }));
     assert!(effects.is_empty());
 
@@ -2372,6 +2372,35 @@ fn save_emits_write_effect_and_marks_the_document_saved() {
     editor.update(Command::Undo.into());
     assert_eq!(editor.active_buffer().unwrap().text.to_string(), "old\n");
     assert!(editor.active_buffer().unwrap().modified);
+}
+
+#[test]
+fn observing_a_missing_file_is_not_an_error_and_clears_external_change() {
+    let mut editor = Editor::default();
+    let path = PathBuf::from("/tmp/does-not-exist.txt");
+    editor.open_paths([path.clone()]);
+    editor.update(AppEvent::Io(IoEvent::FileLoaded {
+        id: DocumentId(1),
+        result: Ok(String::new()),
+    }));
+
+    // A stale external-change flag should be cleared, and a missing file must
+    // not leave an error stuck on the status line.
+    editor
+        .documents
+        .get_mut(&DocumentId(1))
+        .unwrap()
+        .external_changed = true;
+    let effects = editor.update(AppEvent::Io(IoEvent::DiskStateObserved {
+        id: DocumentId(1),
+        result: Ok(None),
+    }));
+
+    assert!(effects.is_empty());
+    assert_eq!(editor.status(), None);
+    let document = editor.documents.get(&DocumentId(1)).unwrap();
+    assert!(!document.external_changed);
+    assert_eq!(document.disk_state, None);
 }
 
 #[test]

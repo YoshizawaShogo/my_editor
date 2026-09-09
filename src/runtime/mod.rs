@@ -199,7 +199,7 @@ impl Runtime {
                 let tx = self.tx.clone();
                 tokio::task::spawn_blocking(move || {
                     let result = match (expected, disk_state(&path)) {
-                        (Some(expected), Ok(current)) if expected != current => {
+                        (Some(expected), Ok(Some(current))) if expected != current => {
                             let _ = tx.send(AppEvent::Io(IoEvent::SaveConflict { id: doc, path }));
                             return;
                         }
@@ -208,10 +208,10 @@ impl Runtime {
                     };
                     let saved = result.is_ok();
                     let _ = tx.send(AppEvent::Io(IoEvent::FileSaved { id: doc, result }));
-                    if saved && let Ok(state) = disk_state(&path) {
+                    if saved && let Ok(Some(state)) = disk_state(&path) {
                         let _ = tx.send(AppEvent::Io(IoEvent::DiskStateObserved {
                             id: doc,
-                            result: Ok(state),
+                            result: Ok(Some(state)),
                         }));
                     }
                 });
@@ -1185,9 +1185,20 @@ fn apply_file_edits(path: &Path, edits_json: &str) -> std::result::Result<(), St
     atomic_write(path, contents.as_bytes())
 }
 
-fn disk_state(path: &Path) -> std::result::Result<DiskState, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("ファイル状態を取得できません {}: {error}", path.display()))?;
+/// Observe a file's on-disk state. A missing file is not an error: opening a
+/// path in order to create it is a normal workflow, so `NotFound` maps to
+/// `Ok(None)` ("no file on disk yet") rather than a status-line error.
+fn disk_state(path: &Path) -> std::result::Result<Option<DiskState>, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "ファイル状態を取得できません {}: {error}",
+                path.display()
+            ));
+        }
+    };
     let modified = metadata
         .modified()
         .map_err(|error| format!("mtimeを取得できません {}: {error}", path.display()))?;
@@ -1195,10 +1206,10 @@ fn disk_state(path: &Path) -> std::result::Result<DiskState, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    Ok(DiskState {
+    Ok(Some(DiskState {
         size: metadata.len(),
         modified_nanos,
-    })
+    }))
 }
 
 fn normalize_path(path: &Path) -> PathBuf {

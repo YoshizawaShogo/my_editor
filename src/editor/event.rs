@@ -157,7 +157,7 @@ pub enum IoEvent {
     },
     DiskStateObserved {
         id: DocumentId,
-        result: Result<DiskState, String>,
+        result: Result<Option<DiskState>, String>,
     },
     DirectPathResolved {
         path: std::path::PathBuf,
