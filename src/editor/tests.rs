@@ -2464,6 +2464,58 @@ fn a_tick_with_a_visible_toast_keeps_redrawing() {
 }
 
 #[test]
+fn an_identical_diagnostic_resend_does_not_force_a_redraw() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::TextPaste("fn main() {}\n".to_owned()));
+    editor.documents.get_mut(&DocumentId(0)).unwrap().path = Some(PathBuf::from("/tmp/diag.rs"));
+    let event = || {
+        AppEvent::Lsp(LspEvent::Diagnostics {
+            uri: "file:///tmp/diag.rs".to_owned(),
+            diagnostics: vec![crate::lsp::Diagnostic {
+                line: 0,
+                character: 0,
+                end_line: 0,
+                end_character: 2,
+                severity: crate::lsp::DiagnosticSeverity::Error,
+                message: "boom".to_owned(),
+            }],
+        })
+    };
+
+    editor.update(event());
+    assert!(editor.take_dirty(), "a new diagnostic set should repaint");
+
+    // rust-analyzer re-publishes the same diagnostics while idle; the identical
+    // resend must not wake a redraw (the "0.3% every few seconds" symptom).
+    editor.update(event());
+    assert!(
+        !editor.take_dirty(),
+        "an identical diagnostic resend should not repaint"
+    );
+}
+
+#[test]
+fn an_identical_lsp_progress_message_does_not_force_a_redraw() {
+    let mut editor = Editor::default();
+    let event = || {
+        AppEvent::Lsp(LspEvent::Progress {
+            server: 1,
+            token: "idx".to_owned(),
+            message: Some("Indexing".to_owned()),
+        })
+    };
+
+    editor.update(event());
+    assert!(editor.take_dirty(), "a new progress message should repaint");
+
+    editor.update(event());
+    assert!(
+        !editor.take_dirty(),
+        "an identical progress message should not repaint"
+    );
+}
+
+#[test]
 fn save_refreshes_current_buffer_highlighting_and_semantic_tokens() {
     let mut editor = Editor::default();
     let path = PathBuf::from("/tmp/save-test.rs");

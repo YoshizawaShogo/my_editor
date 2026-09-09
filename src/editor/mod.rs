@@ -1033,14 +1033,25 @@ impl Editor {
         self.dirty = true;
     }
 
-    fn set_progress(&mut self, key: impl Into<String>, text: impl Into<String>) {
-        self.progress.insert(key.into(), text.into());
+    /// Record a progress message; returns whether the displayed text changed. An
+    /// unchanged repeat (servers re-send the same progress) should not repaint.
+    fn set_progress(&mut self, key: impl Into<String>, text: impl Into<String>) -> bool {
+        let (key, text) = (key.into(), text.into());
+        if self.progress.get(&key) == Some(&text) {
+            return false;
+        }
+        self.progress.insert(key, text);
         self.dirty = true;
+        true
     }
 
-    fn finish_progress(&mut self, key: &str) {
-        self.progress.remove(key);
-        self.dirty = true;
+    /// Clear a progress entry; returns whether anything was actually removed.
+    fn finish_progress(&mut self, key: &str) -> bool {
+        let removed = self.progress.remove(key).is_some();
+        if removed {
+            self.dirty = true;
+        }
+        removed
     }
 
     fn apply_io(&mut self, event: IoEvent) -> Vec<Effect> {
@@ -1308,7 +1319,12 @@ impl Editor {
                             crate::document::DocumentKind::Large(_) => None,
                         }
                     {
-                        editable.set_diagnostics(diagnostics);
+                        // Skip the blanket repaint below when the server re-sent an
+                        // identical diagnostic set (rust-analyzer does this while
+                        // idle, which otherwise wakes a redraw every few seconds).
+                        if !editable.set_diagnostics(diagnostics) {
+                            return effects;
+                        }
                         break;
                     }
                 }
@@ -1319,10 +1335,14 @@ impl Editor {
                 message,
             } => {
                 let key = format!("lsp:{server}:{token}");
-                if let Some(message) = message {
-                    self.set_progress(key, message);
+                let changed = if let Some(message) = message {
+                    self.set_progress(key, message)
                 } else {
-                    self.finish_progress(&key);
+                    self.finish_progress(&key)
+                };
+                // An unchanged progress notification should not force a repaint.
+                if !changed {
+                    return effects;
                 }
             }
             LspEvent::Response { id, result } => match self.pending_lsp.remove(&id) {

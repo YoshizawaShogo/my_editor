@@ -701,10 +701,13 @@ impl Editable {
     /// Resolve incoming LSP diagnostics to char-index ranges against the current
     /// text and store them highest-severity first (so overlapping ranges pick the
     /// most severe color at render time).
-    pub fn set_diagnostics(&mut self, mut diagnostics: Vec<crate::lsp::Diagnostic>) {
+    /// Replace the resolved diagnostics; returns whether they actually changed.
+    /// A server (rust-analyzer, say) may re-publish an identical set periodically,
+    /// and an unchanged set should not trigger a repaint.
+    pub fn set_diagnostics(&mut self, mut diagnostics: Vec<crate::lsp::Diagnostic>) -> bool {
         diagnostics.sort_by_key(|diagnostic| diagnostic.severity);
         let len = self.text.len_chars();
-        self.diagnostics = diagnostics
+        let resolved = diagnostics
             .into_iter()
             .map(|diagnostic| {
                 let start = crate::position::lsp_position_to_char_idx(
@@ -727,7 +730,10 @@ impl Editable {
                     message: diagnostic.message,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let changed = resolved != self.diagnostics;
+        self.diagnostics = resolved;
+        changed
     }
 
     /// Keep resolved diagnostics aligned with an edit, mirroring the semantic-span
