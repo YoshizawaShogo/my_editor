@@ -244,15 +244,50 @@ fn shell_drag_selection_copies_a_stable_snapshot_and_clears_hover() {
 }
 
 #[test]
-fn ctrl_c_without_a_shell_selection_still_sends_interrupt() {
+fn ctrl_c_interrupts_the_shell_even_with_a_selection_on_screen() {
+    // A leftover selection used to turn Ctrl+C into a copy, so a runaway process
+    // could not be interrupted. Copying now happens on mouse release instead, and
+    // Ctrl+C always reaches the shell.
     let mut editor = Editor::default();
+    editor.config.editor.osc52_clipboard = true;
     editor.update(AppEvent::Resize { cols: 20, rows: 6 });
-    editor.update(Command::ToggleShell.into());
+    let token = open_shell(&mut editor);
+    editor.update(AppEvent::Terminal(TerminalEvent::Output {
+        token,
+        bytes: b"hello".to_vec(),
+    }));
+    let mouse = |kind, column| {
+        AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind,
+                column,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        })
+    };
+    editor.update(mouse(MouseEventKind::Down(MouseButton::Left), 11));
+    editor.update(mouse(MouseEventKind::Drag(MouseButton::Left), 15));
+    editor.update(mouse(MouseEventKind::Up(MouseButton::Left), 15));
+    assert!(editor.terminal_selection_view().is_some());
 
-    assert_eq!(
-        editor.update(Command::CopyShellSelection.into()),
-        vec![Effect::TerminalInput(vec![3])]
-    );
+    // The keystroke goes through the same translation the runtime uses.
+    let ctrl_c = crate::input::translate(
+        crate::input::RawInput::Key {
+            event: crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ),
+            at: std::time::Instant::now(),
+        },
+        &editor.focus(),
+        &mut crate::input::KeyChordState::default(),
+    )
+    .expect("Ctrl+C was dropped");
+    let effects = editor.update(ctrl_c);
+
+    assert_eq!(effects, vec![Effect::TerminalInput(vec![3])]);
 }
 
 #[test]

@@ -372,7 +372,7 @@ impl Editor {
                 }
                 self.apply_mouse(mouse);
                 if copy_shell_selection {
-                    self.copy_shell_selection(false)
+                    self.copy_shell_selection()
                 } else if definition {
                     self.request_definition()
                 } else if hover
@@ -2893,7 +2893,6 @@ impl Editor {
             Command::AddCursor { direction } => self.add_cursor(direction),
             Command::SelectNextOccurrence => self.select_next_occurrence(),
             Command::Copy => return self.copy_active(true),
-            Command::CopyShellSelection => return self.copy_shell_selection(true),
             Command::Cut => {
                 // Deleting must key off "did we copy", not off the OSC 52 effect —
                 // that effect is empty when OS-clipboard push is disabled, and a
@@ -3735,17 +3734,13 @@ impl Editor {
         }
     }
 
-    fn copy_shell_selection(&self, send_interrupt_if_empty: bool) -> Vec<Effect> {
+    fn copy_shell_selection(&self) -> Vec<Effect> {
         let Some(selection) = self
             .shell
             .as_ref()
             .and_then(|shell| shell.selection.as_ref())
         else {
-            return if self.focus == Focus::Shell && send_interrupt_if_empty {
-                vec![Effect::TerminalInput(vec![3])]
-            } else {
-                Vec::new()
-            };
+            return Vec::new();
         };
         if selection.anchor == selection.head {
             return Vec::new();

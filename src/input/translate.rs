@@ -37,7 +37,7 @@ impl TryFrom<Event> for RawInput {
     }
 }
 
-pub fn translate(raw: RawInput, _focus: &Focus, pending: &mut KeyChordState) -> Option<AppEvent> {
+pub fn translate(raw: RawInput, focus: &Focus, pending: &mut KeyChordState) -> Option<AppEvent> {
     pending.clear();
     match raw {
         RawInput::Key { event: key, .. }
@@ -45,6 +45,9 @@ pub fn translate(raw: RawInput, _focus: &Focus, pending: &mut KeyChordState) -> 
         {
             None
         }
+        // A focused shell owns the keyboard: every key goes to it, ahead of the
+        // editor's global shortcuts and function keys — except Ctrl+O.
+        RawInput::Key { event: key, .. } if matches!(focus, Focus::Shell) => shell_focus_key(key),
         RawInput::Key { event: key, .. } if key.code == KeyCode::F(4) => Some(Command::Quit.into()),
         RawInput::Key { event: key, .. } if key.code == KeyCode::F(5) => {
             Some(Command::Reload.into())
@@ -58,7 +61,7 @@ pub fn translate(raw: RawInput, _focus: &Focus, pending: &mut KeyChordState) -> 
         RawInput::Key { event: key, .. } if key.code == KeyCode::F(8) => {
             Some(Command::DiffNextHunk.into())
         }
-        RawInput::Key { event: key, at } => translate_key(key, at, _focus),
+        RawInput::Key { event: key, at } => translate_key(key, at, focus),
         RawInput::Paste(text) => Some(AppEvent::TextPaste(text)),
         RawInput::Mouse { event, at } => {
             let clicks = match event.kind {
@@ -108,12 +111,6 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
     // its handler falls back to cancelling for the other overlays.
     if matches!(focus, Focus::Completion(_)) && ctrl && key.code == KeyCode::Char('c') {
         return Some(Command::Cancel.into());
-    }
-    if matches!(focus, Focus::Shell) {
-        if ctrl && key.code == KeyCode::Char('c') {
-            return Some(Command::CopyShellSelection.into());
-        }
-        return shell_key(key).map(AppEvent::TerminalInput);
     }
     if matches!(focus, Focus::Completion(_)) {
         match key.code {
@@ -246,12 +243,34 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
     }
 }
 
+/// Keys while the shell has focus. Ctrl+O is kept as the keyboard's way back to
+/// the editor (a click on the left half also works); everything else is the
+/// shell's, so readline, vim, less and htop see their own bindings. Copying a
+/// shell selection happens on mouse release, so Ctrl+C is free to interrupt.
+fn shell_focus_key(key: KeyEvent) -> Option<AppEvent> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('o' | 'O'))
+    {
+        return Some(Command::ToggleShell.into());
+    }
+    shell_key(key).map(AppEvent::TerminalInput)
+}
+
 fn shell_key(key: KeyEvent) -> Option<Vec<u8>> {
     match key.code {
         KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let ascii = character.to_ascii_lowercase();
-            ascii.is_ascii().then(|| vec![(ascii as u8) & 0x1f])
+            match character {
+                // crossterm decodes 0x1c..=0x1f (Ctrl+\ ] ^ _) as Ctrl+4..=7. Send those
+                // bytes back; masking the digit instead would turn Ctrl+] into ^U,
+                // which kills the whole line in readline.
+                '4'..='7' => Some(vec![character as u8 - b'4' + 0x1c]),
+                _ => {
+                    let ascii = character.to_ascii_lowercase();
+                    ascii.is_ascii().then(|| vec![(ascii as u8) & 0x1f])
+                }
+            }
         }
+        // Some platforms report Ctrl+Space as Null rather than Ctrl+' '.
+        KeyCode::Null => Some(vec![0]),
         KeyCode::Char(character) => {
             let mut bytes = [0; 4];
             Some(character.encode_utf8(&mut bytes).as_bytes().to_vec())
@@ -413,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_copies_in_an_overlay_and_uses_shell_copy_dispatch() {
+    fn ctrl_c_copies_in_an_overlay_and_interrupts_in_the_shell() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let mut pending = KeyChordState::default();
         // In an overlay Ctrl+C is a copy for the find pane; the handler falls
@@ -426,10 +445,51 @@ mod tests {
             translate(raw_key(key), &Focus::Completion(Side::Left), &mut pending),
             Some(AppEvent::Command(Command::Cancel))
         );
+        // In the shell it is always SIGINT; copying happens on mouse release.
         assert_eq!(
             translate(raw_key(key), &Focus::Shell, &mut pending),
-            Some(AppEvent::Command(Command::CopyShellSelection))
+            Some(AppEvent::TerminalInput(vec![3]))
         );
+    }
+
+    fn in_shell(code: KeyCode, modifiers: KeyModifiers) -> Option<AppEvent> {
+        translate(
+            raw_key(KeyEvent::new(code, modifiers)),
+            &Focus::Shell,
+            &mut KeyChordState::default(),
+        )
+    }
+
+    #[test]
+    fn a_focused_shell_gets_every_key_except_ctrl_o() {
+        let ctrl = KeyModifiers::CONTROL;
+        // Ctrl+O stays the keyboard's way back to the editor.
+        assert_eq!(
+            in_shell(KeyCode::Char('o'), ctrl),
+            Some(AppEvent::Command(Command::ToggleShell))
+        );
+        // The editor's global shortcuts no longer fire; the shell gets the byte.
+        for (character, byte) in [('p', 0x10), ('g', 0x07), ('t', 0x14), ('f', 0x06)] {
+            assert_eq!(
+                in_shell(KeyCode::Char(character), ctrl),
+                Some(AppEvent::TerminalInput(vec![byte])),
+                "Ctrl+{character}"
+            );
+        }
+        assert_eq!(
+            in_shell(KeyCode::Char(' '), ctrl),
+            Some(AppEvent::TerminalInput(vec![0]))
+        );
+        // Ctrl+] reaches us as Ctrl+5. Masked naively it would send ^U.
+        assert_eq!(
+            in_shell(KeyCode::Char('5'), ctrl),
+            Some(AppEvent::TerminalInput(vec![0x1d]))
+        );
+        // F4 used to quit the editor from inside the shell (htop's filter key).
+        assert!(!matches!(
+            in_shell(KeyCode::F(4), KeyModifiers::NONE),
+            Some(AppEvent::Command(_))
+        ));
     }
 
     #[test]

@@ -15,7 +15,6 @@ pub enum Command {
     },
     SelectNextOccurrence,
     Copy,
-    CopyShellSelection,
     Cut,
     Paste,
     Save,
