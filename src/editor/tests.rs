@@ -3358,6 +3358,99 @@ fn a_server_without_semantic_tokens_opens_without_requesting_them_and_reaches_re
     );
 }
 
+/// Two open buffers: a 50-line `view_a.txt` (doc 1) and a short `view_b.txt`
+/// (doc 2, on screen), in a viewport small enough that line 40 scrolls.
+fn two_buffers_with_a_long_first() -> Editor {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 10 });
+    editor.open_paths([
+        PathBuf::from("/tmp/view_a.txt"),
+        PathBuf::from("/tmp/view_b.txt"),
+    ]);
+    let long = (0..50)
+        .map(|i| format!("line{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    editor.update(AppEvent::Io(IoEvent::FileLoaded {
+        id: DocumentId(1),
+        result: Ok(long),
+    }));
+    editor.update(AppEvent::Io(IoEvent::FileLoaded {
+        id: DocumentId(2),
+        result: Ok("bbb\n".to_owned()),
+    }));
+    editor
+}
+
+fn switch_buffer(editor: &mut Editor, name: &str) {
+    editor.update(Command::OpenBufferPicker.into());
+    for character in name.chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+    editor.update(Command::PickerConfirm.into());
+}
+
+fn go_to_line(editor: &mut Editor, line: &str) {
+    editor.update(Command::GoToLine.into());
+    for character in line.chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+    editor.update(Command::PickerConfirm.into());
+}
+
+/// (document, caret, first visible line) of the active pane.
+fn active_position(editor: &Editor) -> (DocumentId, CharIdx, usize) {
+    let buffer = editor.active_buffer().unwrap();
+    (
+        buffer.view.doc,
+        buffer.view.selections.primary().head,
+        buffer.view.scroll.top_line,
+    )
+}
+
+#[test]
+fn switching_buffers_returns_to_where_each_one_was_left() {
+    let mut editor = two_buffers_with_a_long_first();
+    switch_buffer(&mut editor, "view_a");
+    go_to_line(&mut editor, "40");
+    let left_a = active_position(&editor);
+    assert_eq!(left_a.0, DocumentId(1));
+    assert!(left_a.2 > 0, "line 40 should have scrolled the view");
+
+    switch_buffer(&mut editor, "view_b");
+    assert_eq!(active_position(&editor).0, DocumentId(2));
+
+    // Back through the buffer picker: caret and scroll both come back.
+    switch_buffer(&mut editor, "view_a");
+    assert_eq!(active_position(&editor), left_a);
+
+    // Reopening the file is a separate switching path; it must restore too.
+    switch_buffer(&mut editor, "view_b");
+    editor.open_paths([PathBuf::from("/tmp/view_a.txt")]);
+    assert_eq!(active_position(&editor), left_a);
+}
+
+#[test]
+fn a_remembered_position_is_clamped_when_the_document_shrank_meanwhile() {
+    let mut editor = two_buffers_with_a_long_first();
+    switch_buffer(&mut editor, "view_a");
+    go_to_line(&mut editor, "40");
+    switch_buffer(&mut editor, "view_b");
+
+    // view_a is reloaded much shorter while off screen (changed on disk).
+    editor.update(AppEvent::Io(IoEvent::FileLoaded {
+        id: DocumentId(1),
+        result: Ok("short\n".to_owned()),
+    }));
+    switch_buffer(&mut editor, "view_a");
+
+    // The old caret and scroll lie past the new end; restoring them verbatim
+    // would index outside the text.
+    let buffer = editor.active_buffer().unwrap();
+    assert!(buffer.view.selections.primary().head.0 <= buffer.text.len_chars());
+    assert!(buffer.view.scroll.top_line < buffer.text.len_lines());
+}
+
 #[test]
 fn reopening_an_open_file_reuses_the_existing_document() {
     let mut editor = Editor::default();

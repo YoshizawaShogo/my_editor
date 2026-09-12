@@ -137,6 +137,12 @@ pub struct Editor {
     /// start == end lands a bare caret; a wider one selects, so a jump to a search
     /// hit arrives with the match highlighted rather than silently placing a caret.
     pending_caret_jumps: HashMap<DocumentId, lsp_types::Range>,
+    /// Where each document was last seen — caret, selections and scroll — so a
+    /// buffer switched away from and back to reopens where it was left rather
+    /// than at the top. Written only at the single exit of [`Self::update`], so
+    /// none of the many switching paths (picker, reopen, close, jump) has to
+    /// remember to save it.
+    last_views: HashMap<DocumentId, View>,
     pending_self_disk_updates: HashMap<DocumentId, usize>,
     /// The shell, alive from the first Ctrl+O until it exits. Independent of
     /// [`RightPane::Shell`], which only says whether it is currently on screen:
@@ -185,6 +191,7 @@ impl Default for Editor {
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             pending_caret_jumps: HashMap::new(),
+            last_views: HashMap::new(),
             pending_self_disk_updates: HashMap::new(),
             shell: None,
             terminal_size: (0, 0),
@@ -199,6 +206,15 @@ impl Default for Editor {
 
 impl Editor {
     pub fn update(&mut self, event: AppEvent) -> Vec<Effect> {
+        let effects = self.apply_event(event);
+        // Recorded here rather than inside `apply_event`: its arms return early
+        // in several places, and a position saved only on the fall-through
+        // path would be skipped exactly when one of those switched buffers.
+        self.remember_visible_views();
+        effects
+    }
+
+    fn apply_event(&mut self, event: AppEvent) -> Vec<Effect> {
         let mut effects = match event {
             AppEvent::Command(command) => self.apply_command(command),
             AppEvent::TextInput(character) => {
@@ -573,19 +589,73 @@ impl Editor {
         })
     }
 
+    /// Record where every visible pane is. Runs once per event, after it has been
+    /// applied, so each document's entry holds its latest position and outlives
+    /// the pane being pointed at another document.
+    fn remember_visible_views(&mut self) {
+        let views: Vec<View> = self
+            .layout
+            .panes_mut()
+            .into_iter()
+            .map(|pane| pane.view.clone())
+            .collect();
+        for view in views {
+            self.last_views.insert(view.doc, view);
+        }
+    }
+
+    /// The view to open `doc` with when switching to it: where it was last seen,
+    /// or the top the first time. Clamped to the current text, since the document
+    /// may have shrunk (an external reload) while it was off screen.
+    fn view_for(&self, doc: DocumentId) -> View {
+        let Some(mut view) = self.last_views.get(&doc).cloned() else {
+            return View::new(doc);
+        };
+        if let Some(text) = self
+            .documents
+            .get(&doc)
+            .and_then(Document::editable_opt)
+            .map(|editable| editable.text())
+        {
+            let len = text.len_chars();
+            let clamp = |index: CharIdx| CharIdx(index.0.min(len));
+            let ranges = view
+                .selections
+                .iter()
+                .map(|selection| Selection {
+                    anchor: clamp(selection.anchor),
+                    head: clamp(selection.head),
+                })
+                .collect();
+            let primary = view.selections.primary_index();
+            view.selections = crate::view::Selections::from_vec(ranges, primary);
+            // Clamping can stack several carets on the end of the text; merge
+            // them, or one keystroke would be applied once per duplicate.
+            view.selections.normalize();
+            let last_line = text.len_lines().saturating_sub(1);
+            if view.scroll.top_line > last_line {
+                view.scroll.top_line = last_line;
+                view.scroll.wrapped_row_offset = 0;
+            }
+        }
+        view
+    }
+
     pub fn open_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> Vec<Effect> {
         let paths: Vec<_> = paths.into_iter().collect();
         if !paths.is_empty() {
             self.documents.remove(&DocumentId(0));
+            self.last_views.remove(&DocumentId(0));
         }
         let mut effects = Vec::new();
         for path in paths {
             let (id, load) = self.document_for_path(path);
+            let view = self.view_for(id);
             if self.layout.is_diff() {
-                self.show_only(View::new(id));
+                self.show_only(view);
                 self.focus = Focus::Editor(Side::Left);
             } else if let Some(pane) = self.layout.active_editor_mut(self.focus) {
-                pane.view = View::new(id);
+                pane.view = view;
             }
             effects.extend(load);
         }
@@ -2600,7 +2670,8 @@ impl Editor {
             self.apply_text_edits(doc, edits);
         }
         if self.documents.contains_key(&preferred_doc) {
-            self.show_only(View::new(preferred_doc));
+            let view = self.view_for(preferred_doc);
+            self.show_only(view);
         }
         if !external_edits.is_empty() {
             self.notify(
@@ -3183,12 +3254,14 @@ impl Editor {
         // LSP state (version, opened, semantic/hover readiness) needs no separate
         // cleanup here — that inseparability is the point of storing it inline.
         self.documents.remove(&id);
+        self.last_views.remove(&id);
         if self.deferred_hover.is_some_and(|(doc, _)| doc == id) {
             self.deferred_hover = None;
         }
         self.pending_self_disk_updates.remove(&id);
         if let Some(next) = self.documents.keys().next().copied() {
-            self.show_only(View::new(next));
+            let view = self.view_for(next);
+            self.show_only(view);
         } else {
             let id = DocumentId(self.next_doc_id);
             self.next_doc_id += 1;
@@ -5217,10 +5290,11 @@ impl Editor {
             }
             (PickerMode::Buffer, PickerCandidate::Document(target)) => {
                 self.focus = Focus::Editor(picker.return_side);
+                let view = self.view_for(target);
                 if let Some(pane) = self.layout.active_editor_mut(self.focus) {
-                    pane.view = View::new(target);
+                    pane.view = view;
                 } else {
-                    self.show_only(View::new(target));
+                    self.show_only(view);
                     final_side = Side::Left;
                 }
             }
