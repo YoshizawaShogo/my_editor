@@ -250,6 +250,11 @@ impl Editable {
                     full_indentation
                 };
                 let indentation = normalized_indentation(&raw_indentation, tab_size, insert_spaces);
+                let unit = if insert_spaces {
+                    " ".repeat(tab_size.max(1))
+                } else {
+                    "\t".to_owned()
+                };
                 let inside_empty_brackets = selection.is_caret()
                     && insertion > 0
                     && insertion < self.text.len_chars()
@@ -257,11 +262,6 @@ impl Editable {
                     && matching_pair(self.text.char(insertion - 1))
                         == Some(self.text.char(insertion));
                 if inside_empty_brackets {
-                    let unit = if insert_spaces {
-                        " ".repeat(tab_size.max(1))
-                    } else {
-                        "\t".to_owned()
-                    };
                     let inner_indentation = format!("{indentation}{unit}");
                     let cursor_back = 1 + indentation.chars().count();
                     return (format!("\n{inner_indentation}\n{indentation}"), cursor_back);
@@ -272,13 +272,19 @@ impl Editable {
                     .into();
                 let comment = line_comment
                     .and_then(|marker| continued_line_comment(&prefix, &raw_indentation, marker));
-                (
-                    comment.map_or_else(
-                        || format!("\n{indentation}"),
-                        |comment| format!("\n{indentation}{comment} "),
-                    ),
-                    0,
-                )
+                if let Some(comment) = comment {
+                    return (format!("\n{indentation}{comment} "), 0);
+                }
+                // A line that ends by opening a bracket — `if {`, `fn main() {`, a
+                // call's `(` — starts a block, so what follows sits one level deeper.
+                let opens_block = prefix
+                    .trim_end_matches([' ', '\t'])
+                    .ends_with(['(', '[', '{']);
+                if opens_block {
+                    (format!("\n{indentation}{unit}"), 0)
+                } else {
+                    (format!("\n{indentation}"), 0)
+                }
             })
             .collect::<Vec<_>>();
         let (replacements, cursor_backs): (Vec<_>, Vec<_>) = edits.into_iter().unzip();
@@ -1285,5 +1291,33 @@ mod tests {
                 format!("    call{opening}{closing}")
             );
         }
+    }
+
+    #[test]
+    fn newline_after_an_opening_bracket_indents_one_level_deeper() {
+        // The closing brace is not right after the caret (it is further down, or
+        // not typed yet), so this is not the empty-bracket case.
+        let mut editable = Editable::new("    if ready {\n    }");
+        let mut selections = Selections::single(Selection::caret(CharIdx(14)));
+        editable.insert_newline(&mut selections, None, 4, true);
+        assert_eq!(
+            editable.text().to_string(),
+            "    if ready {\n        \n    }"
+        );
+        assert_eq!(selections.primary().head, CharIdx(23));
+
+        // With tabs the level is one tab; trailing spaces after the brace and
+        // Tcl's braced condition do not hide the opening brace.
+        let text = "\tif {$x > 0} {  ";
+        let mut editable = Editable::new(text);
+        let mut selections = Selections::single(Selection::caret(CharIdx(text.len())));
+        editable.insert_newline(&mut selections, Some("#"), 4, false);
+        assert_eq!(editable.text().to_string(), format!("{text}\n\t\t"));
+
+        // A comment that happens to end in a brace only continues the comment.
+        let mut editable = Editable::new("    // if ready {");
+        let mut selections = Selections::single(Selection::caret(CharIdx(17)));
+        editable.insert_newline(&mut selections, Some("//"), 4, true);
+        assert_eq!(editable.text().to_string(), "    // if ready {\n    // ");
     }
 }
