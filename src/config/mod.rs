@@ -17,28 +17,58 @@ impl Default for Config {
         Self {
             language: vec![
                 rust,
-                LanguageConfig::new("toml", &["toml"], Some("#")),
+                LanguageConfig {
+                    // Cargo.lock is TOML under a name of its own.
+                    filenames: vec!["Cargo.lock".to_owned()],
+                    ..LanguageConfig::new("toml", &["toml"], Some("#"))
+                },
                 LanguageConfig::new("markdown", &["md", "markdown"], None),
-                LanguageConfig::new("json", &["json"], Some("//")),
+                LanguageConfig::new("json", &["json", "jsonc"], Some("//")),
                 LanguageConfig {
                     lsp: Some(vec!["pylsp".to_owned()]),
-                    ..LanguageConfig::new("python", &["py"], Some("#"))
+                    // .pyi: type stubs; .pyw: windowed scripts on Windows.
+                    ..LanguageConfig::new("python", &["py", "pyi", "pyw"], Some("#"))
                 },
                 LanguageConfig {
                     lsp: Some(vec!["clangd".to_owned()]),
                     ..LanguageConfig::new("c", &["c", "h"], Some("//"))
                 },
-                LanguageConfig::new("bash", &["sh", "bash"], Some("#")),
+                LanguageConfig {
+                    // Startup files have no extension; they are matched by name.
+                    filenames: [
+                        ".bashrc",
+                        ".bash_profile",
+                        ".bash_aliases",
+                        ".bash_logout",
+                        ".profile",
+                    ]
+                    .map(str::to_owned)
+                    .into(),
+                    ..LanguageConfig::new("bash", &["sh", "bash"], Some("#"))
+                },
                 // csh is its own language (its control flow differs from bash, so
                 // snippets and shellcheck must treat it separately) and is syntax
                 // highlighted by a regex pass rather than tree-sitter (see
                 // highlight::csh).
-                LanguageConfig::new("csh", &["csh"], Some("#")),
+                LanguageConfig {
+                    filenames: [".cshrc", ".tcshrc", ".login", ".logout"]
+                        .map(str::to_owned)
+                        .into(),
+                    ..LanguageConfig::new("csh", &["csh", "tcsh"], Some("#"))
+                },
                 // Highlighted via the bca-tree-sitter-tcl grammar with a vendored
                 // query (see highlight::grammar / tcl_highlights.scm).
-                LanguageConfig::new("tcl", &["tcl"], Some("#")),
+                // EDA tool inputs written in Tcl ride along: timing constraints
+                // (.sdc, Xilinx .xdc), power intent (.upf, .cpf) and simulator
+                // do-files (.do) are Tcl command scripts, so the grammar fits.
+                LanguageConfig::new(
+                    "tcl",
+                    &["tcl", "tk", "itcl", "tm", "sdc", "xdc", "upf", "cpf", "do"],
+                    Some("#"),
+                ),
                 LanguageConfig {
                     name: "make".to_owned(),
+                    extensions: vec!["mk".to_owned(), "mak".to_owned()],
                     filenames: vec![
                         "Makefile".to_owned(),
                         "makefile".to_owned(),
@@ -233,6 +263,24 @@ mod tests {
         assert!(config.editor.insert_spaces);
         assert_eq!(config.editor.shell.as_deref(), Some("/bin/zsh"));
         assert_eq!(config.editor.large_file_threshold_bytes(), 3 * 1024 * 1024);
+    }
+
+    #[test]
+    fn startup_files_and_tool_dialects_resolve_to_their_language() {
+        let config = Config::default();
+        let language = |path: &str| {
+            config
+                .language_for_path(Path::new(path))
+                .map(|language| language.name.clone())
+        };
+        // Dot-files have no extension as far as Path::extension is concerned, so
+        // they only resolve through the file-name list.
+        assert_eq!(language("/home/u/.cshrc").as_deref(), Some("csh"));
+        assert_eq!(language("/home/u/.bashrc").as_deref(), Some("bash"));
+        // Stubs, and EDA inputs that are Tcl scripts under their own extension.
+        assert_eq!(language("typing.pyi").as_deref(), Some("python"));
+        assert_eq!(language("top.sdc").as_deref(), Some("tcl"));
+        assert_eq!(language("run.do").as_deref(), Some("tcl"));
     }
 
     #[test]

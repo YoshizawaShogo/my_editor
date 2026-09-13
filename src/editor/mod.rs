@@ -2070,10 +2070,11 @@ impl Editor {
         }]
     }
 
-    /// Extensions ctags-based go-to-definition is offered for. These are the
-    /// languages ctags indexes well and that the editor targets; other files fall
-    /// through to nothing rather than spending a scan that can't resolve.
-    const CTAGS_EXTENSIONS: &[&str] = &["rs", "c", "h", "py", "sh", "bash", "csh", "tcl"];
+    /// Languages ctags-based go-to-definition is offered for: the ones ctags
+    /// indexes well and the editor targets. Keyed on the document's language, not
+    /// its extension, so anything the config maps to one of them (`.pyi`, `.sdc`,
+    /// `.cshrc`) qualifies without a second list to keep in step with the first.
+    const CTAGS_LANGUAGES: &[&str] = &["rust", "c", "python", "bash", "csh", "tcl"];
 
     /// Resolve the identifier under the caret with ctags. The fallback path for
     /// buffers without a language server; a no-op unless the file is a ctags
@@ -2090,11 +2091,10 @@ impl Editor {
         let Some(editable) = document.editable_opt() else {
             return Vec::new();
         };
-        let is_target = document.path.as_deref().is_some_and(|path| {
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| Self::CTAGS_EXTENSIONS.contains(&extension))
-        });
+        let is_target = document
+            .language
+            .as_deref()
+            .is_some_and(|language| Self::CTAGS_LANGUAGES.contains(&language));
         if !is_target {
             return Vec::new();
         }

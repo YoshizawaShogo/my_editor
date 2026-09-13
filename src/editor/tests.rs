@@ -3487,6 +3487,27 @@ fn a_remembered_position_is_clamped_when_the_document_shrank_meanwhile() {
 }
 
 #[test]
+fn ctags_definition_is_offered_for_every_file_mapped_to_a_ctags_language() {
+    // The offer used to be keyed on its own extension list, so a file the config
+    // maps to Tcl under another extension (a .sdc constraint file) was coloured
+    // as Tcl yet could not go to a definition.
+    let mut editor = Editor::default();
+    editor.open_paths([PathBuf::from("/tmp/constraints.sdc")]);
+    editor.update(AppEvent::Io(IoEvent::FileLoaded {
+        id: DocumentId(1),
+        result: Ok("create_clock clk\n".to_owned()),
+    }));
+
+    let effects = editor.request_ctags_definition();
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::CtagsDefinition { .. })),
+        "no ctags lookup offered: {effects:?}"
+    );
+}
+
+#[test]
 fn reopening_an_open_file_reuses_the_existing_document() {
     let mut editor = Editor::default();
     editor.open_paths([PathBuf::from("/tmp/dup.rs")]);

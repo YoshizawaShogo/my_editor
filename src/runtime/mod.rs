@@ -1324,11 +1324,23 @@ fn run_shellcheck(path: &Path) -> Vec<crate::lsp::Diagnostic> {
     if crate::status::which("shellcheck").is_none() {
         return Vec::new();
     }
-    let Ok(output) = Command::new("shellcheck")
-        .args(["--format=json1", "--"])
-        .arg(path)
-        .output()
-    else {
+    // shellcheck infers the dialect from the shebang. Startup files like .bashrc
+    // have none, so without a hint every save reported SC2148 ("shell unknown");
+    // the editor has already classified the file as bash, so pass that on.
+    let has_shebang = File::open(path)
+        .ok()
+        .and_then(|file| {
+            let mut first = String::new();
+            BufReader::new(file).read_line(&mut first).ok()?;
+            Some(first.starts_with("#!"))
+        })
+        .unwrap_or(true);
+    let mut command = Command::new("shellcheck");
+    command.arg("--format=json1");
+    if !has_shebang {
+        command.arg("--shell=bash");
+    }
+    let Ok(output) = command.arg("--").arg(path).output() else {
         return Vec::new();
     };
     // shellcheck exits non-zero when it reports findings, so the status is
@@ -1395,7 +1407,11 @@ fn ctags_definition(symbol: &str, root: &Path) -> Option<(PathBuf, u32)> {
             "--output-format=json",
             "--fields=+n",
             "--languages=Python,C,Sh,Rust,Tcl",
-            "--langmap=Sh:+.csh",
+            // Extensions the editor maps to these languages beyond ctags' own
+            // defaults (see Config::default): csh variants under Sh, the EDA Tcl
+            // dialects under Tcl, Python stubs. Extensionless startup files have
+            // nothing to map and stay unindexed.
+            "--langmap=Sh:+.csh.tcsh,Tcl:+.sdc.xdc.upf.cpf.do.tm.itcl,Python:+.pyi.pyw",
             "-R",
             "-f",
             "-",
