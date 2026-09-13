@@ -129,14 +129,17 @@ pub struct Editor {
     /// focus — it is a plain overlay shown while typing a call.
     signature_help: Option<SignatureHelpState>,
     deferred_hover: Option<(DocumentId, CharIdx)>,
-    nav_back: Vec<(DocumentId, CharIdx)>,
-    nav_forward: Vec<(DocumentId, CharIdx)>,
+    /// The Ctrl+E / Ctrl+R stacks: which file pane the caret was in, and where.
+    nav_back: Vec<(Side, DocumentId, CharIdx)>,
+    nav_forward: Vec<(Side, DocumentId, CharIdx)>,
     /// Caret positions to restore once a freshly opened document finishes loading,
     /// used by jumps that open a file whose text is not in memory yet.
     /// Where to put the caret once a freshly opened document loads. A range with
     /// start == end lands a bare caret; a wider one selects, so a jump to a search
     /// hit arrives with the match highlighted rather than silently placing a caret.
-    pending_caret_jumps: HashMap<DocumentId, lsp_types::Range>,
+    /// The side is the pane the jump was aimed at; a pane on the other side showing
+    /// the same document keeps its caret.
+    pending_caret_jumps: HashMap<DocumentId, (Side, lsp_types::Range)>,
     /// Where each document was last seen — caret, selections and scroll — so a
     /// buffer switched away from and back to reopens where it was left rather
     /// than at the top. Written only at the single exit of [`Self::update`], so
@@ -454,7 +457,7 @@ impl Editor {
             AppEvent::CtagsDefinition(event) => match event.location {
                 Some((path, line)) => {
                     let at = lsp_types::Position::new(line, 0);
-                    self.open_path_at(path, lsp_types::Range::new(at, at))
+                    self.open_definition(event.side, path, lsp_types::Range::new(at, at))
                 }
                 None => {
                     self.notify(ToastLevel::Info, "定義が見つかりません");
@@ -709,7 +712,8 @@ impl Editor {
         else {
             return effects;
         };
-        self.pending_caret_jumps.insert(id, range);
+        self.pending_caret_jumps
+            .insert(id, (self.caret_side(), range));
         // 再読込が走らないケース(未保存編集のある既存バッファ)は FileLoaded が
         // 来ないので、その場でジャンプを適用する。
         if !effects
@@ -724,7 +728,7 @@ impl Editor {
     /// Move the caret to the position recorded by [`Self::open_path_at`] now that
     /// the document `id` has loaded and can resolve the UTF-16 LSP column.
     fn apply_pending_caret_jump(&mut self, id: DocumentId) {
-        let Some(range) = self.pending_caret_jumps.remove(&id) else {
+        let Some((side, range)) = self.pending_caret_jumps.remove(&id) else {
             return;
         };
         let Some(document) = self.documents.get(&id) else {
@@ -748,10 +752,13 @@ impl Editor {
                 }
             }
         });
-        for pane in self.layout.panes_mut() {
-            if pane.view.doc != id {
-                continue;
-            }
+        // Only the pane the jump was aimed at: the same file may be open in the
+        // other pane too, showing the usage the jump started from.
+        if let Some(pane) = self
+            .layout
+            .active_editor_mut(Focus::Editor(side))
+            .filter(|pane| pane.view.doc == id)
+        {
             match selection {
                 Some(selection) => pane.view.selections.set_single(selection),
                 // Large files have no editable text to hold a caret; scroll the
@@ -762,6 +769,35 @@ impl Editor {
         if selection.is_some() {
             self.reveal_caret_with_context();
         }
+    }
+
+    /// Open a go-to-definition target in the file pane on `side`, caret on
+    /// `range`. A file that is already open is switched to without re-reading
+    /// it; an unopened one lands once its text arrives.
+    fn open_definition(
+        &mut self,
+        side: Side,
+        path: PathBuf,
+        range: lsp_types::Range,
+    ) -> Vec<Effect> {
+        self.focus_file_pane(side);
+        let Some(doc) = self
+            .documents
+            .iter()
+            .find_map(|(id, document)| (document.path.as_ref() == Some(&path)).then_some(*id))
+        else {
+            return self.open_path_at(path, range);
+        };
+        let view = self.view_for(doc);
+        if let Some(pane) = self.layout.active_editor_mut(self.focus)
+            && pane.view.doc != doc
+        {
+            pane.view = view;
+        }
+        self.pending_caret_jumps
+            .insert(doc, (self.caret_side(), range));
+        self.apply_pending_caret_jump(doc);
+        Vec::new()
     }
 
     pub fn set_workspace_root(&mut self, root: PathBuf) {
@@ -1582,7 +1618,7 @@ impl Editor {
                     }
                 }
                 Some(PendingLsp::Completion { .. }) => {}
-                Some(PendingLsp::Definition) => match result.and_then(|value| {
+                Some(PendingLsp::Definition { side }) => match result.and_then(|value| {
                     serde_json::from_value::<lsp_types::GotoDefinitionResponse>(value)
                         .map_err(|error| error.to_string())
                 }) {
@@ -1604,40 +1640,12 @@ impl Editor {
                             // the caret moved to the symbol.
                             let path =
                                 PathBuf::from(location.uri.as_str().trim_start_matches("file://"));
-                            if let Some((doc, document)) = self
-                                .documents
-                                .iter()
-                                .find(|(_, document)| document.path.as_ref() == Some(&path))
-                            {
-                                let mut view = View::new(*doc);
-                                if let Some(editable) = document.editable_opt() {
-                                    // LSP columns are UTF-16 units, not char indices;
-                                    // using the plain converter drifts the caret on
-                                    // lines with non-ASCII text before the target.
-                                    let index = crate::position::lsp_position_to_char_idx(
-                                        editable.text(),
-                                        location.range.start.line as usize,
-                                        location.range.start.character as usize,
-                                    );
-                                    view.selections.set_single(Selection::caret(index));
-                                }
-                                self.show_only(view);
-                                // The new view starts scrolled to the top; reveal the
-                                // definition with context so its body isn't pushed
-                                // just past the bottom edge.
-                                self.reveal_caret_with_context();
-                            } else {
-                                // The file is not open yet, so its text is not loaded.
-                                // Remember where to land and apply it once the read
-                                // completes, otherwise the caret sits at the top.
-                                effects.extend(self.open_path_at(
-                                    path,
-                                    lsp_types::Range::new(
-                                        location.range.start,
-                                        location.range.start,
-                                    ),
-                                ));
-                            }
+                            let at = location.range.start;
+                            effects.extend(self.open_definition(
+                                side,
+                                path,
+                                lsp_types::Range::new(at, at),
+                            ));
                         }
                     }
                     Err(error) => self.status = Some(format!("定義ジャンプに失敗: {error}")),
@@ -2050,6 +2058,21 @@ impl Editor {
             .any(|word| matches!(word, "use" | "import" | "from"))
     }
 
+    /// The file pane a definition jump opens in. With two files side by side it
+    /// is the other one, so the usage just clicked stays in view beside its
+    /// definition — and following the chain further keeps each hop next to the
+    /// one it came from. Otherwise it is the pane the caret is in.
+    fn definition_side(&self) -> Side {
+        let side = self.caret_side();
+        if !self.layout.is_editor_split() {
+            return side;
+        }
+        match side {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        }
+    }
+
     fn request_definition(&mut self) -> Vec<Effect> {
         let Some((server, path, line, character)) = self.active_lsp_context() else {
             // No language server for this buffer — fall back to ctags.
@@ -2057,7 +2080,8 @@ impl Editor {
         };
         let id = self.next_lsp_request;
         self.next_lsp_request += 1;
-        self.pending_lsp.insert(id, PendingLsp::Definition);
+        let side = self.definition_side();
+        self.pending_lsp.insert(id, PendingLsp::Definition { side });
         vec![Effect::LspRequest {
             server,
             id,
@@ -2107,6 +2131,7 @@ impl Editor {
             doc,
             symbol,
             root: self.workspace_root.clone(),
+            side: self.definition_side(),
         }]
     }
 
@@ -6510,7 +6535,11 @@ enum PendingLsp {
         anchor: CharIdx,
         add_parentheses: bool,
     },
-    Definition,
+    /// `side` is the file pane the definition opens in, fixed at the click so a
+    /// response that arrives after focus has moved still lands where it was aimed.
+    Definition {
+        side: Side,
+    },
     Rename {
         doc: DocumentId,
     },

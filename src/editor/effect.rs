@@ -62,6 +62,8 @@ pub enum Effect {
         doc: DocumentId,
         symbol: String,
         root: PathBuf,
+        /// The file pane the definition opens in, handed back with the result.
+        side: super::Side,
     },
     SpawnLsp {
         server: u64,

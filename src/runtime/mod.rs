@@ -392,12 +392,18 @@ impl Runtime {
                     let _ = tx.send(AppEvent::Shellcheck(ShellcheckEvent { doc, diagnostics }));
                 });
             }
-            Effect::CtagsDefinition { doc, symbol, root } => {
+            Effect::CtagsDefinition {
+                doc,
+                symbol,
+                root,
+                side,
+            } => {
                 let tx = self.tx.clone();
                 tokio::task::spawn_blocking(move || {
                     let location = ctags_definition(&symbol, &root);
                     let _ = tx.send(AppEvent::CtagsDefinition(CtagsDefinitionEvent {
                         doc,
+                        side,
                         location,
                     }));
                 });

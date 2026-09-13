@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::document::{DiskState, DocumentId, LargeFile};
 use crate::lsp::LspEvent;
 
-use super::Command;
+use super::{Command, Side};
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum AppEvent {
@@ -51,10 +51,12 @@ pub struct ShellcheckEvent {
 
 /// The result of a ctags definition lookup. `location` is the target file and its
 /// 0-based line, or None when no matching tag was found (or ctags is absent). The
-/// originating `doc` lets the editor report "not found" against the right buffer.
+/// originating `doc` lets the editor report "not found" against the right buffer,
+/// and `side` is the file pane the request asked the definition to open in.
 #[derive(Debug, Eq, PartialEq)]
 pub struct CtagsDefinitionEvent {
     pub doc: DocumentId,
+    pub side: Side,
     pub location: Option<(std::path::PathBuf, u32)>,
 }
 

@@ -942,6 +942,90 @@ fn ctrl_click_records_the_pre_click_position_not_the_symbol() {
     assert_eq!(editor.current_location(), origin);
 }
 
+/// A Rust file open in both halves of a split: two calls to `helper`, then its
+/// definition on line 2 (char 20).
+fn split_on_helper_calls(editor: &mut Editor) -> (PathBuf, DocumentId) {
+    editor.update(AppEvent::Resize { cols: 80, rows: 10 });
+    let path = PathBuf::from("x.rs");
+    editor.open_paths([path.clone()]);
+    editor.update(AppEvent::TextPaste(
+        "helper();\nhelper();\nfn helper() {}".to_owned(),
+    ));
+    editor.update(Command::ToggleSplit.into());
+    (path, editor.layout.left.view.doc)
+}
+
+fn click_left_pane(editor: &mut Editor, row: u16, modifiers: KeyModifiers) -> Vec<Effect> {
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 7,
+            row,
+            modifiers,
+        },
+        clicks: 1,
+    }))
+}
+
+/// Ctrl+click the call on line 1 of the left pane and answer the ctags lookup
+/// with `helper`'s definition.
+fn jump_to_helper_from_left_pane(editor: &mut Editor, path: PathBuf, doc: DocumentId) {
+    let effects = click_left_pane(editor, 1, KeyModifiers::CONTROL);
+    let side = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::CtagsDefinition { side, .. } => Some(*side),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected a ctags lookup, got {effects:?}"));
+    editor.update(AppEvent::CtagsDefinition(CtagsDefinitionEvent {
+        doc,
+        side,
+        location: Some((path, 2)),
+    }));
+}
+
+#[test]
+fn ctrl_click_in_a_split_opens_the_definition_beside_the_usage() {
+    let mut editor = Editor::default();
+    let (path, doc) = split_on_helper_calls(&mut editor);
+
+    jump_to_helper_from_left_pane(&mut editor, path, doc);
+
+    // The definition opens in the right pane, which takes the caret…
+    assert_eq!(editor.focus, Focus::Editor(Side::Right));
+    assert_eq!(editor.current_location(), Some((doc, CharIdx(20))));
+    // …while the left pane, showing the same file, stays on the clicked call.
+    let usage = editor.layout.left.view.selections.primary().head;
+    assert_eq!(
+        editor.documents[&doc]
+            .editable_opt()
+            .unwrap()
+            .text()
+            .char_to_line(usage.0),
+        1
+    );
+}
+
+#[test]
+fn back_from_a_definition_beside_the_usage_returns_to_the_usage_pane() {
+    let mut editor = Editor::default();
+    let (path, doc) = split_on_helper_calls(&mut editor);
+    click_left_pane(&mut editor, 0, KeyModifiers::NONE);
+    let origin = editor.current_location();
+
+    jump_to_helper_from_left_pane(&mut editor, path, doc);
+    let definition = editor.current_location();
+
+    editor.update(Command::NavigateBack.into());
+    assert_eq!(editor.focus, Focus::Editor(Side::Left));
+    assert_eq!(editor.current_location(), origin);
+
+    editor.update(Command::NavigateForward.into());
+    assert_eq!(editor.focus, Focus::Editor(Side::Right));
+    assert_eq!(editor.current_location(), definition);
+}
+
 #[test]
 fn replace_is_off_until_the_checkbox_is_ticked() {
     let mut editor = Editor::default();
@@ -1826,7 +1910,9 @@ fn semantic_tokens_use_server_legend_names_instead_of_numeric_slots() {
 fn definition_jump_to_unopened_file_lands_on_utf16_position() {
     let mut editor = Editor::default();
     // Stand in for a pending textDocument/definition request.
-    editor.pending_lsp.insert(7, PendingLsp::Definition);
+    editor
+        .pending_lsp
+        .insert(7, PendingLsp::Definition { side: Side::Left });
 
     let path = std::path::PathBuf::from("/tmp/def_target.rs");
     editor.update(AppEvent::Lsp(LspEvent::Response {
@@ -1865,7 +1951,9 @@ fn definition_jump_to_unopened_file_lands_on_utf16_position() {
 fn definition_jump_scrolls_the_target_line_into_view() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 10 });
-    editor.pending_lsp.insert(7, PendingLsp::Definition);
+    editor
+        .pending_lsp
+        .insert(7, PendingLsp::Definition { side: Side::Left });
 
     let path = std::path::PathBuf::from("/tmp/far_target.rs");
     editor.update(AppEvent::Lsp(LspEvent::Response {

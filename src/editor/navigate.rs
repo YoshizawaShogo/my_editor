@@ -4,25 +4,57 @@ use crate::document::{Document, DocumentId};
 use crate::position::CharIdx;
 use crate::view::{Selection, View};
 
+use super::{Focus, Side};
+
 impl super::Editor {
     pub(super) fn current_location(&self) -> Option<(DocumentId, CharIdx)> {
         let pane = self.layout.active_editor(self.focus)?;
         Some((pane.view.doc, pane.view.selections.primary().head))
     }
 
-    /// Remember the caret's current spot before a jump so Ctrl+E can return to it.
+    /// The file pane the caret is in. A right-side focus over a right half that
+    /// holds no file resolves to the left pane, the same way `active_editor` does.
+    pub(super) fn caret_side(&self) -> Side {
+        match self.focus {
+            Focus::Editor(Side::Right) | Focus::Completion(Side::Right)
+                if self.layout.right_editor().is_some() =>
+            {
+                Side::Right
+            }
+            _ => Side::Left,
+        }
+    }
+
+    /// Put the caret in the file pane on `side` — the left one when the right
+    /// half no longer holds a file. Focus is left alone when the caret is already
+    /// there, so the find pane keeps holding it as an overlay.
+    pub(super) fn focus_file_pane(&mut self, side: Side) {
+        let side = if self.layout.right_editor().is_some() {
+            side
+        } else {
+            Side::Left
+        };
+        if side != self.caret_side() {
+            self.focus = Focus::Editor(side);
+        }
+    }
+
+    /// Remember the caret's current spot, and the pane it is in, before a jump so
+    /// Ctrl+E can return to it.
     pub(super) fn record_jump_origin(&mut self) {
-        let Some(location) = self.current_location() else {
+        let Some((doc, head)) = self.current_location() else {
             return;
         };
+        let location = (self.caret_side(), doc, head);
         if let Some(&last) = self.nav_back.last() {
             if last == location {
                 return;
             }
-            // Collapse consecutive origins on the same line, so moving or clicking
-            // around within one line does not fill the back-stack with near-
-            // duplicates that each need a separate Ctrl+E to step past.
-            if last.0 == location.0 && self.same_line(location.0, last.1, location.1) {
+            // Collapse consecutive origins on the same line of the same pane, so
+            // moving or clicking around within one line does not fill the
+            // back-stack with near-duplicates that each need a separate Ctrl+E to
+            // step past.
+            if (last.0, last.1) == (location.0, location.1) && self.same_line(doc, last.2, head) {
                 *self.nav_back.last_mut().expect("checked non-empty") = location;
                 self.nav_forward.clear();
                 return;
@@ -49,15 +81,16 @@ impl super::Editor {
 
     /// Ctrl+E / Ctrl+R: step back and forward through visited caret locations.
     pub(super) fn navigate_history(&mut self, back: bool) {
-        let Some(current) = self.current_location() else {
+        let Some((doc, head)) = self.current_location() else {
             return;
         };
+        let current = (self.caret_side(), doc, head);
         let target = if back {
             self.nav_back.pop()
         } else {
             self.nav_forward.pop()
         };
-        let Some((doc, head)) = target else {
+        let Some((side, doc, head)) = target else {
             self.status = Some(if back {
                 "戻る履歴がありません".to_owned()
             } else {
@@ -75,6 +108,10 @@ impl super::Editor {
         } else {
             self.nav_back.push(current);
         }
+        // Return to the pane the caret was in rather than landing in whichever
+        // one has focus now: a jump that crossed panes — a definition opened
+        // beside its usage — steps back across them too.
+        self.focus_file_pane(side);
         self.go_to_location(doc, head);
     }
 
