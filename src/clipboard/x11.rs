@@ -106,6 +106,20 @@ impl X11Clipboard {
         Some(Self { shared })
     }
 
+    /// Whether a copy could be handed to an X server here: the display it would
+    /// talk to, or why it could not. Connects and hangs up again, claiming
+    /// nothing, so `--status` can answer this without owning the clipboard.
+    pub fn probe() -> Result<String, String> {
+        let display = std::env::var("DISPLAY").unwrap_or_default();
+        if display.is_empty() {
+            return Err("DISPLAY unset".to_owned());
+        }
+        match x11rb::connect(None) {
+            Ok(_) => Ok(format!("DISPLAY={display}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     /// Claim the clipboard and offer `text` from now on.
     ///
     /// The claim is confirmed against the server rather than assumed: a refused

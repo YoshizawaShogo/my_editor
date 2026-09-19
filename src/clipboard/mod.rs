@@ -1,6 +1,32 @@
+mod wayland;
 mod x11;
 
 pub use x11::X11Clipboard;
+
+/// Where one clipboard backend stands, for `my_editor --status` to report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendStatus {
+    pub name: &'static str,
+    /// `Ok` carries what a copy would be handed to; `Err` why it would not —
+    /// including "the editor does not implement this", which is Wayland's answer.
+    pub state: Result<String, String>,
+}
+
+/// Every clipboard backend and its standing here, in the order the editor picks
+/// them. Probes the display server, so this belongs to a command being run, not
+/// to rendering.
+pub fn backend_status() -> Vec<BackendStatus> {
+    vec![
+        BackendStatus {
+            name: "x11",
+            state: X11Clipboard::probe(),
+        },
+        BackendStatus {
+            name: "wayland",
+            state: Err(wayland::unavailability()),
+        },
+    ]
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Register {

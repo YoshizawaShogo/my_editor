@@ -1,5 +1,5 @@
 use my_editor::{
-    Result, config::Config, error::install_panic_hook, runtime::Runtime, status,
+    Result, clipboard, config::Config, error::install_panic_hook, runtime::Runtime, status,
     terminal::TerminalSession,
 };
 use std::path::PathBuf;
@@ -40,7 +40,12 @@ fn run() -> Result<()> {
             && std::env::var_os("NO_COLOR").is_none();
         print!(
             "{}",
-            status::tool_report(&Config::default(), status::which, color)
+            status::tool_report(
+                &Config::default(),
+                status::which,
+                &clipboard::backend_status(),
+                color
+            )
         );
         return Ok(());
     }
