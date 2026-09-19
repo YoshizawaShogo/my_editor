@@ -36,9 +36,19 @@ fn move_character(text: &Rope, index: CharIdx, direction: Direction) -> CharIdx 
 
 fn move_line(text: &Rope, index: CharIdx, direction: Direction) -> CharIdx {
     let (line, col) = char_idx_to_line_col(text, index);
+    let last_line = text.len_lines().saturating_sub(1);
     let target = match direction {
-        Direction::Up => line.saturating_sub(1),
-        Direction::Down => (line + 1).min(text.len_lines().saturating_sub(1)),
+        // At the edges of the document there is no line to move to, so the press
+        // goes to the edge of the line instead of doing nothing: Up on the first
+        // line lands on its start, Down on the last on its end. Not the smart-home
+        // toggle that the Home key does — an arrow that bounced between two spots
+        // on repeated presses would be its own surprise.
+        Direction::Up if line == 0 => return line_col_to_char_idx(text, 0, 0),
+        Direction::Down if line == last_line => {
+            return line_col_to_char_idx(text, last_line, usize::MAX);
+        }
+        Direction::Up => line - 1,
+        Direction::Down => line + 1,
         Direction::Left => return line_col_to_char_idx(text, line, 0),
         Direction::Right => return line_col_to_char_idx(text, line, usize::MAX),
     };
@@ -209,6 +219,48 @@ mod tests {
             false,
         );
         assert_eq!(from_start.head, CharIdx(4));
+    }
+
+    #[test]
+    fn vertical_movement_at_the_document_edges_goes_to_the_line_edge() {
+        let text = Rope::from_str("first line\nsecond");
+        let up = |from, extend| {
+            move_head(
+                &text,
+                Selection::caret(CharIdx(from)),
+                Direction::Up,
+                Unit::Character,
+                extend,
+            )
+        };
+
+        // Up on the first line: nowhere to go, so it lands on the line start.
+        assert_eq!(up(5, false).head, CharIdx(0));
+        // Repeating it stays there rather than toggling like Home does.
+        assert_eq!(up(0, false).head, CharIdx(0));
+        // Shift+Up keeps the anchor, so the run to the start is selected.
+        let extended = up(5, true);
+        assert_eq!((extended.anchor, extended.head), (CharIdx(5), CharIdx(0)));
+
+        // Down on the last line lands on its end.
+        let down = move_head(
+            &text,
+            Selection::caret(CharIdx(13)),
+            Direction::Down,
+            Unit::Character,
+            false,
+        );
+        assert_eq!(down.head, CharIdx(17));
+
+        // A line in the middle still moves by line, keeping the column.
+        let middle = move_head(
+            &text,
+            Selection::caret(CharIdx(3)),
+            Direction::Down,
+            Unit::Character,
+            false,
+        );
+        assert_eq!(middle.head, CharIdx(14));
     }
 
     #[test]
