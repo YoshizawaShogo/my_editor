@@ -707,6 +707,16 @@ impl Runtime {
                     },
                     "textDocument": {
                         "hover": {"contentFormat": ["markdown", "plaintext"]},
+                        // No resolveSupport: without it a server has to send
+                        // additionalTextEdits (the `use` line an auto-import
+                        // needs) with the item itself, and we never have to
+                        // resolve an item before applying it.
+                        "completion": {
+                            "completionItem": {
+                                "snippetSupport": true,
+                                "documentationFormat": ["markdown", "plaintext"]
+                            }
+                        },
                         "signatureHelp": {
                             "signatureInformation": {
                                 "documentationFormat": ["markdown", "plaintext"]

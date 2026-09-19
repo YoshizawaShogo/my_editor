@@ -3957,6 +3957,122 @@ fn markdown_status_does_not_report_the_workspace_rust_lsp() {
     );
 }
 
+/// A buffer with a ready language server, for driving completion responses by
+/// hand.
+fn editor_with_lsp() -> Editor {
+    let mut editor = Editor::default();
+    let document = editor.documents.get_mut(&DocumentId(0)).unwrap();
+    document.path = Some(PathBuf::from("main.rs"));
+    document.language = Some("rust".to_owned());
+    let server = editor.test_register_server("rust", 1);
+    server.spawned = true;
+    server.ready = true;
+    editor.test_open_doc(DocumentId(0), 1);
+    editor
+}
+
+/// Ask for completion and answer with `items`, as the server would.
+fn complete_with(editor: &mut Editor, items: serde_json::Value) {
+    let request = editor
+        .request_completion(true)
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::LspRequest { id, .. } => Some(id),
+            _ => None,
+        })
+        .expect("a completion request");
+    editor.update(AppEvent::Lsp(LspEvent::Response {
+        id: request,
+        result: Ok(items),
+    }));
+}
+
+#[test]
+fn completion_replaces_the_span_the_server_names() {
+    // The server asks to replace `s.push`, not just the word under the caret,
+    // which is what counting the typed prefix would have given.
+    let mut editor = editor_with_lsp();
+    editor.update(AppEvent::TextPaste("s.push".to_owned()));
+
+    complete_with(
+        &mut editor,
+        serde_json::json!([{
+            "label": "push_str",
+            "textEdit": {
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 6}
+                },
+                "newText": "push_str"
+            }
+        }]),
+    );
+    editor.update(Command::PickerConfirm.into());
+
+    assert_eq!(editor.active_buffer().unwrap().text.to_string(), "push_str");
+}
+
+#[test]
+fn completion_applies_the_extra_edits_that_come_with_it() {
+    // An auto-import: the item inserts `HashMap` and the `use` line above it.
+    let mut editor = editor_with_lsp();
+    editor.update(AppEvent::TextPaste("\nHashM".to_owned()));
+
+    complete_with(
+        &mut editor,
+        serde_json::json!([{
+            "label": "HashMap",
+            "additionalTextEdits": [{
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 0}
+                },
+                "newText": "use std::collections::HashMap;\n"
+            }]
+        }]),
+    );
+    editor.update(Command::PickerConfirm.into());
+
+    let buffer = editor.active_buffer().unwrap();
+    assert_eq!(
+        buffer.text.to_string(),
+        "use std::collections::HashMap;\n\nHashMap"
+    );
+    // The caret rode over the inserted line instead of staying on its old index.
+    assert_eq!(
+        buffer.view.selections.primary().head,
+        CharIdx(buffer.text.len_chars())
+    );
+}
+
+#[test]
+fn a_snippet_completion_expands_its_placeholder() {
+    let mut editor = editor_with_lsp();
+    editor.update(AppEvent::TextPaste("wi".to_owned()));
+
+    complete_with(
+        &mut editor,
+        serde_json::json!([{
+            "label": "with_capacity(…)",
+            "insertTextFormat": 2,
+            "textEdit": {
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 2}
+                },
+                "newText": "with_capacity(${1:capacity})"
+            }
+        }]),
+    );
+    editor.update(Command::PickerConfirm.into());
+
+    let buffer = editor.active_buffer().unwrap();
+    assert_eq!(buffer.text.to_string(), "with_capacity(capacity)");
+    // The placeholder is selected, so typing replaces it.
+    let selection = buffer.view.selections.primary();
+    assert_eq!((selection.range().start, selection.range().end), (14, 22));
+}
+
 #[test]
 fn completion_excludes_the_candidate_identical_to_the_typed_prefix() {
     let mut editor = Editor::default();

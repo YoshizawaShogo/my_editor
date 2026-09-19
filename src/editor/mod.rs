@@ -1552,6 +1552,24 @@ impl Editor {
                             .get(&doc)
                             .and_then(|document| document.language.clone());
                         let matcher = SkimMatcherV2::default();
+                        // Positions in the response are in the coordinates of the
+                        // version the request was made against, which the guard
+                        // above has just confirmed is still the current one.
+                        let text = self
+                            .documents
+                            .get(&doc)
+                            .and_then(Document::editable_opt)
+                            .map(|editable| editable.text().clone());
+                        let to_char_idx = |position: lsp_types::Position| {
+                            text.as_ref().map(|text| {
+                                crate::position::lsp_position_to_char_idx(
+                                    text,
+                                    position.line as usize,
+                                    position.character as usize,
+                                )
+                                .0
+                            })
+                        };
                         let mut items: Vec<_> = match response {
                             lsp_types::CompletionResponse::Array(items) => items,
                             lsp_types::CompletionResponse::List(list) => list.items,
@@ -1567,12 +1585,43 @@ impl Editor {
                             } else {
                                 matcher.fuzzy_match(&filter, &prefix)?
                             };
-                            let mut insert = item
-                                .insert_text
-                                .clone()
+                            // A textEdit carries both the text and the span it
+                            // replaces, and takes precedence over insertText: the
+                            // server knows what it is replacing (a dotted path, a
+                            // half-typed field) better than a count of the word
+                            // under the caret does.
+                            let edit = item.text_edit.as_ref().map(|edit| match edit {
+                                lsp_types::CompletionTextEdit::Edit(edit) => {
+                                    (edit.range, edit.new_text.clone())
+                                }
+                                // Insert, not replace: the caret-anchored
+                                // insertion leaves whatever follows it alone.
+                                lsp_types::CompletionTextEdit::InsertAndReplace(edit) => {
+                                    (edit.insert, edit.new_text.clone())
+                                }
+                            });
+                            let mut insert = edit
+                                .as_ref()
+                                .map(|(_, text)| text.clone())
+                                .or_else(|| item.insert_text.clone())
                                 .unwrap_or_else(|| item.label.clone());
+                            // Only the part of the span before the caret: that is
+                            // what the insertion is anchored to. `anchor` is where
+                            // the typed word starts, so the caret sits at its end.
+                            let caret = anchor.0 + prefix.chars().count();
+                            let prefix_len = edit
+                                .as_ref()
+                                .and_then(|(range, _)| to_char_idx(range.start))
+                                .filter(|start| *start <= caret)
+                                .map_or_else(|| prefix.chars().count(), |start| caret - start);
+                            // A snippet places its own caret and parentheses, so
+                            // it is expanded rather than inserted verbatim.
+                            let snippet = item.insert_text_format
+                                == Some(lsp_types::InsertTextFormat::SNIPPET);
                             let callable = kind_is_callable(item.kind, language.as_deref());
-                            if callable && add_parentheses && !insert.contains('(') {
+                            let parenthesize =
+                                !snippet && callable && add_parentheses && !insert.contains('(');
+                            if parenthesize {
                                 insert.push_str("()");
                             }
                             // Drop a candidate only when picking it would change
@@ -1583,16 +1632,32 @@ impl Editor {
                                 return None;
                             }
                             let cursor_back = usize::from(
-                                callable && add_parentheses && insert.trim_end().ends_with("()"),
+                                !snippet
+                                    && callable
+                                    && add_parentheses
+                                    && insert.trim_end().ends_with("()"),
                             );
+                            let additional_edits = item
+                                .additional_text_edits
+                                .iter()
+                                .flatten()
+                                .filter_map(|edit| {
+                                    Some((
+                                        to_char_idx(edit.range.start)?
+                                            ..to_char_idx(edit.range.end)?,
+                                        edit.new_text.clone(),
+                                    ))
+                                })
+                                .collect();
                             Some((
                                 score,
                                 CompletionCandidate {
+                                    snippet_body: snippet.then(|| insert.clone()),
                                     insert,
                                     cursor_back,
                                     label: item.label,
-                                    prefix_len: prefix.chars().count(),
-                                    snippet_body: None,
+                                    prefix_len,
+                                    additional_edits,
                                 },
                             ))
                         })
@@ -1985,6 +2050,7 @@ impl Editor {
                 label: word.to_owned(),
                 prefix_len,
                 snippet_body: None,
+                additional_edits: Vec::new(),
             });
         // Snippets rank above buffer words so `for`, `if`, … stay reachable.
         let language = self
@@ -2748,6 +2814,52 @@ impl Editor {
             .editable_mut()
             .insert_fragments(&mut selections, &replacements);
         self.mark_doc_dirty(doc);
+    }
+
+    /// Apply the edits a completion carries besides its own insertion — the
+    /// `use` line an auto-import needs. They are applied before the insertion,
+    /// while their char ranges still describe the text, and the caret is carried
+    /// over whatever they added ahead of it.
+    fn apply_completion_edits(&mut self, edits: Vec<(std::ops::Range<usize>, String)>) {
+        if edits.is_empty() {
+            return;
+        }
+        let focus = self.focus;
+        let Some(pane) = self.layout.active_editor(focus) else {
+            return;
+        };
+        let doc = pane.view.doc;
+        let caret = pane.view.selections.primary().head.0;
+        let shift: isize = edits
+            .iter()
+            .filter(|(range, _)| range.end <= caret)
+            .map(|(range, text)| text.chars().count() as isize - (range.end - range.start) as isize)
+            .sum();
+        let selections: Vec<_> = edits
+            .iter()
+            .map(|(range, _)| Selection {
+                anchor: CharIdx(range.start),
+                head: CharIdx(range.end),
+            })
+            .collect();
+        let replacements: Vec<_> = edits.into_iter().map(|(_, text)| text).collect();
+        let mut selections = crate::view::Selections::from_vec(selections, 0);
+        let Some(document) = self.documents.get_mut(&doc) else {
+            return;
+        };
+        if document.editable_opt().is_none() {
+            return;
+        }
+        document
+            .editable_mut()
+            .insert_fragments(&mut selections, &replacements);
+        self.mark_doc_dirty(doc);
+        if let Some(pane) = self.layout.active_editor_mut(focus) {
+            let moved = usize::try_from(caret as isize + shift).unwrap_or(0);
+            pane.view
+                .selections
+                .set_single(Selection::caret(CharIdx(moved)));
+        }
     }
 
     fn document_for_uri(&self, uri: &str) -> Option<DocumentId> {
@@ -5262,7 +5374,12 @@ impl Editor {
         if let Some(completion) = self.completion.take() {
             if let Some(candidate) = completion.items.get(completion.selected) {
                 let prefix_len = candidate.prefix_len;
+                let additional_edits = candidate.additional_edits.clone();
                 self.focus = Focus::Editor(completion.return_side);
+                // The extra edits go in first: they are in the coordinates of the
+                // text as it stands now, which the insertion below is about to
+                // shift out from under them.
+                self.apply_completion_edits(additional_edits);
                 if let Some(body) = candidate.snippet_body.clone() {
                     self.expand_snippet_body(&body, prefix_len);
                 } else {
@@ -5867,6 +5984,7 @@ fn snippet_candidates(language: &str, prefix: &str) -> Vec<CompletionCandidate> 
             prefix_len,
             cursor_back: 0,
             snippet_body: Some(snippet.body.to_owned()),
+            additional_edits: Vec::new(),
         })
         .collect()
 }
@@ -6776,6 +6894,9 @@ struct CompletionCandidate {
     insert: String,
     prefix_len: usize,
     cursor_back: usize,
+    /// Edits the server wants applied alongside the insertion — the `use` line an
+    /// auto-import adds — as char ranges resolved when the response arrived.
+    additional_edits: Vec<(std::ops::Range<usize>, String)>,
     /// When set, confirming expands this snippet body instead of inserting
     /// `insert` verbatim (see [`Editor::expand_snippet_body`]).
     snippet_body: Option<String>,
