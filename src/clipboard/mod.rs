@@ -1,3 +1,7 @@
+mod x11;
+
+pub use x11::X11Clipboard;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Register {
     fragments: Vec<String>,

@@ -572,7 +572,7 @@ VSCode ライクでも全ショートカットは実装しない。**右手は�
 | `Tab` / `Shift+Tab` | インデント / アンインデント | 選択行 |
 | `Ctrl+/` , `Ctrl+Q` | コメントトグル | **2 キー割当**。右手マウスで範囲選択中に左手でコメントできるよう `Ctrl+Q` を併設 |
 | `Ctrl+Z` / `Ctrl+Y` | undo / redo | |
-| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | コピー / カット / ペースト | 内部＋OSC52。選択なしの`Ctrl+C`は現在行をlinewiseコピー |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | コピー / カット / ペースト | 内部＋X11クリップボード（＋任意でOSC52）。選択なしの`Ctrl+C`は現在行をlinewiseコピー |
 | `Ctrl+S` | 保存 | |
 | `Ctrl+W` | バッファを閉じる | 未保存なら `Confirm`（§4.6） |
 | `Ctrl+T` | ファイルピッカー（カレントディレクトリ以下） | 再押下で閉じる。`ignore`走査。`Ctrl+P`はコマンドパレットに使用 |
@@ -802,7 +802,12 @@ struct EdgeSummary { errors: usize, warnings: usize, git_changes: usize, search_
 ## 10. クリップボード
 
 - **内部レジスタ** `Register` を常に保持（マルチカーソル対応のため行/複数片も保持可能）。
-- yank/copy 時、内部レジスタは常に更新する。加えて設定 `editor.osc52_clipboard` が有効なときだけ `Effect::ClipboardOsc52(text)` を発行し、OSC52 エスケープで **手元端末（SSH クライアント側）のシステムクリップボード**へ転送する。**既定は無効**（OSC52 非対応の端末や、クリップボード・パススルー未設定の tmux/screen 越しでは生シーケンスが画面に化けるため）。対応端末で有効化するとエディタのコピーがそのままシステムクリップボードへ入る。無効でも内部レジスタによるエディタ内コピー&ペーストは常に動作する。
+- yank/copy 時、内部レジスタは常に更新する。加えて `Effect::ClipboardSystem(text)` を**常に**発行し、X11 の `CLIPBOARD` セレクションへ渡す（設定不要）。
+- **X11 セレクションは自前実装**（`clipboard/x11.rs`、`x11rb`）。X11 にクリップボードへの push は無く、**コピーした側がデータを保持し、貼り付け時に要求されてから渡す**。`xclip`/`xsel` が裏でプロセスを残すのはこのためで、常駐するエディタは自分で所有者になれる。よって**外部コマンドには依存しない**。非表示ウィンドウで `CLIPBOARD` の所有権を取り、専用スレッドが `SelectionRequest` に `TARGETS`/`UTF8_STRING`/`text/plain;charset=utf-8`/`STRING` で応答する。`SelectionClear`（他クライアントが所有権を取得）で保持テキストを捨てる。
+  - **Wayland は実装しない**。コアprotocolでセレクションを設定するにはフォーカスのあるサーフェスから得た input serial が必要で、TUI は自分のサーフェスを持たない。`wlr/ext-data-control` があれば可能だが GNOME は非対応。Wayland セッションにはほぼ必ず XWayland がいる（WSLg も `DISPLAY` が生きている）ので X11 経路で賄う。
+  - **OSC52 へのフォールバックはしない**。非対応端末では画面が化け、対応しているかを端末に問い合わせる術も無い（書き込みは応答を返さず、読み出しクエリは既定で無効な端末が多く偽陰性になる）。
+  - 失敗は必ず可視化する（トースト）。X11 へ接続できない場合はコピー時に1回だけ知らせ、以後は黙る。INCR 転送は未実装で、1リクエストに収まらない大きさはコピー時点で拒否して理由を出す。
+- 加えて設定 `editor.osc52_clipboard` が有効なときだけ `Effect::ClipboardOsc52(text)` を発行し、OSC52 エスケープで **手元端末（SSH クライアント側）のシステムクリップボード**へ転送する。**既定は無効**（OSC52 非対応の端末や、クリップボード・パススルー未設定の tmux/screen 越しでは生シーケンスが画面に化けるため）。対応端末で有効化するとエディタのコピーがそのままシステムクリップボードへ入る。無効でも内部レジスタによるエディタ内コピー&ペーストは常に動作する。
 - 選択が全て空の`Ctrl+C`は、各カーソルの論理行を改行付きのlinewiseレジスタとしてコピーする。linewise pasteはカーソル行の行頭へ挿入し、行の途中へ内容を割り込ませない。選択があれば従来どおり選択範囲を文字単位でコピーする。
 - paste は内部レジスタから（端末→アプリ方向の OSC52 read は端末対応が不安定なため使わない）。ブラケットペーストは端末の貼り付けとして受け、複数行を 1 編集として扱う。
 
@@ -840,7 +845,7 @@ tab_size = 4
 insert_spaces = true
 shell = "/path/to/shell"          # 省略時は $SHELL、さらに無ければ /bin/sh
 large_file_threshold = "10MiB"   # これを超えると less 相当の読み取り専用で開く（§4.2.1）
-osc52_clipboard = false           # OSC52でOSクリップボードへコピー（§10）。既定OFF。対応端末で有効化
+osc52_clipboard = false           # OSC52でも転送するか（§10）。既定OFF。X11クリップボードは設定不要で常に有効
 
 [search]                          # Ctrl+F / Ctrl+H の Directory スコープ既定（§13）
 respect_ignore_files = true       # .gitignore / .ignore を尊重
@@ -1106,7 +1111,9 @@ src/
   highlight/
     mod.rs                # Highlighter enum・選択規則
     tree_sitter.rs        # 文法バンドル・増分パース・クエリ着色
-  clipboard.rs            # Register, OSC52
+  clipboard/
+    mod.rs                # Register
+    x11.rs                # X11 CLIPBOARD セレクションの所有（§10）
   config/
     mod.rs                # 読込・serdeスキーマ
     language.rs           # 言語判定（拡張子→LanguageId）
@@ -1163,7 +1170,7 @@ src/
   - undo 永続化のプライバシー → **0700/0600**（§4.5.1）。
   - LSP × マルチカーソル → **primary のみ（MVP）**（§8.3, §8.5）。
   - workspace_root → **cwd 基準・上位 `.git` を root**（§11.3）。
-  - OSC52 制約 → **放置**（内部レジスタが真実源, §10）。
+  - OSC52 制約 → **放置**（内部レジスタが真実源, §10）。OS クリップボードは X11 セレクションを自前で所有して賄う（§10）。
   - 端末のキーエンコーディング限界 → **いったん放置**（実機で取れない組合せが出たら再検討）。
 - 追加決定（本バッチ）:
   - 終了 = **F4**、バッファを閉じる = **Ctrl+W**（§7.4）。

@@ -18,6 +18,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use crate::{
     Result,
+    clipboard::X11Clipboard,
     config::Config,
     document::{DiskState, LargeFile},
     editor::{
@@ -41,6 +42,12 @@ pub struct Runtime {
     lsp: std::collections::HashMap<u64, LspHandle>,
     shell: Option<ShellHandle>,
     rendered_line_count: usize,
+    /// Owns the X11 `CLIPBOARD` selection while the editor runs; `None` when
+    /// there is no X server, which leaves copies internal to the editor.
+    clipboard: Option<X11Clipboard>,
+    /// Whether the user has been told that there is no clipboard to copy to.
+    /// Said once: every copy would otherwise nag about the same thing.
+    clipboard_absence_reported: bool,
 }
 
 impl Runtime {
@@ -64,7 +71,30 @@ impl Runtime {
             lsp: std::collections::HashMap::new(),
             shell: None,
             rendered_line_count: 1,
+            clipboard: X11Clipboard::spawn(),
+            clipboard_absence_reported: false,
         }
+    }
+
+    /// Hand copied text to the OS clipboard, saying so when that cannot be done.
+    /// A copy that silently goes nowhere is worse than no OS clipboard at all: the
+    /// register still holds the text, so the editor's own paste keeps working and
+    /// the user only finds out at the paste in another application.
+    fn copy_to_os_clipboard(&mut self, text: &str) {
+        let message = match &self.clipboard {
+            Some(clipboard) => match clipboard.set(text) {
+                Ok(()) => return,
+                Err(error) => format!("クリップボードへのコピーに失敗: {error}"),
+            },
+            None => {
+                if self.clipboard_absence_reported {
+                    return;
+                }
+                self.clipboard_absence_reported = true;
+                "X11へ接続できないため、コピーはエディタ内だけです".to_owned()
+            }
+        };
+        let _ = self.tx.send(AppEvent::Error(message));
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -556,6 +586,7 @@ impl Runtime {
                     }
                 }
             }
+            Effect::ClipboardSystem(text) => self.copy_to_os_clipboard(&text),
             Effect::ClipboardOsc52(text) => self.terminal.copy_osc52(&text)?,
             Effect::Quit => {}
         }
