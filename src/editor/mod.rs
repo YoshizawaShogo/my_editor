@@ -3179,6 +3179,16 @@ impl Editor {
 
     fn toggle_shell(&mut self) -> Vec<Effect> {
         if self.layout.is_shell() {
+            // With the pane open, the first press moves the caret into it: Ctrl+O
+            // from the document used to hide the shell that was being read, which
+            // is never what a press from over there asks for. Only a press from
+            // inside the shell hides it, the way Ctrl+` behaves in VS Code.
+            if self.focus != Focus::Shell {
+                self.focus = Focus::Shell;
+                self.dismiss_hover();
+                self.dirty = true;
+                return Vec::new();
+            }
             // Hide the pane only. The session keeps running so that reopening
             // comes back to the same shell with its scrollback intact.
             self.set_right_pane(None);

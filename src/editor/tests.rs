@@ -77,6 +77,28 @@ fn opening_a_right_pane_replaces_whichever_one_was_there() {
 }
 
 #[test]
+fn ctrl_o_moves_focus_into_an_open_shell_before_hiding_it() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+    open_shell(&mut editor);
+    assert_eq!(editor.focus, Focus::Shell);
+
+    // Reading the shell while editing: the pane is open, the caret is not in it.
+    editor.focus = Focus::Editor(Side::Left);
+    editor.update(Command::ToggleShell.into());
+    assert!(
+        editor.shell_visible(),
+        "Ctrl+O from the document must not hide the shell being read"
+    );
+    assert_eq!(editor.focus, Focus::Shell);
+
+    // From inside the shell, the same key hides it again.
+    editor.update(Command::ToggleShell.into());
+    assert!(!editor.shell_visible());
+    assert_eq!(editor.focus, Focus::Editor(Side::Left));
+}
+
+#[test]
 fn a_replaced_shell_session_cannot_tear_down_its_successor() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 24 });
