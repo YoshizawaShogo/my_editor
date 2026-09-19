@@ -77,6 +77,58 @@ fn opening_a_right_pane_replaces_whichever_one_was_there() {
 }
 
 #[test]
+fn esc_closes_the_hover_popup_before_touching_the_selection() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::TextPaste("hello world".to_owned()));
+    editor.update(Command::SelectAll.into());
+    editor.hover = Some("診断: Syntax Error: expected type".to_owned());
+
+    editor.update(Command::CollapseSelections.into());
+
+    assert!(editor.hover_view().is_none());
+    assert!(
+        !editor
+            .active_buffer()
+            .unwrap()
+            .view
+            .selections
+            .primary()
+            .is_caret(),
+        "the press that closed the popup must not also drop the selection"
+    );
+
+    // With the popup gone, Esc collapses as it always did.
+    editor.update(Command::CollapseSelections.into());
+    assert!(
+        editor
+            .active_buffer()
+            .unwrap()
+            .view
+            .selections
+            .primary()
+            .is_caret()
+    );
+}
+
+#[test]
+fn moving_the_caret_closes_the_hover_popup() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::TextPaste("hello".to_owned()));
+    editor.hover = Some("診断: Syntax Error: expected type".to_owned());
+
+    editor.update(
+        Command::Move {
+            direction: Direction::Left,
+            unit: Unit::Character,
+            extend: false,
+        }
+        .into(),
+    );
+
+    assert!(editor.hover_view().is_none());
+}
+
+#[test]
 fn ctrl_o_moves_focus_into_an_open_shell_before_hiding_it() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 24 });

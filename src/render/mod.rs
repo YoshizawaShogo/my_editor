@@ -354,6 +354,7 @@ fn draw_hover(frame: &mut Frame<'_>, editor: &Editor, text: &str) {
         line_count,
         editor.split_buffers().is_some(),
         editor.focused_side(),
+        caret_row(editor),
     );
     let inner = draw_popup_frame(frame, area);
     frame.render_widget(
@@ -362,11 +363,27 @@ fn draw_hover(frame: &mut Frame<'_>, editor: &Editor, text: &str) {
     );
 }
 
+/// The caret's row within the text area, for popups that have to stay off it.
+/// `None` while no file pane holds the caret (the shell, say).
+fn caret_row(editor: &Editor) -> Option<u16> {
+    let buffer = editor.active_buffer()?;
+    let head = buffer
+        .view
+        .selections
+        .primary()
+        .head
+        .0
+        .min(buffer.text.len_chars());
+    let line = buffer.text.char_to_line(head);
+    Some(line.saturating_sub(buffer.view.scroll.top_line) as u16)
+}
+
 fn hover_popup_area(
     viewport: Rect,
     line_count: u16,
     split: bool,
     focused: crate::editor::Side,
+    caret_row: Option<u16>,
 ) -> Rect {
     let target = if split {
         let (left, _, right) = split_panes(viewport);
@@ -379,7 +396,29 @@ fn hover_popup_area(
         viewport
     };
     let width = target.width.saturating_sub(2).clamp(1, 64);
-    let height = (line_count + 2).min(target.height.saturating_sub(1).max(1));
+    let wanted = line_count + 2;
+    // A split draws the popup in the *other* pane, where the caret is not, so only
+    // the single-pane case has a caret to dodge. There it goes into whichever half
+    // of the pane has more room, leaving the line being edited — and its
+    // diagnostic — readable underneath.
+    let caret_row = if split { None } else { caret_row };
+    let (y, height) = match caret_row.filter(|row| *row < target.height) {
+        Some(row) => {
+            let above = row;
+            let below = target.height.saturating_sub(row + 1);
+            if below >= above {
+                let height = wanted.min(below).max(1);
+                (target.y + row + 1, height)
+            } else {
+                let height = wanted.min(above).max(1);
+                (target.y + row - height, height)
+            }
+        }
+        None => (
+            target.y + 1,
+            wanted.min(target.height.saturating_sub(1).max(1)),
+        ),
+    };
     Rect {
         x: if split {
             if focused == crate::editor::Side::Right {
@@ -390,7 +429,7 @@ fn hover_popup_area(
         } else {
             target.right().saturating_sub(width + 2)
         },
-        y: target.y + 1,
+        y,
         width,
         height,
     }
@@ -2804,12 +2843,34 @@ mod tests {
     fn split_hover_is_rendered_in_the_opposite_editor_pane() {
         let viewport = Rect::new(0, 0, 180, 20);
 
-        let from_right = hover_popup_area(viewport, 5, true, crate::editor::Side::Right);
+        let from_right = hover_popup_area(viewport, 5, true, crate::editor::Side::Right, Some(3));
         assert!(from_right.right() <= 90);
         assert!(from_right.x > 1);
 
-        let from_left = hover_popup_area(viewport, 5, true, crate::editor::Side::Left);
+        let from_left = hover_popup_area(viewport, 5, true, crate::editor::Side::Left, Some(3));
         assert!(from_left.x > 90);
+    }
+
+    #[test]
+    fn hover_keeps_clear_of_the_caret_row() {
+        let viewport = Rect::new(0, 0, 100, 20);
+        let covers = |area: Rect, row: u16| row >= area.y && row < area.bottom();
+
+        // Caret near the top: the popup drops below it, into the free space.
+        let below = hover_popup_area(viewport, 6, false, crate::editor::Side::Left, Some(2));
+        assert!(!covers(below, 2));
+        assert!(below.y > 2);
+
+        // Caret near the bottom: it goes above instead of running off the pane.
+        let above = hover_popup_area(viewport, 6, false, crate::editor::Side::Left, Some(17));
+        assert!(!covers(above, 17));
+        assert!(above.bottom() <= 17);
+
+        // A popup taller than the room left is trimmed, never wrapped onto the
+        // caret.
+        let tall = hover_popup_area(viewport, 40, false, crate::editor::Side::Left, Some(15));
+        assert!(!covers(tall, 15));
+        assert!(tall.bottom() <= viewport.bottom());
     }
 
     #[test]

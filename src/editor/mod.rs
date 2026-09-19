@@ -2904,6 +2904,15 @@ impl Editor {
             } => self.move_active(direction, unit, extend),
             Command::SelectAll => self.select_all(),
             Command::CollapseSelections => {
+                // Esc backs out of the newest surface first. A hover popup covers
+                // the text being read, so that is what the press is aimed at;
+                // collapsing the selections underneath it at the same time would
+                // throw away multi-cursor work nobody asked to end.
+                if self.hover.is_some() {
+                    self.dismiss_hover();
+                    self.dirty = true;
+                    return Vec::new();
+                }
                 // Esc also closes the focus-less signature-help popup.
                 self.dismiss_signature_help();
                 // The diff is display-only, so Esc backs out of it. Selections
@@ -5696,6 +5705,9 @@ impl Editor {
     fn move_active(&mut self, direction: Direction, unit: Unit, extend: bool) {
         self.dismiss_completion();
         self.dismiss_signature_help();
+        // The popup describes where the caret was, so moving it away is a request
+        // to be rid of the popup as much as Esc is.
+        self.dismiss_hover();
         let focus = self.focus;
         let (documents, layout) = (&mut self.documents, &mut self.layout);
         let Some(pane) = layout.active_editor_mut(focus) else {
