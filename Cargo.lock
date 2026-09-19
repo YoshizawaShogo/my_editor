@@ -24,12 +24,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
-name = "base64"
-version = "0.22.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
-
-[[package]]
 name = "bca-tree-sitter-tcl"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -514,7 +508,6 @@ dependencies = [
 name = "my_editor"
 version = "0.1.0"
 dependencies = [
- "base64",
  "bca-tree-sitter-tcl",
  "crossterm",
  "futures-util",

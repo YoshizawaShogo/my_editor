@@ -587,7 +587,6 @@ impl Runtime {
                 }
             }
             Effect::ClipboardSystem(text) => self.copy_to_os_clipboard(&text),
-            Effect::ClipboardOsc52(text) => self.terminal.copy_osc52(&text)?,
             Effect::Quit => {}
         }
         Ok(())

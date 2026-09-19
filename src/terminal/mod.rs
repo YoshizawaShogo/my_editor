@@ -1,6 +1,5 @@
 use std::io::{self, Stdout, Write};
 
-use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::{
     cursor::{Hide, SetCursorStyle, Show},
     event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
@@ -156,13 +155,6 @@ impl TerminalSession {
         let end_result = execute!(self.terminal.backend_mut(), EndSynchronizedUpdate);
         draw_result?;
         end_result?;
-        Ok(())
-    }
-
-    pub fn copy_osc52(&mut self, text: &str) -> Result<()> {
-        let encoded = STANDARD.encode(text.as_bytes());
-        write!(self.terminal.backend_mut(), "\x1b]52;c;{encoded}\x07")?;
-        Write::flush(self.terminal.backend_mut())?;
         Ok(())
     }
 }

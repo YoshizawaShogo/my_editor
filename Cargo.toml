@@ -5,7 +5,6 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-base64 = "0.22"
 crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
 futures-util = "0.3"
 fuzzy-matcher = "0.3.7"

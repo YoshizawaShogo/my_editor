@@ -23,7 +23,9 @@ impl Register {
         &self.fragments
     }
 
-    pub fn osc52_text(&self) -> String {
+    /// The register as one string for the OS clipboard. A linewise register
+    /// keeps its trailing newline, so pasting it elsewhere lands whole lines.
+    pub fn text(&self) -> String {
         let text = self.fragments.join("\n");
         if self.linewise {
             format!("{text}\n")
@@ -46,11 +48,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn linewise_register_adds_one_trailing_newline_for_osc52() {
+    fn linewise_register_keeps_one_trailing_newline() {
         let mut register = Register::default();
         register.store_linewise(vec!["one".to_owned(), "two".to_owned()]);
 
         assert!(register.is_linewise());
-        assert_eq!(register.osc52_text(), "one\ntwo\n");
+        assert_eq!(register.text(), "one\ntwo\n");
     }
 }

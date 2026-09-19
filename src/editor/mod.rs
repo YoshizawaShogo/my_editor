@@ -2920,7 +2920,7 @@ impl Editor {
             Command::Copy => return self.copy_active(true),
             Command::Cut => {
                 // Deleting must key off "did we copy", not off the clipboard
-                // effects — those say nothing about whether anything was captured,
+                // push — that says nothing about whether anything was captured,
                 // and a no-selection Ctrl+X must still cut the current line.
                 if self.copy_into_register(true) {
                     let linewise = self.clipboard.is_linewise();
@@ -2933,7 +2933,7 @@ impl Editor {
                                 .delete_backward(&mut view.selections);
                         }
                     });
-                    return self.clipboard_effects(self.clipboard.osc52_text());
+                    return vec![Effect::ClipboardSystem(self.clipboard.text())];
                 }
                 return Vec::new();
             }
@@ -3678,7 +3678,7 @@ impl Editor {
 
     fn copy_active(&mut self, copy_caret_lines: bool) -> Vec<Effect> {
         if self.copy_into_register(copy_caret_lines) {
-            self.clipboard_effects(self.clipboard.osc52_text())
+            vec![Effect::ClipboardSystem(self.clipboard.text())]
         } else {
             Vec::new()
         }
@@ -3686,9 +3686,8 @@ impl Editor {
 
     /// Copy the active selection — or, when every cursor is a bare caret and
     /// `copy_caret_lines` is set, the caret lines — into the internal register.
-    /// Returns whether anything was captured. Kept separate from OSC 52 emission
-    /// so callers like Cut can act on "did we copy" regardless of the (optional)
-    /// clipboard push.
+    /// Returns whether anything was captured, which is what callers like Cut key
+    /// off — the clipboard push carries the text, not the answer to that.
     fn copy_into_register(&mut self, copy_caret_lines: bool) -> bool {
         let focus = self.focus;
         let Some(pane) = self.layout.active_editor(focus) else {
@@ -3747,20 +3746,6 @@ impl Editor {
         true
     }
 
-    /// What a copy pushes outside the editor. The OS clipboard always gets it —
-    /// the runtime owns the X11 selection, and drops the effect when there is no
-    /// X server — while OSC 52 rides along only when the config enables it, since
-    /// terminals without support for it garble the screen. The in-editor register
-    /// is updated regardless, so copy/paste inside the editor never depends on
-    /// either.
-    fn clipboard_effects(&self, text: String) -> Vec<Effect> {
-        let mut effects = vec![Effect::ClipboardSystem(text.clone())];
-        if self.config.editor.osc52_clipboard {
-            effects.push(Effect::ClipboardOsc52(text));
-        }
-        effects
-    }
-
     fn copy_shell_selection(&self) -> Vec<Effect> {
         let Some(selection) = self
             .shell
@@ -3783,7 +3768,7 @@ impl Editor {
         if text.is_empty() {
             Vec::new()
         } else {
-            self.clipboard_effects(text)
+            vec![Effect::ClipboardSystem(text)]
         }
     }
 

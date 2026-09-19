@@ -193,7 +193,6 @@ fn hiding_the_shell_pane_keeps_the_session_but_an_exit_ends_it() {
 #[test]
 fn shell_drag_selection_copies_a_stable_snapshot_and_clears_hover() {
     let mut editor = Editor::default();
-    editor.config.editor.osc52_clipboard = true;
     editor.update(AppEvent::Resize { cols: 20, rows: 6 });
     let token = open_shell(&mut editor);
     editor.update(AppEvent::Terminal(TerminalEvent::Output {
@@ -217,13 +216,7 @@ fn shell_drag_selection_copies_a_stable_snapshot_and_clears_hover() {
     editor.update(mouse(MouseEventKind::Drag(MouseButton::Left), 15));
     let effects = editor.update(mouse(MouseEventKind::Up(MouseButton::Left), 15));
 
-    assert_eq!(
-        effects,
-        vec![
-            Effect::ClipboardSystem("hello".to_owned()),
-            Effect::ClipboardOsc52("hello".to_owned())
-        ]
-    );
+    assert_eq!(effects, vec![Effect::ClipboardSystem("hello".to_owned())]);
     assert_eq!(
         editor.terminal_selection_view(),
         Some(TerminalSelectionView {
@@ -255,7 +248,6 @@ fn ctrl_c_interrupts_the_shell_even_with_a_selection_on_screen() {
     // could not be interrupted. Copying now happens on mouse release instead, and
     // Ctrl+C always reaches the shell.
     let mut editor = Editor::default();
-    editor.config.editor.osc52_clipboard = true;
     editor.update(AppEvent::Resize { cols: 20, rows: 6 });
     let token = open_shell(&mut editor);
     editor.update(AppEvent::Terminal(TerminalEvent::Output {
@@ -541,28 +533,9 @@ fn vertical_cursor_addition_edits_both_lines() {
 }
 
 #[test]
-fn copy_updates_the_register_and_pushes_to_the_clipboard() {
-    let mut editor = Editor::default();
-    editor.config.editor.osc52_clipboard = true;
-    editor.update(AppEvent::TextPaste("copy me".to_owned()));
-    editor.update(Command::SelectAll.into());
-
-    let effects = editor.update(Command::Copy.into());
-
-    assert_eq!(
-        effects,
-        vec![
-            Effect::ClipboardSystem("copy me".to_owned()),
-            Effect::ClipboardOsc52("copy me".to_owned())
-        ]
-    );
-}
-
-#[test]
-fn copy_without_osc52_enabled_still_pushes_to_the_os_clipboard() {
-    // Default config: nothing is written to the terminal (so unsupported
-    // terminals don't garble), but the OS clipboard is not opt-in — the runtime
-    // hands it over, or drops it when there is no X server.
+fn copy_pushes_to_the_os_clipboard_and_fills_the_register() {
+    // The push is not opt-in: the runtime hands it to the X11 selection owner, or
+    // drops it when there is no X server. The register is filled either way.
     let mut editor = Editor::default();
     editor.update(AppEvent::TextPaste("copy me".to_owned()));
     editor.update(Command::SelectAll.into());
@@ -582,18 +555,11 @@ fn copy_without_osc52_enabled_still_pushes_to_the_os_clipboard() {
 #[test]
 fn copy_without_a_selection_copies_and_pastes_the_current_line() {
     let mut editor = Editor::default();
-    editor.config.editor.osc52_clipboard = true;
     editor.update(AppEvent::TextPaste("one\ntwo".to_owned()));
 
     let effects = editor.update(Command::Copy.into());
 
-    assert_eq!(
-        effects,
-        vec![
-            Effect::ClipboardSystem("two\n".to_owned()),
-            Effect::ClipboardOsc52("two\n".to_owned())
-        ]
-    );
+    assert_eq!(effects, vec![Effect::ClipboardSystem("two\n".to_owned())]);
     editor.update(Command::Paste.into());
     assert_eq!(
         editor.active_buffer().unwrap().text.to_string(),
@@ -603,8 +569,8 @@ fn copy_without_a_selection_copies_and_pastes_the_current_line() {
 
 #[test]
 fn cut_without_a_selection_cuts_and_restores_the_current_line() {
-    // Default config (OSC 52 off): the cut must still delete the caret line —
-    // deletion must not depend on what the clipboard push reports.
+    // The cut must still delete the caret line: deletion must not depend on what
+    // the clipboard push reports.
     let mut editor = Editor::default();
     editor.update(AppEvent::TextPaste("one\ntwo".to_owned()));
     editor.update(

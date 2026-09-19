@@ -118,6 +118,5 @@ pub enum Effect {
     /// Push copied text to the OS clipboard. The runtime owns the X11
     /// selection and drops this when there is no X server to talk to.
     ClipboardSystem(String),
-    ClipboardOsc52(String),
     Quit,
 }
