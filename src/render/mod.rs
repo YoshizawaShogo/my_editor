@@ -1616,9 +1616,26 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
     );
     // Diagnostics already carry char-index ranges kept in sync with edits, so no
     // per-frame position conversion is needed.
+    // The line the caret is on is mid-thought: `open: ` is a syntax error for as
+    // long as it takes to type the type, and underlining it reads as a typo
+    // rather than as unfinished work. The gutter mark and the message at the end
+    // of the line still report it, and the underline returns once the caret
+    // leaves the line.
+    let editing_line = focused.then(|| {
+        buffer.text.char_to_line(
+            buffer
+                .view
+                .selections
+                .primary()
+                .head
+                .0
+                .min(buffer.text.len_chars()),
+        )
+    });
     let diagnostic_ranges = buffer
         .diagnostics
         .iter()
+        .filter(|diagnostic| Some(diagnostic_line(buffer.text, diagnostic)) != editing_line)
         .map(|diagnostic| {
             (
                 diagnostic.range.start.0..diagnostic.range.end.0,
@@ -2874,6 +2891,60 @@ mod tests {
     }
 
     #[test]
+    fn the_line_being_edited_is_not_underlined() {
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        let path = std::path::PathBuf::from("/tmp/underline.rs");
+        editor.open_paths([path.clone()]);
+        editor.update(crate::editor::AppEvent::Io(
+            crate::editor::IoEvent::FileLoaded {
+                id: crate::document::DocumentId(1),
+                result: Ok("open: \nsecond".to_owned()),
+            },
+        ));
+        editor.update(crate::editor::AppEvent::Lsp(
+            crate::lsp::LspEvent::Diagnostics {
+                uri: format!("file://{}", path.display()),
+                diagnostics: vec![crate::lsp::Diagnostic {
+                    line: 0,
+                    character: 0,
+                    end_line: 0,
+                    end_character: 6,
+                    severity: crate::lsp::DiagnosticSeverity::Error,
+                    message: "expected type".to_owned(),
+                }],
+            },
+        ));
+
+        let underlined = |terminal: &Terminal<TestBackend>, row: u16| {
+            let buffer = terminal.backend().buffer();
+            (0..40).any(|column| {
+                buffer[(column, row)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+            })
+        };
+
+        // The caret sits on line 0, where the error is: no underline while the
+        // line is being typed.
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+        assert!(!underlined(&terminal, 0));
+
+        // Moving off the line brings it back.
+        editor.update(
+            crate::editor::Command::Move {
+                direction: crate::editor::Direction::Down,
+                unit: crate::editor::Unit::Line,
+                extend: false,
+            }
+            .into(),
+        );
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+        assert!(underlined(&terminal, 0));
+    }
+
+    #[test]
     fn diagnostics_render_as_colored_non_editable_virtual_text() {
         let backend = TestBackend::new(40, 5);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2907,9 +2978,9 @@ mod tests {
         assert_eq!(cell.symbol(), "b");
         assert_eq!(cell.fg, Color::Rgb(0xe2, 0x78, 0x78));
         assert!(cell.modifier.contains(Modifier::ITALIC));
-        let diagnosed_code = &terminal.backend().buffer()[(5, 0)];
-        assert_eq!(diagnosed_code.underline_color, Color::Rgb(0xe2, 0x78, 0x78));
-        assert!(diagnosed_code.modifier.contains(Modifier::UNDERLINED));
+        // The underline over the code itself is covered by
+        // `the_line_being_edited_is_not_underlined`, which needs a caret parked
+        // off the diagnosed line — impossible in this one-line buffer.
 
         editor.update(crate::editor::AppEvent::Mouse(crate::editor::MouseInput {
             event: crossterm::event::MouseEvent {
