@@ -2780,6 +2780,67 @@ fn splitting_over_the_shell_recalls_the_displaced_pane() {
     assert!(!editor.shell_visible());
 }
 
+/// A read-only reader over a temporary file, one line per entry.
+fn large_reader(lines: &[&str]) -> (Editor, PathBuf) {
+    let path = std::env::temp_dir().join(format!(
+        "my_editor_reader_{}_{}.log",
+        std::process::id(),
+        lines.len()
+    ));
+    std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 40, rows: 10 });
+    editor.open_paths([path.clone()]);
+    editor.update(AppEvent::Io(IoEvent::LargeFileLoaded {
+        id: DocumentId(1),
+        result: crate::document::LargeFile::open(&path),
+    }));
+    (editor, path)
+}
+
+fn reader_mouse(editor: &mut Editor, row: u16, kind: MouseEventKind) {
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind,
+            column: 10,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+}
+
+#[test]
+fn clicking_and_dragging_the_reader_selects_whole_lines_to_copy() {
+    let (mut editor, path) = large_reader(&["aaa", "bbb", "ccc", "ddd"]);
+
+    reader_mouse(&mut editor, 2, MouseEventKind::Down(MouseButton::Left));
+    reader_mouse(&mut editor, 0, MouseEventKind::Drag(MouseButton::Left));
+
+    // The caret is a line number, so the drag covers lines 0 through 2.
+    let effects = editor.update(Command::Copy.into());
+    assert_eq!(
+        effects,
+        vec![Effect::ClipboardSystem("aaa\nbbb\nccc".to_owned())]
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn the_reader_stops_scrolling_at_the_last_line() {
+    let (mut editor, path) = large_reader(&["aaa", "bbb", "ccc"]);
+
+    for _ in 0..10 {
+        reader_mouse(&mut editor, 1, MouseEventKind::ScrollDown);
+    }
+
+    // Past the end there is nothing to read, so the wheel stops on the last
+    // line rather than scrolling into blank screens.
+    let reader = editor.active_large_buffer().expect("the reader is open");
+    assert_eq!(reader.view.scroll.top_line, 2);
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn splitting_the_only_buffer_shows_it_on_both_sides() {
     let mut editor = Editor::default();

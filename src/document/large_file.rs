@@ -45,6 +45,25 @@ impl LargeFile {
         )
     }
 
+    /// The last line that exists, or `None` while the index has not reached the
+    /// end of the file yet. Scrolling clamps with it: the index is built lazily,
+    /// so the answer is only known once a scan has run past the end.
+    pub fn last_line(&self) -> Option<usize> {
+        let index = self.index.borrow();
+        if !index.complete {
+            return None;
+        }
+        let last = index.starts.len().saturating_sub(1);
+        // A file ending in a newline leaves a start at EOF — an empty line that
+        // no reader should be able to scroll onto.
+        let trailing_newline = index.starts.last().copied() == Some(self.mmap.len() as u64);
+        Some(if trailing_newline && last > 0 {
+            last - 1
+        } else {
+            last
+        })
+    }
+
     pub fn ensure_line(&self, target: usize) {
         let mut index = self.index.borrow_mut();
         while index.starts.len() <= target && !index.complete {
@@ -118,8 +137,11 @@ mod tests {
         let large = LargeFile::open(&path).unwrap();
 
         assert_eq!(large.index.borrow().starts, vec![0]);
+        assert!(large.last_line().is_none());
         assert_eq!(large.line(2).as_deref(), Some("two"));
         assert_eq!(large.index.borrow().starts, vec![0, 5, 9, 13]);
+        // The newline ending the file must not count as a fourth line.
+        assert_eq!(large.last_line(), Some(2));
 
         drop(large);
         fs::remove_file(path).unwrap();

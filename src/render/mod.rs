@@ -1060,6 +1060,12 @@ fn draw_large_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &crate::editor::
     buffer
         .file
         .ensure_line(start + usize::from(area.height) + 1);
+    // The reader's caret is a line, so a selection is the run of lines between
+    // anchor and head — drawn whole, or a drag would only mark the line it
+    // ended on while Ctrl+C copied the entire range.
+    let selection = buffer.view.selections.primary();
+    let selected =
+        selection.anchor.0.min(selection.head.0)..=selection.anchor.0.max(selection.head.0);
     let mut lines = Vec::with_capacity(usize::from(area.height));
     for line_index in start..start + usize::from(area.height) {
         let Some(text) = buffer.file.line(line_index) else {
@@ -1072,13 +1078,13 @@ fn draw_large_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &crate::editor::
             ),
             Span::styled(
                 text,
-                Style::default().fg(FG).bg(
-                    if line_index == buffer.view.selections.primary().head.0 {
+                Style::default()
+                    .fg(FG)
+                    .bg(if selected.contains(&line_index) {
                         SELECTION
                     } else {
                         BG
-                    },
-                ),
+                    }),
             ),
         ]));
     }

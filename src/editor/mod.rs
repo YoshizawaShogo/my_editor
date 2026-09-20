@@ -4017,6 +4017,18 @@ impl Editor {
                 let Some(pane) = self.layout.active_editor_mut(self.focus) else {
                     return;
                 };
+                // 読み取り専用の行キャレット。語や行の切り出しは文字位置を前提に
+                // しているので、大容量ファイルではクリック回数も修飾キーも見ない。
+                if self
+                    .documents
+                    .get(&pane.view.doc)
+                    .is_some_and(|document| document.large().is_some())
+                {
+                    pane.view.selections.set_single(Selection::caret(index));
+                    self.drag_anchor = Some(index);
+                    self.dirty = true;
+                    return;
+                }
                 if mouse.modifiers.contains(KeyModifiers::ALT) {
                     pane.view.selections.add(Selection::caret(index), true);
                 } else if input.clicks >= 3 {
@@ -5674,6 +5686,12 @@ impl Editor {
         }
         let pane = self.layout.active_editor(self.focus)?;
         let document = self.documents.get(&pane.view.doc)?;
+        // 大容量ファイルのキャレットは行番号そのもの（§4.2.1）。折り返しも桁も
+        // 持たないので、画面の行がそのまま先頭行からの距離になる。
+        if let Some(large) = document.large() {
+            let line = pane.view.scroll.top_line + usize::from(row);
+            return large.line(line).map(|_| CharIdx(line));
+        }
         let text = document.editable_opt()?.text();
         let tab_size = self
             .config
@@ -5738,16 +5756,25 @@ impl Editor {
         let Some(document) = documents.get(&pane.view.doc) else {
             return;
         };
-        let max_top = document.editable_opt().map_or(usize::MAX, |editable| {
-            editable.text().len_lines().saturating_sub(1)
-        });
         pane.view.scroll.top_line = if amount < 0 {
             pane.view
                 .scroll
                 .top_line
                 .saturating_sub(amount.unsigned_abs())
         } else {
-            (pane.view.scroll.top_line + amount as usize).min(max_top)
+            let target = pane.view.scroll.top_line + amount as usize;
+            match &document.kind {
+                crate::document::DocumentKind::Editable(editable) => {
+                    target.min(editable.text().len_lines().saturating_sub(1))
+                }
+                // The line index is built lazily, so the end is only known once
+                // a scan has run past it: index up to the line being scrolled
+                // to, and clamp if that scan hit the end of the file.
+                crate::document::DocumentKind::Large(large) => {
+                    large.ensure_line(target + 1);
+                    large.last_line().map_or(target, |last| target.min(last))
+                }
+            }
         };
         pane.view.scroll.wrapped_row_offset = 0;
         self.dirty = true;
