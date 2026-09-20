@@ -12,6 +12,10 @@ use crate::{
     position::{char_idx_to_display_pos, display_col_after},
 };
 
+/// Stands in for the usual status line, which reports on an editable buffer a
+/// large file does not have.
+const LARGE_FILE_STATUS: &str = "READ ONLY · large file";
+
 const BG: Color = Color::Rgb(0x16, 0x18, 0x21);
 const FG: Color = Color::Rgb(0xc6, 0xc8, 0xd1);
 const MUTED: Color = Color::Rgb(0x6b, 0x70, 0x89);
@@ -66,29 +70,14 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
     frame.render_widget(Block::default().style(Style::default().bg(BG)), areas[0]);
     if editor.search_pane_visible() {
         let (left, divider, right) = split_panes(areas[0]);
-        if let Some(buffer) = editor.active_buffer() {
-            draw_buffer(frame, left, &buffer, editor.document_focused());
-            draw_status(frame, areas[1], editor, &buffer);
-        } else if let Some(buffer) = editor.active_large_buffer() {
-            draw_large_buffer(frame, left, &buffer);
-            draw_status_text(
-                frame,
-                areas[1],
-                editor.status().unwrap_or("READ ONLY · large file"),
-            );
-        } else {
-            draw_status_text(frame, areas[1], editor.status().unwrap_or("Ready"));
-        }
+        draw_file_half(frame, left, areas[1], editor, editor.document_focused());
         draw_split_divider(frame, divider);
         if let Some(search) = editor.search_view() {
             draw_search_pane(frame, right, &search);
         }
     } else if editor.shell_visible() {
         let (left, divider, right) = split_panes(areas[0]);
-        if let Some(buffer) = editor.active_buffer() {
-            draw_buffer(frame, left, &buffer, !editor.shell_focused());
-            draw_status(frame, areas[1], editor, &buffer);
-        }
+        draw_file_half(frame, left, areas[1], editor, !editor.shell_focused());
         if let Some(screen) = editor.terminal_screen() {
             draw_terminal(
                 frame,
@@ -161,7 +150,7 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
         draw_status_text(
             frame,
             areas[1],
-            editor.status().unwrap_or("READ ONLY · large file"),
+            editor.status().unwrap_or(LARGE_FILE_STATUS),
         );
     } else {
         frame.render_widget(
@@ -1048,6 +1037,22 @@ fn draw_start_page(frame: &mut Frame<'_>, area: Rect) {
             .style(Style::default().bg(BG)),
         Rect { y, ..area },
     );
+}
+
+/// The file half beside a right pane — the find pane or the shell — with its
+/// status line. A large file has no editable buffer, so both callers have to
+/// fall through to the read-only reader; the shell used to skip that and left
+/// the half blank while a 10MB log was open.
+fn draw_file_half(frame: &mut Frame<'_>, area: Rect, status: Rect, editor: &Editor, focused: bool) {
+    if let Some(buffer) = editor.active_buffer() {
+        draw_buffer(frame, area, &buffer, focused);
+        draw_status(frame, status, editor, &buffer);
+    } else if let Some(buffer) = editor.active_large_buffer() {
+        draw_large_buffer(frame, area, &buffer);
+        draw_status_text(frame, status, editor.status().unwrap_or(LARGE_FILE_STATUS));
+    } else {
+        draw_status_text(frame, status, editor.status().unwrap_or("Ready"));
+    }
 }
 
 fn draw_large_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &crate::editor::LargeBuffer<'_>) {
@@ -2888,6 +2893,39 @@ mod tests {
         let tall = hover_popup_area(viewport, 40, false, crate::editor::Side::Left, Some(15));
         assert!(!covers(tall, 15));
         assert!(tall.bottom() <= viewport.bottom());
+    }
+
+    #[test]
+    fn the_large_file_reader_stays_on_screen_beside_the_shell() {
+        let path =
+            std::env::temp_dir().join(format!("my_editor_render_large_{}.log", std::process::id()));
+        std::fs::write(&path, b"aaa\nbbb\nccc\n").unwrap();
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 40, rows: 6 });
+        editor.open_paths([path.clone()]);
+        editor.update(crate::editor::AppEvent::Io(
+            crate::editor::IoEvent::LargeFileLoaded {
+                id: crate::document::DocumentId(1),
+                result: crate::document::LargeFile::open(&path),
+            },
+        ));
+        editor.update(crate::editor::Command::ToggleShell.into());
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        // The shell half used to blank the reader: only an editable buffer was
+        // drawn beside it, and a large file has none.
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(rendered.contains("aaa"), "{rendered}");
+        assert!(rendered.contains("ccc"), "{rendered}");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
