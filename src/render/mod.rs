@@ -14,7 +14,7 @@ use crate::{
 
 /// Stands in for the usual status line, which reports on an editable buffer a
 /// large file does not have.
-const LARGE_FILE_STATUS: &str = "<read only> 大容量ファイル";
+const LARGE_FILE_STATUS: &str = "<read only> large file";
 
 const BG: Color = Color::Rgb(0x16, 0x18, 0x21);
 const FG: Color = Color::Rgb(0xc6, 0xc8, 0xd1);
@@ -425,7 +425,7 @@ fn highlighted_hover_lines(text: &str) -> Vec<Line<'static>> {
     let mut byte_base = 0;
     text.split('\n')
         .map(|line| {
-            let diagnostic = line.starts_with("診断:");
+            let diagnostic = line.starts_with("Diagnostic:");
             let mut spans = Vec::new();
             let mut run = String::new();
             let mut run_style = None;
@@ -861,7 +861,10 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
                     format!(" {error} "),
                     Style::default().fg(Color::Rgb(0xd9, 0x7c, 0x7c)),
                 ),
-                None => Span::styled(format!(" {} 件 ", search.total), Style::default().fg(MUTED)),
+                None => Span::styled(
+                    format!(" {} hits ", search.total),
+                    Style::default().fg(MUTED),
+                ),
             })
             // Results are a snapshot; this re-runs the search on demand.
             .title(
@@ -1025,9 +1028,9 @@ fn draw_start_page(frame: &mut Frame<'_>, area: Rect) {
     let lines = vec![
         Line::styled("my_editor", Style::default().fg(FG)),
         Line::from(""),
-        Line::styled("Ctrl+T  ファイルを開く", Style::default().fg(MUTED)),
-        Line::styled("Ctrl+P  コマンドを検索", Style::default().fg(MUTED)),
-        Line::styled("F4      終了", Style::default().fg(MUTED)),
+        Line::styled("Ctrl+T  Open file", Style::default().fg(MUTED)),
+        Line::styled("Ctrl+P  Search commands", Style::default().fg(MUTED)),
+        Line::styled("F4      Quit", Style::default().fg(MUTED)),
     ];
     let y = area.y + area.height.saturating_sub(lines.len() as u16) / 3;
     frame.render_widget(
@@ -2656,7 +2659,10 @@ mod tests {
         );
         assert!(screen.contains("file"), "scope tabs missing: {screen:?}");
         // "foo" occurs twice in the current buffer.
-        assert!(screen.contains("2 件"), "result count missing: {screen:?}");
+        assert!(
+            screen.contains("2 hits"),
+            "result count missing: {screen:?}"
+        );
     }
 
     #[test]

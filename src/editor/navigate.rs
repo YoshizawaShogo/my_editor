@@ -92,9 +92,9 @@ impl super::Editor {
         };
         let Some((side, doc, head)) = target else {
             self.set_status(if back {
-                "戻る履歴がありません"
+                "Nothing to go back to"
             } else {
-                "進む履歴がありません"
+                "Nothing to go forward to"
             });
             return;
         };

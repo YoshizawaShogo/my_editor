@@ -81,7 +81,7 @@ fn esc_closes_the_hover_popup_before_touching_the_selection() {
     let mut editor = Editor::default();
     editor.update(AppEvent::TextPaste("hello world".to_owned()));
     editor.update(Command::SelectAll.into());
-    editor.hover = Some("診断: Syntax Error: expected type".to_owned());
+    editor.hover = Some("Diagnostic: Syntax Error: expected type".to_owned());
 
     editor.update(Command::CollapseSelections.into());
 
@@ -114,7 +114,7 @@ fn esc_closes_the_hover_popup_before_touching_the_selection() {
 fn moving_the_caret_closes_the_hover_popup() {
     let mut editor = Editor::default();
     editor.update(AppEvent::TextPaste("hello".to_owned()));
-    editor.hover = Some("診断: Syntax Error: expected type".to_owned());
+    editor.hover = Some("Diagnostic: Syntax Error: expected type".to_owned());
 
     editor.update(
         Command::Move {
@@ -1632,18 +1632,15 @@ fn clicking_the_run_button_replaces_every_match() {
 #[test]
 fn the_status_line_is_retired_by_the_next_action() {
     let mut editor = Editor::default();
-    editor.set_status("大容量ファイルを読み取り専用で開きました");
+    editor.set_status("Opened read only: large file");
 
     // Background traffic is not an action: a tick must not wipe the report.
     editor.update(AppEvent::Tick);
-    assert_eq!(
-        editor.status(),
-        Some("大容量ファイルを読み取り専用で開きました")
-    );
+    assert_eq!(editor.status(), Some("Opened read only: large file"));
 
     // A keystroke is, and what that keystroke has to say takes the slot.
     editor.update(Command::Reload.into());
-    assert_eq!(editor.status(), Some("再読込できるファイルがありません"));
+    assert_eq!(editor.status(), Some("Nothing to reload"));
 
     editor.update(Command::CollapseSelections.into());
     assert_eq!(editor.status(), None);
@@ -1663,7 +1660,7 @@ fn a_bad_pattern_is_reported_on_the_pane_not_the_status_bar() {
     // the file name and outlived the pane that ran it.
     assert_eq!(
         editor.search_view().unwrap().error.as_deref(),
-        Some("検索式が不正です")
+        Some("Invalid search pattern")
     );
     assert_eq!(editor.status(), None);
 
@@ -4498,7 +4495,7 @@ fn starting_rename_dismisses_the_hover_and_completion_popups() {
     editor.test_register_server("rust", 1).ready = true;
     editor.test_open_doc(DocumentId(0), 1);
     editor.update(AppEvent::TextPaste("value".to_owned()));
-    editor.hover = Some("診断: unused variable".to_owned());
+    editor.hover = Some("Diagnostic: unused variable".to_owned());
 
     editor.update(Command::Rename.into());
 
@@ -4658,7 +4655,7 @@ fn malformed_automatic_completion_response_does_not_replace_the_status() {
     editor.test_register_server("rust", 1).ready = true;
     editor.test_open_doc(DocumentId(0), 1);
     editor.update(AppEvent::TextPaste("cur".to_owned()));
-    editor.set_status("保存しました");
+    editor.set_status("Saved");
     let request = editor
         .request_completion(false)
         .into_iter()
@@ -4673,7 +4670,7 @@ fn malformed_automatic_completion_response_does_not_replace_the_status() {
         result: Err("server cancelled request".to_owned()),
     }));
 
-    assert_eq!(editor.status(), Some("保存しました"));
+    assert_eq!(editor.status(), Some("Saved"));
 }
 
 #[test]

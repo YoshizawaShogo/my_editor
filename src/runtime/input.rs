@@ -13,7 +13,7 @@ pub(super) fn spawn(tx: mpsc::UnboundedSender<RawInput>) -> JoinHandle<()> {
                     Ok(raw) => raw,
                     Err(()) => continue,
                 },
-                Err(error) => RawInput::ReadError(format!("入力エラー: {error}")),
+                Err(error) => RawInput::ReadError(format!("Input error: {error}")),
             };
 
             if tx.send(raw).is_err() {

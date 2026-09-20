@@ -84,14 +84,14 @@ impl Runtime {
         let message = match &self.clipboard {
             Some(clipboard) => match clipboard.set(text) {
                 Ok(()) => return,
-                Err(error) => format!("クリップボードへのコピーに失敗: {error}"),
+                Err(error) => format!("Copy to the clipboard failed: {error}"),
             },
             None => {
                 if self.clipboard_absence_reported {
                     return;
                 }
                 self.clipboard_absence_reported = true;
-                "X11へ接続できないため、コピーはエディタ内だけです".to_owned()
+                "No X11 connection: the copy stays inside the editor".to_owned()
             }
         };
         let _ = self.tx.send(AppEvent::Error(message));
@@ -208,10 +208,7 @@ impl Runtime {
                             if large.validate_text() {
                                 Ok(large)
                             } else {
-                                Err(format!(
-                                    "バイナリ/非UTF-8のため開けません: {}",
-                                    path.display()
-                                ))
+                                Err(format!("Not UTF-8 text, cannot open: {}", path.display()))
                             }
                         });
                         IoEvent::LargeFileLoaded { id, result }
@@ -284,7 +281,7 @@ impl Runtime {
                             Err(error) => {
                                 let _ = tx.send(AppEvent::FileScan(FileScanEvent::Failed {
                                     token,
-                                    error: format!("ファイル走査に失敗: {error}"),
+                                    error: format!("File scan failed: {error}"),
                                 }));
                             }
                         }
@@ -308,7 +305,7 @@ impl Runtime {
                         Err(error) => {
                             let _ = tx.send(AppEvent::Grep(GrepEvent::Failed {
                                 token,
-                                error: format!("検索式が不正です: {error}"),
+                                error: format!("Invalid search pattern: {error}"),
                             }));
                             return;
                         }
@@ -386,7 +383,7 @@ impl Runtime {
                 tokio::task::spawn_blocking(move || {
                     let result = (|| {
                         let pattern = regex::Regex::new(&pattern)
-                            .map_err(|error| format!("検索式が不正です: {error}"))?;
+                            .map_err(|error| format!("Invalid search pattern: {error}"))?;
                         let mut changed = 0;
                         for path in paths {
                             let contents = read_utf8_file(&path)?;
@@ -612,7 +609,7 @@ impl Runtime {
                 let message = if error.kind() == std::io::ErrorKind::NotFound {
                     "not found".to_owned()
                 } else {
-                    format!("{language} LSPを起動できません: {error}")
+                    format!("Cannot start the {language} language server: {error}")
                 };
                 let _ = self.tx.send(AppEvent::Lsp(crate::lsp::LspEvent::Exited {
                     server,
@@ -770,7 +767,7 @@ impl Runtime {
             Err(error) => {
                 let _ = self.tx.send(AppEvent::Terminal(TerminalEvent::Exited {
                     token,
-                    error: Some(format!("PTYを作成できません: {error}")),
+                    error: Some(format!("Cannot create a PTY: {error}")),
                 }));
                 return;
             }
@@ -807,7 +804,7 @@ impl Runtime {
             Err(error) => {
                 let _ = self.tx.send(AppEvent::Terminal(TerminalEvent::Exited {
                     token,
-                    error: Some(format!("シェルを起動できません: {error}")),
+                    error: Some(format!("Cannot start the shell: {error}")),
                 }));
                 return;
             }
@@ -1194,22 +1191,18 @@ fn expand_path_input(input: &str, root: &Path) -> PathBuf {
 }
 
 fn read_utf8_file(path: &std::path::Path) -> std::result::Result<String, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("ファイルを開けません {}: {error}", path.display()))?;
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("Cannot open {}: {error}", path.display()))?;
     if !crate::document::looks_like_text(&bytes) {
-        return Err(format!(
-            "バイナリ/非UTF-8のため開けません: {}",
-            path.display()
-        ));
+        return Err(format!("Not UTF-8 text, cannot open: {}", path.display()));
     }
     // The sample only rules the file out early; this validates all of it.
-    String::from_utf8(bytes)
-        .map_err(|_| format!("バイナリ/非UTF-8のため開けません: {}", path.display()))
+    String::from_utf8(bytes).map_err(|_| format!("Not UTF-8 text, cannot open: {}", path.display()))
 }
 
 fn apply_file_edits(path: &Path, edits_json: &str) -> std::result::Result<(), String> {
     let edits: Vec<lsp_types::TextEdit> = serde_json::from_str(edits_json)
-        .map_err(|error| format!("LSP編集を解釈できません: {error}"))?;
+        .map_err(|error| format!("Cannot read the language server's edits: {error}"))?;
     let mut contents = read_utf8_file(path)?;
     let rope = ropey::Rope::from_str(&contents);
     let mut replacements: Vec<_> = edits
@@ -1290,15 +1283,12 @@ fn disk_state(path: &Path) -> std::result::Result<Option<DiskState>, String> {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(format!(
-                "ファイル状態を取得できません {}: {error}",
-                path.display()
-            ));
+            return Err(format!("Cannot stat {}: {error}", path.display()));
         }
     };
     let modified = metadata
         .modified()
-        .map_err(|error| format!("mtimeを取得できません {}: {error}", path.display()))?;
+        .map_err(|error| format!("Cannot read the mtime of {}: {error}", path.display()))?;
     let modified_nanos = modified
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1498,7 +1488,7 @@ fn compute_git_info(path: &Path) -> std::result::Result<GitInfo, String> {
         .unwrap_or_else(|| Path::new("."));
     let file = path
         .file_name()
-        .ok_or_else(|| format!("git状態を取得できないパスです: {}", path.display()))?;
+        .ok_or_else(|| format!("No git status for this path: {}", path.display()))?;
 
     let status_output = Command::new("git")
         .arg("-C")
@@ -1506,7 +1496,7 @@ fn compute_git_info(path: &Path) -> std::result::Result<GitInfo, String> {
         .args(["status", "--porcelain", "--"])
         .arg(file)
         .output()
-        .map_err(|error| format!("git statusを実行できません: {error}"))?;
+        .map_err(|error| format!("Cannot run git status: {error}"))?;
     if !status_output.status.success() {
         return Err(String::from_utf8_lossy(&status_output.stderr)
             .trim()
@@ -1518,7 +1508,7 @@ fn compute_git_info(path: &Path) -> std::result::Result<GitInfo, String> {
         .arg(directory)
         .args(["branch", "--show-current"])
         .output()
-        .map_err(|error| format!("git branchを実行できません: {error}"))?;
+        .map_err(|error| format!("Cannot run git branch: {error}"))?;
     let mut branch = nonempty_output(&branch_output.stdout);
     if branch.is_none() {
         let head_output = Command::new("git")
@@ -1526,7 +1516,7 @@ fn compute_git_info(path: &Path) -> std::result::Result<GitInfo, String> {
             .arg(directory)
             .args(["rev-parse", "--short", "HEAD"])
             .output()
-            .map_err(|error| format!("git rev-parseを実行できません: {error}"))?;
+            .map_err(|error| format!("Cannot run git rev-parse: {error}"))?;
         branch = nonempty_output(&head_output.stdout).map(|head| format!("detached@{head}"));
     }
 
@@ -1536,7 +1526,7 @@ fn compute_git_info(path: &Path) -> std::result::Result<GitInfo, String> {
         .args(["diff", "--unified=0", "HEAD", "--"])
         .arg(file)
         .output()
-        .map_err(|error| format!("git diffを実行できません: {error}"))?;
+        .map_err(|error| format!("Cannot run git diff: {error}"))?;
     let lines = if diff_output.status.success() {
         parse_git_diff(&String::from_utf8_lossy(&diff_output.stdout))
     } else {
@@ -1614,11 +1604,16 @@ fn load_config() -> std::result::Result<Config, String> {
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
-        Err(error) => return Err(format!("設定を読めません {}: {error}", path.display())),
+        Err(error) => {
+            return Err(format!(
+                "Cannot read the config {}: {error}",
+                path.display()
+            ));
+        }
     };
     toml::from_str::<Config>(&contents)
         .map(Config::merged_with_defaults)
-        .map_err(|error| format!("設定が不正です {}: {error}", path.display()))
+        .map_err(|error| format!("Invalid config {}: {error}", path.display()))
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> std::result::Result<(), String> {
@@ -1627,7 +1622,7 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::result::Result<(), String>
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     if !parent.is_dir() {
-        return Err(format!("ディレクトリが存在しません: {}", parent.display()));
+        return Err(format!("No such directory: {}", parent.display()));
     }
     let existing_permissions = fs::metadata(path)
         .ok()
@@ -1647,11 +1642,11 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::result::Result<(), String>
                 break;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("一時ファイルを作成できません: {error}")),
+            Err(error) => return Err(format!("Cannot create a temporary file: {error}")),
         }
     }
     let Some((temporary_path, mut file)) = temporary else {
-        return Err("保存用一時ファイル名を確保できません".to_owned());
+        return Err("Cannot name a temporary file to save through".to_owned());
     };
     let write_result = (|| {
         file.write_all(contents)?;
@@ -1665,7 +1660,7 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::result::Result<(), String>
     })();
     if let Err(error) = write_result {
         let _ = fs::remove_file(&temporary_path);
-        return Err(format!("保存できません {}: {error}", path.display()));
+        return Err(format!("Cannot save {}: {error}", path.display()));
     }
     Ok(())
 }

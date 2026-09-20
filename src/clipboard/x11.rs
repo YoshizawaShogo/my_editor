@@ -132,7 +132,7 @@ impl X11Clipboard {
         let limit = shared.connection.maximum_request_bytes();
         if text.len() + CHANGE_PROPERTY_OVERHEAD > limit {
             return Err(format!(
-                "{}KiBまでしかクリップボードへ渡せません",
+                "The clipboard takes at most {}KiB",
                 (limit - CHANGE_PROPERTY_OVERHEAD) / 1024
             ));
         }
@@ -153,7 +153,7 @@ impl X11Clipboard {
             .map_err(|error| error.to_string())?
             .owner;
         if owner != shared.window {
-            return Err("クリップボードの所有権を取得できませんでした".to_owned());
+            return Err("Could not take ownership of the clipboard".to_owned());
         }
         Ok(())
     }

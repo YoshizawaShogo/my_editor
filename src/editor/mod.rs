@@ -488,7 +488,7 @@ impl Editor {
                     self.open_definition(event.side, path, lsp_types::Range::new(at, at))
                 }
                 None => {
-                    self.notify(ToastLevel::Info, "定義が見つかりません");
+                    self.notify(ToastLevel::Info, "No definition found");
                     Vec::new()
                 }
             },
@@ -1065,9 +1065,9 @@ impl Editor {
             .collect();
         Some(PickerView {
             title: match picker.mode {
-                PickerMode::Directory => "Open file · / ~ ../ でパス補完",
+                PickerMode::Directory => "Open file · / ~ ../ completes paths",
                 PickerMode::Buffer => "Open buffer",
-                PickerMode::Diff => "Compare with · buffer or file · / ~ ../ でパス補完",
+                PickerMode::Diff => "Compare with · buffer or file · / ~ ../ completes paths",
                 PickerMode::Command => "Command Palette · key / command / description",
             },
             query: picker.query.clone(),
@@ -1353,7 +1353,7 @@ impl Editor {
                 Ok(large) => {
                     if let Some(document) = self.documents.get_mut(&id) {
                         document.load_large(large);
-                        self.set_status("大容量ファイルを読み取り専用で開きました".to_owned());
+                        self.set_status("Opened read only: large file".to_owned());
                     }
                     self.apply_pending_caret_jump(id);
                 }
@@ -1361,7 +1361,7 @@ impl Editor {
             },
             IoEvent::FileSaved { id, result } => match result {
                 Ok(()) => {
-                    self.notify(ToastLevel::Success, "保存しました");
+                    self.notify(ToastLevel::Success, "Saved");
                     if let Some(document) = self.documents.get_mut(&id) {
                         document.editable_mut().mark_saved();
                         document.external_changed = false;
@@ -1410,10 +1410,10 @@ impl Editor {
                 if let Some(document) = self.documents.get_mut(&id) {
                     document.external_changed = true;
                 }
-                self.notify(ToastLevel::Warn, "外部変更との保存競合を検出しました");
+                self.notify(ToastLevel::Warn, "Save conflicts with a change on disk");
                 self.confirm = Some(ConfirmState {
                     message: format!(
-                        "外部変更があります。上書きしますか? {}  [Enter: 上書き / Esc: 中止]",
+                        "Changed on disk. Overwrite {}?  [Enter: overwrite / Esc: cancel]",
                         path.display()
                     ),
                     action: ConfirmAction::Overwrite(id),
@@ -1422,7 +1422,7 @@ impl Editor {
             }
             IoEvent::DirectoryReplaceFinished { result } => match result {
                 Ok(files) => {
-                    let message = format!("ディレクトリ置換完了: {files}ファイル");
+                    let message = format!("Replaced in {files} files");
                     self.notify(ToastLevel::Success, message.clone());
                     self.set_status(message);
                 }
@@ -1433,7 +1433,8 @@ impl Editor {
             },
             IoEvent::ExternalEditsFinished { result } => match result {
                 Ok(path) => {
-                    let message = format!("LSP変更を保存しました: {}", path.display());
+                    let message =
+                        format!("Saved edits from the language server: {}", path.display());
                     self.notify(ToastLevel::Success, message.clone());
                     self.set_status(message);
                 }
@@ -1478,10 +1479,12 @@ impl Editor {
                                 .path
                                 .as_deref()
                                 .map_or_else(|| "?".to_owned(), |path| path.display().to_string());
-                            self.set_status(format!("外部変更を検出しました（編集中）: {name}"));
+                            self.set_status(format!(
+                                "Changed on disk while you were editing: {name}"
+                            ));
                         } else if let Some(path) = document.path.clone() {
                             effects.push(Effect::ReadFile { id, path });
-                            self.set_status("外部変更を再読込しました");
+                            self.set_status("Reloaded after a change on disk");
                         }
                     }
                 }
@@ -1506,12 +1509,12 @@ impl Editor {
                         .map(|language| language.name.clone());
                     self.documents.insert(id, document);
                     self.show_only(View::new(id));
-                    self.set_status(format!("新規ファイル: {}", path.display()));
+                    self.set_status(format!("New file: {}", path.display()));
                     effects.extend(self.start_or_open_lsp(id));
                 } else if inside_root {
-                    self.set_status("ディレクトリが存在しません".to_owned());
+                    self.set_status("No such directory".to_owned());
                 } else {
-                    self.set_status("ワークスペース外には新規作成できません".to_owned());
+                    self.set_status("Cannot create a file outside the workspace".to_owned());
                 }
                 self.focus = Focus::Editor(Side::Left);
             }
@@ -1528,7 +1531,10 @@ impl Editor {
                     server.spawned = true;
                     server.error = None;
                 }
-                self.notify(ToastLevel::Info, format!("{language} LSPを起動しました"));
+                self.notify(
+                    ToastLevel::Info,
+                    format!("{language} language server started"),
+                );
             }
             LspEvent::Initialized {
                 server,
@@ -1794,7 +1800,7 @@ impl Editor {
                             ));
                         }
                     }
-                    Err(error) => self.set_status(format!("定義ジャンプに失敗: {error}")),
+                    Err(error) => self.set_status(format!("Go to definition failed: {error}")),
                 },
                 Some(PendingLsp::Rename { doc }) => match result.and_then(|value| {
                     serde_json::from_value::<lsp_types::WorkspaceEdit>(value)
@@ -1802,9 +1808,9 @@ impl Editor {
                 }) {
                     Ok(edit) => {
                         effects.extend(self.apply_workspace_edit(doc, edit));
-                        self.set_status("リネームを適用しました".to_owned());
+                        self.set_status("Renamed".to_owned());
                     }
-                    Err(error) => self.set_status(format!("リネームに失敗: {error}")),
+                    Err(error) => self.set_status(format!("Rename failed: {error}")),
                 },
                 Some(PendingLsp::Formatting { doc }) => match result.and_then(|value| {
                     serde_json::from_value::<Option<Vec<lsp_types::TextEdit>>>(value)
@@ -1812,10 +1818,10 @@ impl Editor {
                 }) {
                     Ok(Some(edits)) => {
                         self.apply_text_edits(doc, edits);
-                        self.set_status("整形を適用しました".to_owned());
+                        self.set_status("Formatted".to_owned());
                     }
-                    Ok(None) => self.set_status("整形による変更はありません".to_owned()),
-                    Err(error) => self.set_status(format!("整形に失敗: {error}")),
+                    Ok(None) => self.set_status("Already formatted".to_owned()),
+                    Err(error) => self.set_status(format!("Format failed: {error}")),
                 },
                 Some(PendingLsp::Hover { doc, line }) => match result.and_then(|value| {
                     serde_json::from_value::<Option<lsp_types::Hover>>(value)
@@ -1848,7 +1854,7 @@ impl Editor {
                             })
                             .map(|diagnostic| diagnostic.message.clone())
                         {
-                            parts.push(format!("診断: {message}"));
+                            parts.push(format!("Diagnostic: {message}"));
                         }
                         self.hover = (!parts.is_empty()).then(|| parts.join("\n\n"));
                     }
@@ -1912,7 +1918,7 @@ impl Editor {
                 let progress_prefix = format!("lsp:{server}:");
                 self.progress
                     .retain(|key, _| !key.starts_with(&progress_prefix));
-                let message = error.unwrap_or_else(|| "LSPが終了しました".to_owned());
+                let message = error.unwrap_or_else(|| "The language server exited".to_owned());
                 self.notify(ToastLevel::Error, message.clone());
                 let language = self
                     .servers
@@ -2087,7 +2093,7 @@ impl Editor {
         };
         if prefix.is_empty() {
             if manual {
-                self.set_status("補完候補がありません".to_owned());
+                self.set_status("No completions".to_owned());
                 self.dirty = true;
             }
             return Vec::new();
@@ -2145,7 +2151,7 @@ impl Editor {
         items.extend(words);
         if items.is_empty() {
             if manual {
-                self.set_status("補完候補がありません".to_owned());
+                self.set_status("No completions".to_owned());
                 self.dirty = true;
             }
             return Vec::new();
@@ -2429,7 +2435,7 @@ impl Editor {
 
     fn request_formatting(&mut self) -> Vec<Effect> {
         let Some((server, path, _, _)) = self.active_lsp_context() else {
-            self.set_status("このバッファでは整形を利用できません".to_owned());
+            self.set_status("No formatter for this buffer".to_owned());
             return Vec::new();
         };
         let Some(doc) = self
@@ -2849,7 +2855,7 @@ impl Editor {
             self.notify(
                 ToastLevel::Warn,
                 format!(
-                    "未オープンの{}ファイルにも変更を適用します",
+                    "Also applied to {} files that are not open",
                     external_edits.len()
                 ),
             );
@@ -3284,7 +3290,7 @@ impl Editor {
                     self.focus = Focus::Overlay;
                     self.dirty = true;
                 } else {
-                    self.set_status("このバッファではリネームを利用できません".to_owned());
+                    self.set_status("No rename for this buffer".to_owned());
                 }
             }
             Command::GoToLine => {
@@ -3314,7 +3320,7 @@ impl Editor {
                     return Vec::new();
                 };
                 let Some(path) = document.path.clone() else {
-                    self.set_status("再読込できるファイルがありません".to_owned());
+                    self.set_status("Nothing to reload".to_owned());
                     return Vec::new();
                 };
                 let modified = document
@@ -3322,7 +3328,7 @@ impl Editor {
                     .is_some_and(|editable| editable.modified);
                 if modified {
                     self.confirm = Some(ConfirmState {
-                        message: "未保存の変更を破棄して再読込しますか? [Enter / Esc]".to_owned(),
+                        message: "Discard unsaved changes and reload? [Enter / Esc]".to_owned(),
                         action: ConfirmAction::ReloadDiscard(doc),
                     });
                     self.focus = Focus::Overlay;
@@ -3365,7 +3371,7 @@ impl Editor {
                         .is_some_and(|editable| editable.modified)
                 }) {
                     self.confirm = Some(ConfirmState {
-                        message: "未保存の変更を破棄して終了しますか? [Enter / Esc]".to_owned(),
+                        message: "Discard unsaved changes and quit? [Enter / Esc]".to_owned(),
                         action: ConfirmAction::QuitDiscard,
                     });
                     self.focus = Focus::Overlay;
@@ -3482,7 +3488,7 @@ impl Editor {
             .is_some_and(|editable| editable.modified)
         {
             self.confirm = Some(ConfirmState {
-                message: "未保存の変更を破棄してバッファを閉じますか? [Enter / Esc]".to_owned(),
+                message: "Discard unsaved changes and close this buffer? [Enter / Esc]".to_owned(),
                 action: ConfirmAction::CloseDiscard(id),
             });
             self.focus = Focus::Overlay;
@@ -3552,7 +3558,7 @@ impl Editor {
             })
             .and_then(|config| config.line_comment.clone());
         let Some(comment) = language else {
-            self.set_status("この言語のコメント記号は未設定です".to_owned());
+            self.set_status("No comment syntax configured for this language".to_owned());
             self.dirty = true;
             return;
         };
@@ -3746,12 +3752,12 @@ impl Editor {
                 let path = match document.path.clone() {
                     Some(path) => path,
                     None => {
-                        refusal = Some("無名バッファは保存できません");
+                        refusal = Some("An unnamed buffer has nowhere to save to");
                         return None;
                     }
                 };
                 let Some(editable) = document.editable_opt() else {
-                    refusal = Some("大容量ファイルは読み取り専用です");
+                    refusal = Some("Large files are read only");
                     return None;
                 };
                 Some((
@@ -4237,7 +4243,7 @@ impl Editor {
         // Diff also offers files that are not open yet, so an empty buffer list
         // is not a dead end there.
         if candidates.is_empty() && mode != PickerMode::Diff {
-            self.set_status("他に開いているバッファがありません".to_owned());
+            self.set_status("No other buffers are open".to_owned());
             self.dirty = true;
             return Vec::new();
         }
@@ -4266,7 +4272,7 @@ impl Editor {
         self.dirty = true;
         scan_token
             .map(|token| {
-                self.set_progress("file-scan", "ファイルを走査中…");
+                self.set_progress("file-scan", "Scanning files…");
                 vec![Effect::StartFileScan {
                     root: self.workspace_root.clone(),
                     respect_ignore_files: self.respect_ignore_files(),
@@ -4346,8 +4352,8 @@ impl Editor {
             path_listing_start: None,
         });
         self.focus = Focus::Overlay;
-        self.set_status("ファイルを走査中…".to_owned());
-        self.set_progress("file-scan", "ファイルを走査中…");
+        self.set_status("Scanning files…".to_owned());
+        self.set_progress("file-scan", "Scanning files…");
         self.dirty = true;
         vec![Effect::StartFileScan {
             root: self.workspace_root.clone(),
@@ -4589,7 +4595,7 @@ impl Editor {
         let (query, options, scope) = (search.query.clone(), search.options, search.scope);
         let hits = search.hits.clone();
         let Ok(pattern) = search_pattern(&query, options) else {
-            self.set_search_error(Some("検索式が不正です"));
+            self.set_search_error(Some("Invalid search pattern"));
             self.dirty = true;
             return Vec::new();
         };
@@ -4602,10 +4608,7 @@ impl Editor {
                 })
                 .collect();
             self.confirm = Some(ConfirmState {
-                message: format!(
-                    "{}ファイルをディスク上で置換します。続行しますか? [Enter / Esc]",
-                    paths.len()
-                ),
+                message: format!("Replace in {} files on disk? [Enter / Esc]", paths.len()),
                 action: ConfirmAction::DirectoryReplace {
                     paths: paths.into_iter().collect(),
                     pattern: pattern.as_str().to_owned(),
@@ -4645,7 +4648,7 @@ impl Editor {
                 .insert_fragments(&mut selections, &fragments);
             self.mark_doc_dirty(id);
         }
-        self.set_status("置換を適用しました".to_owned());
+        self.set_status("Replaced".to_owned());
         self.dirty = true;
         // The hits point at text that is no longer there; re-run the search so
         // the list shows what is left rather than stale ranges.
@@ -4924,9 +4927,9 @@ impl Editor {
                 search.grep_token = Some(token);
             }
             self.dirty = true;
-            self.set_progress("grep", "検索中…");
+            self.set_progress("grep", "Searching…");
             let Ok(pattern) = search_pattern(&query, options) else {
-                self.set_search_error(Some("検索式が不正です"));
+                self.set_search_error(Some("Invalid search pattern"));
                 return Vec::new();
             };
             return vec![Effect::StartGrep {
@@ -4945,7 +4948,7 @@ impl Editor {
         }
         let pattern = search_pattern(&query, options);
         let Ok(pattern) = pattern else {
-            self.set_search_error(Some("検索式が不正です"));
+            self.set_search_error(Some("Invalid search pattern"));
             return Vec::new();
         };
         let active = self
@@ -5692,7 +5695,7 @@ impl Editor {
         self.confirm = None;
         if scanning {
             self.finish_progress("file-scan");
-            if self.status() == Some("ファイルを走査中…") {
+            if self.status() == Some("Scanning files…") {
                 self.status = None;
             }
         }
@@ -5928,7 +5931,7 @@ impl Editor {
             return;
         };
         if document.large().is_some() {
-            self.set_status("大容量ファイルは読み取り専用です".to_owned());
+            self.set_status("Large files are read only".to_owned());
             self.dirty = true;
             return;
         }
@@ -6281,176 +6284,176 @@ impl CommandPaletteEntry {
 const COMMAND_PALETTE: &[CommandPaletteEntry] = &[
     CommandPaletteEntry {
         key: "Ctrl+F",
-        name: "Find & Replace / 検索・置換",
-        description: "右ペインを開く。再押下で現在→全バッファ→ディレクトリと範囲切替",
+        name: "Find & Replace",
+        description: "Open the right pane; press again to cycle scope: buffer, all buffers, directory",
         command: Command::OpenReplace,
     },
     CommandPaletteEntry {
         key: "F6",
-        name: "Diff / バッファ比較",
-        description: "比較対象を選び左右diff表示。表示中はEsc/F6で閉じる",
+        name: "Diff",
+        description: "Pick a file to compare side by side; Esc or F6 closes it",
         command: Command::OpenDiffPicker,
     },
     CommandPaletteEntry {
         key: "F7",
-        name: "Prev Diff / 前の差分",
-        description: "diff表示で前の差分位置へスクロール",
+        name: "Prev Diff",
+        description: "Scroll to the previous change in the diff",
         command: Command::DiffPrevHunk,
     },
     CommandPaletteEntry {
         key: "F8",
-        name: "Next Diff / 次の差分",
-        description: "diff表示で次の差分位置へスクロール",
+        name: "Next Diff",
+        description: "Scroll to the next change in the diff",
         command: Command::DiffNextHunk,
     },
     CommandPaletteEntry {
         key: "Ctrl+T",
-        name: "Find File / ファイル検索",
-        description: "ワークスペースのファイルを開く",
+        name: "Find File",
+        description: "Open a file from the workspace",
         command: Command::OpenDirectoryPicker,
     },
     CommandPaletteEntry {
         key: "Ctrl+G",
-        name: "Find Buffer / バッファ検索",
-        description: "開いているバッファを選ぶ",
+        name: "Find Buffer",
+        description: "Switch to an open buffer",
         command: Command::OpenBufferPicker,
     },
     CommandPaletteEntry {
         key: "Ctrl+P",
-        name: "Command Palette / コマンド検索",
-        description: "コマンドとキーバインドを検索",
+        name: "Command Palette",
+        description: "Search commands and their keys",
         command: Command::OpenCommandPalette,
     },
     CommandPaletteEntry {
         key: "Ctrl+S",
-        name: "Save / 保存",
-        description: "現在のファイルを安全に保存",
+        name: "Save",
+        description: "Save the current file",
         command: Command::Save,
     },
     CommandPaletteEntry {
         key: "Ctrl+W",
-        name: "Close Buffer / 閉じる",
-        description: "現在のバッファを閉じる",
+        name: "Close Buffer",
+        description: "Close the current buffer",
         command: Command::CloseBuffer,
     },
     CommandPaletteEntry {
         key: "Ctrl+Z",
-        name: "Undo / 元に戻す",
-        description: "直前の編集を元に戻す",
+        name: "Undo",
+        description: "Undo the last edit",
         command: Command::Undo,
     },
     CommandPaletteEntry {
         key: "Ctrl+Y",
-        name: "Redo / やり直す",
-        description: "元に戻した編集をやり直す",
+        name: "Redo",
+        description: "Redo the undone edit",
         command: Command::Redo,
     },
     CommandPaletteEntry {
         key: "Ctrl+E",
-        name: "Go Back / 戻る",
-        description: "直前のカーソル位置へ戻る",
+        name: "Go Back",
+        description: "Go back to the previous caret position",
         command: Command::NavigateBack,
     },
     CommandPaletteEntry {
         key: "Ctrl+R",
-        name: "Go Forward / 進む",
-        description: "戻る前のカーソル位置へ進む",
+        name: "Go Forward",
+        description: "Go forward to where you came back from",
         command: Command::NavigateForward,
     },
     CommandPaletteEntry {
         key: "Ctrl+C",
-        name: "Copy / コピー",
-        description: "選択範囲をコピー",
+        name: "Copy",
+        description: "Copy the selection",
         command: Command::Copy,
     },
     CommandPaletteEntry {
         key: "Ctrl+X",
-        name: "Cut / 切り取り",
-        description: "選択範囲を切り取る",
+        name: "Cut",
+        description: "Cut the selection",
         command: Command::Cut,
     },
     CommandPaletteEntry {
         key: "Ctrl+V",
-        name: "Paste / 貼り付け",
-        description: "クリップボードを貼り付ける",
+        name: "Paste",
+        description: "Paste the clipboard",
         command: Command::Paste,
     },
     CommandPaletteEntry {
         key: "Ctrl+A",
-        name: "Select All / 全選択",
-        description: "現在のバッファをすべて選択",
+        name: "Select All",
+        description: "Select the whole buffer",
         command: Command::SelectAll,
     },
     CommandPaletteEntry {
         key: "Ctrl+D",
-        name: "Select Next / 次を選択",
-        description: "次の同一語へカーソルを追加",
+        name: "Select Next",
+        description: "Add a caret at the next occurrence",
         command: Command::SelectNextOccurrence,
     },
     CommandPaletteEntry {
         key: "Tab",
-        name: "Indent / インデント",
-        description: "選択行をインデント",
+        name: "Indent",
+        description: "Indent the selected lines",
         command: Command::Indent,
     },
     CommandPaletteEntry {
         key: "Shift+Tab",
-        name: "Outdent / アンインデント",
-        description: "選択行のインデントを戻す",
+        name: "Outdent",
+        description: "Outdent the selected lines",
         command: Command::Outdent,
     },
     CommandPaletteEntry {
         key: "Ctrl+/ · Ctrl+Q",
-        name: "Toggle Comment / コメント",
-        description: "選択行のコメントを切り替える",
+        name: "Toggle Comment",
+        description: "Toggle comments on the selected lines",
         command: Command::ToggleComment,
     },
     CommandPaletteEntry {
         key: "Ctrl+@ · Ctrl+Space",
-        name: "Completion / 補完",
-        description: "LSP補完候補を表示",
+        name: "Completion",
+        description: "Show completions from the language server",
         command: Command::ToggleCompletion,
     },
     CommandPaletteEntry {
         key: "F2",
-        name: "Rename Symbol / リネーム",
-        description: "LSPでシンボル名を変更",
+        name: "Rename Symbol",
+        description: "Rename the symbol through the language server",
         command: Command::Rename,
     },
     CommandPaletteEntry {
         key: "Ctrl+N",
-        name: "Go to Line / 行番号ジャンプ",
-        description: "指定した行番号へカーソルを移動",
+        name: "Go to Line",
+        description: "Move the caret to a line number",
         command: Command::GoToLine,
     },
     CommandPaletteEntry {
         key: "F5",
-        name: "Reload File / 再読込",
-        description: "ファイルをディスクから読み直す（未保存時は確認）",
+        name: "Reload File",
+        description: "Re-read the file from disk; asks when there are unsaved changes",
         command: Command::Reload,
     },
     CommandPaletteEntry {
         key: "—",
-        name: "Format Document / 整形",
-        description: "LSPで文書を整形",
+        name: "Format Document",
+        description: "Format the document through the language server",
         command: Command::Format,
     },
     CommandPaletteEntry {
         key: "Ctrl+]",
-        name: "Split Editor / 左右分割",
-        description: "エディタの左右分割を切り替える",
+        name: "Split Editor",
+        description: "Toggle the side-by-side split",
         command: Command::ToggleSplit,
     },
     CommandPaletteEntry {
         key: "Ctrl+O",
-        name: "Terminal / シェル",
-        description: "統合ターミナルを切り替える",
+        name: "Terminal",
+        description: "Toggle the integrated terminal",
         command: Command::ToggleShell,
     },
     CommandPaletteEntry {
         key: "F4",
-        name: "Quit / 終了",
-        description: "エディタを終了",
+        name: "Quit",
+        description: "Quit the editor",
         command: Command::Quit,
     },
 ];

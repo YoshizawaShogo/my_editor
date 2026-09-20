@@ -228,9 +228,9 @@ impl super::Editor {
             self.notify(
                 ToastLevel::Info,
                 if forward {
-                    "最後の差分です"
+                    "Last change"
                 } else {
-                    "最初の差分です"
+                    "First change"
                 },
             );
             return;

@@ -10,10 +10,10 @@ pub struct LargeFile {
 impl LargeFile {
     pub fn open(path: &Path) -> std::result::Result<Self, String> {
         let file = File::open(path)
-            .map_err(|error| format!("大容量ファイルを開けません {}: {error}", path.display()))?;
+            .map_err(|error| format!("Cannot open large file {}: {error}", path.display()))?;
         // SAFETY: The mapping is read-only. External truncation remains the documented SIGBUS risk.
         let mmap = unsafe { MmapOptions::new().map(&file) }
-            .map_err(|error| format!("mmapできません {}: {error}", path.display()))?;
+            .map_err(|error| format!("Cannot map {}: {error}", path.display()))?;
         Ok(Self {
             mmap,
             index: RefCell::new(LineIndex::default()),
