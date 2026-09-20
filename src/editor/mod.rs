@@ -147,6 +147,10 @@ pub struct Editor {
     /// remember to save it.
     last_views: HashMap<DocumentId, View>,
     pending_self_disk_updates: HashMap<DocumentId, usize>,
+    /// The file pane that the shell or the find pane pushed out of the right
+    /// half, waiting to be put back when that pane closes. Only one can be
+    /// waiting, because only one right pane exists to displace.
+    stashed_split: Option<EditorPane>,
     /// The shell, alive from the first Ctrl+O until it exits. Independent of
     /// [`RightPane::Shell`], which only says whether it is currently on screen:
     /// hiding the pane has to keep the session so reopening resumes it.
@@ -196,6 +200,7 @@ impl Default for Editor {
             pending_caret_jumps: HashMap::new(),
             last_views: HashMap::new(),
             pending_self_disk_updates: HashMap::new(),
+            stashed_split: None,
             shell: None,
             terminal_size: (0, 0),
             status: None,
@@ -825,9 +830,19 @@ impl Editor {
     /// running grep in particular, which would otherwise keep reporting
     /// progress for a pane that is no longer on screen.
     fn set_right_pane(&mut self, right: Option<RightPane>) {
-        if let Some(RightPane::Search(_)) = std::mem::replace(&mut self.layout.right, right) {
+        let previous = std::mem::replace(&mut self.layout.right, right);
+        if matches!(previous, Some(RightPane::Search(_))) {
             self.finish_progress("grep");
         }
+        // シェルと検索は一時的に呼び出して閉じる道具なので、分割中に右半分を
+        // 奪ったら元のファイルペインを取っておき、閉じたときに分割へ戻す。
+        // diffは左ペインも差し替えるモード切替なので、戻す対象にはしない。
+        self.stashed_split = match (previous, &self.layout.right) {
+            (Some(RightPane::Editor(pane)), Some(RightPane::Shell | RightPane::Search(_))) => {
+                Some(pane)
+            }
+            _ => None,
+        };
         // Focus must not outlive the pane it pointed at. `Overlay` belongs to the
         // find pane and `Side::Right` to whatever sits on the right, so either
         // one is stranded once that pane is replaced or removed — and a stranded
@@ -868,6 +883,7 @@ impl Editor {
             return None;
         };
         self.finish_progress("grep");
+        self.layout.right = self.stashed_split.take().map(RightPane::Editor);
         self.dirty = true;
         Some(*search)
     }
@@ -3312,7 +3328,8 @@ impl Editor {
             }
             // Hide the pane only. The session keeps running so that reopening
             // comes back to the same shell with its scrollback intact.
-            self.set_right_pane(None);
+            let restored = self.stashed_split.take().map(RightPane::Editor);
+            self.set_right_pane(restored);
             self.focus = Focus::Editor(Side::Left);
             return Vec::new();
         }
@@ -3366,16 +3383,23 @@ impl Editor {
         // 分割の目的はたいてい別のファイルを並べて見ることなので、他に開いて
         // いるバッファがあればその先頭（最初に開いたもの）を右に出す。同じ
         // ファイルを二画面で見たいときは分割後にCtrl+Gで選び直せばよい。
-        let left = self.layout.left.view.doc;
-        let view = match self
-            .documents
-            .keys()
-            .filter(|id| **id != left)
-            .min_by_key(|id| id.0)
-            .copied()
-        {
-            Some(other) => self.view_for(other),
-            None => self.layout.left.view.clone(),
+        // 分割中にシェルや検索へ譲った右ペインがあるなら、Ctrl+]はまずそれを
+        // 呼び戻す。奪われる前の並びに戻すのが押した意図に一番近い。
+        let view = match self.stashed_split.take() {
+            Some(pane) => pane.view,
+            None => {
+                let left = self.layout.left.view.doc;
+                match self
+                    .documents
+                    .keys()
+                    .filter(|id| **id != left)
+                    .min_by_key(|id| id.0)
+                    .copied()
+                {
+                    Some(other) => self.view_for(other),
+                    None => self.layout.left.view.clone(),
+                }
+            }
         };
         self.set_right_pane(Some(RightPane::Editor(EditorPane { view })));
         self.focus = Focus::Editor(Side::Right);
@@ -3424,6 +3448,13 @@ impl Editor {
         // cleanup here — that inseparability is the point of storing it inline.
         self.documents.remove(&id);
         self.last_views.remove(&id);
+        if self
+            .stashed_split
+            .as_ref()
+            .is_some_and(|pane| pane.view.doc == id)
+        {
+            self.stashed_split = None;
+        }
         if self.deferred_hover.is_some_and(|(doc, _)| doc == id) {
             self.deferred_hover = None;
         }
@@ -3626,7 +3657,8 @@ impl Editor {
                 // than reopening a dead one.
                 self.shell = None;
                 if self.layout.is_shell() {
-                    self.set_right_pane(None);
+                    let restored = self.stashed_split.take().map(RightPane::Editor);
+                    self.set_right_pane(restored);
                     self.focus = Focus::Editor(Side::Left);
                 }
                 self.status = error;

@@ -2704,6 +2704,82 @@ fn splitting_shows_the_first_other_buffer_on_the_right() {
     assert_eq!(right.text.to_string(), "first");
 }
 
+/// Open two files, split, and return the editor with `first.txt` on the right.
+fn split_editor() -> Editor {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+    editor.open_paths([PathBuf::from("first.txt"), PathBuf::from("current.txt")]);
+    for (id, text) in [(1, "first"), (2, "current")] {
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(id),
+            result: Ok(text.to_owned()),
+        }));
+    }
+    editor.update(Command::ToggleSplit.into());
+    editor
+}
+
+#[test]
+fn hiding_the_shell_puts_the_split_it_displaced_back() {
+    let mut editor = split_editor();
+
+    editor.update(Command::ToggleShell.into());
+    assert!(editor.split_buffers().is_none());
+    editor.update(Command::ToggleShell.into());
+
+    let (left, right, _) = editor.split_buffers().expect("the split is back");
+    assert_eq!(left.text.to_string(), "current");
+    assert_eq!(right.text.to_string(), "first");
+}
+
+#[test]
+fn closing_the_find_pane_puts_the_split_it_displaced_back() {
+    let mut editor = split_editor();
+
+    editor.update(Command::OpenSearch.into());
+    assert!(editor.split_buffers().is_none());
+    editor.update(Command::OpenSearch.into());
+
+    assert!(!editor.search_pane_visible());
+    let (_, right, _) = editor.split_buffers().expect("the split is back");
+    assert_eq!(right.text.to_string(), "first");
+}
+
+#[test]
+fn a_shell_opened_without_a_split_still_closes_to_a_single_pane() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+
+    editor.update(Command::ToggleShell.into());
+    editor.update(Command::ToggleShell.into());
+
+    assert!(!editor.shell_visible());
+    assert!(editor.split_buffers().is_none());
+}
+
+#[test]
+fn closing_the_split_stays_closed_across_the_shell() {
+    let mut editor = split_editor();
+    editor.update(Command::ToggleSplit.into());
+
+    editor.update(Command::ToggleShell.into());
+    editor.update(Command::ToggleShell.into());
+
+    assert!(editor.split_buffers().is_none());
+}
+
+#[test]
+fn splitting_over_the_shell_recalls_the_displaced_pane() {
+    let mut editor = split_editor();
+    editor.update(Command::ToggleShell.into());
+
+    editor.update(Command::ToggleSplit.into());
+
+    let (_, right, _) = editor.split_buffers().expect("the split is back");
+    assert_eq!(right.text.to_string(), "first");
+    assert!(!editor.shell_visible());
+}
+
 #[test]
 fn splitting_the_only_buffer_shows_it_on_both_sides() {
     let mut editor = Editor::default();
