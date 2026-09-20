@@ -856,10 +856,13 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
         let block = Block::default()
             .borders(Borders::TOP)
             .border_style(Style::default().fg(MUTED))
-            .title(Span::styled(
-                format!(" {} 件 ", search.total),
-                Style::default().fg(MUTED),
-            ))
+            .title(match &search.error {
+                Some(error) => Span::styled(
+                    format!(" {error} "),
+                    Style::default().fg(Color::Rgb(0xd9, 0x7c, 0x7c)),
+                ),
+                None => Span::styled(format!(" {} 件 ", search.total), Style::default().fg(MUTED)),
+            })
             // Results are a snapshot; this re-runs the search on demand.
             .title(
                 Line::from(Span::styled(

@@ -1630,6 +1630,28 @@ fn clicking_the_run_button_replaces_every_match() {
 }
 
 #[test]
+fn a_bad_pattern_is_reported_on_the_pane_not_the_status_bar() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+    editor.update(AppEvent::TextPaste("one".to_owned()));
+    editor.update(Command::OpenSearch.into());
+    editor.update(Command::SearchToggleRegex.into());
+
+    editor.update(AppEvent::TextInput('('));
+
+    // The status bar belongs to the document: a search that reported there wiped
+    // the file name and outlived the pane that ran it.
+    assert_eq!(
+        editor.search_view().unwrap().error.as_deref(),
+        Some("検索式が不正です")
+    );
+    assert_eq!(editor.status(), None);
+
+    editor.update(AppEvent::TextInput(')'));
+    assert_eq!(editor.search_view().unwrap().error, None);
+}
+
+#[test]
 fn the_result_list_stops_with_the_last_hit_on_screen() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 24 });

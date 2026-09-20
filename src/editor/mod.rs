@@ -1101,6 +1101,7 @@ impl Editor {
             field_cursor: search.field_cursor,
             field_selection: self.search_selection(),
             results_scroll: search.results_scroll,
+            error: search.error.clone(),
         })
     }
 
@@ -4408,6 +4409,7 @@ impl Editor {
             field_undo: Vec::new(),
             field_redo: Vec::new(),
             results_scroll: 0,
+            error: None,
         };
         self.set_right_pane(Some(RightPane::Search(Box::new(search))));
         self.focus = Focus::Overlay;
@@ -4517,7 +4519,7 @@ impl Editor {
         let (query, options, scope) = (search.query.clone(), search.options, search.scope);
         let hits = search.hits.clone();
         let Ok(pattern) = search_pattern(&query, options) else {
-            self.status = Some("検索式が不正です".to_owned());
+            self.set_search_error(Some("検索式が不正です"));
             self.dirty = true;
             return Vec::new();
         };
@@ -4807,7 +4809,17 @@ impl Editor {
         self.refresh_search()
     }
 
+    /// Put a failure on the find pane, where it stays with the run that caused
+    /// it and disappears with the pane.
+    fn set_search_error(&mut self, error: Option<&str>) {
+        if let Some(search) = self.search_mut() {
+            search.error = error.map(str::to_owned);
+        }
+        self.dirty = true;
+    }
+
     fn refresh_search(&mut self) -> Vec<Effect> {
+        self.set_search_error(None);
         let Some(search) = self.search() else {
             return Vec::new();
         };
@@ -4844,7 +4856,7 @@ impl Editor {
             self.dirty = true;
             self.set_progress("grep", "検索中…");
             let Ok(pattern) = search_pattern(&query, options) else {
-                self.status = Some("検索式が不正です".to_owned());
+                self.set_search_error(Some("検索式が不正です"));
                 return Vec::new();
             };
             return vec![Effect::StartGrep {
@@ -4863,7 +4875,7 @@ impl Editor {
         }
         let pattern = search_pattern(&query, options);
         let Ok(pattern) = pattern else {
-            self.status = Some("検索式が不正です".to_owned());
+            self.set_search_error(Some("検索式が不正です"));
             return Vec::new();
         };
         let active = self
@@ -4925,12 +4937,11 @@ impl Editor {
                 search.hits.extend(hits.into_iter().map(SearchHit::Disk));
                 false
             }
-            GrepEvent::Done { token } if search.grep_token == Some(token) => {
-                self.status = Some(format!("検索完了: {}件", search.hits.len()));
-                true
-            }
+            // The count is on the pane's own header, and a run that ends is not
+            // news the document's status bar has to carry.
+            GrepEvent::Done { token } if search.grep_token == Some(token) => true,
             GrepEvent::Failed { token, error } if search.grep_token == Some(token) => {
-                self.status = Some(error);
+                search.error = Some(error);
                 true
             }
             _ => false,
@@ -6497,6 +6508,10 @@ struct SearchState {
     field_undo: Vec<FieldSnapshot>,
     field_redo: Vec<FieldSnapshot>,
     results_scroll: usize,
+    /// Why the last run produced nothing, shown on the pane's result header.
+    /// The shared status bar is the document's — a search that reported there
+    /// wiped the file name and outlived the pane that ran it.
+    error: Option<String>,
 }
 
 /// A find-pane field and caret, captured before an edit so it can be restored.
@@ -6762,6 +6777,7 @@ pub struct SearchView {
     /// Selected range in the active field, in characters, when one is active.
     pub field_selection: Option<std::ops::Range<usize>>,
     pub results_scroll: usize,
+    pub error: Option<String>,
 }
 
 #[derive(Debug)]
