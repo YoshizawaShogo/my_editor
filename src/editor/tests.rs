@@ -4453,6 +4453,58 @@ fn completion_applies_the_extra_edits_that_come_with_it() {
 }
 
 #[test]
+fn naming_a_declaration_does_not_open_the_completion_popup() {
+    let mut editor = Editor::default();
+    editor.open_paths([PathBuf::from("x.rs")]);
+    editor.update(AppEvent::TextPaste(
+        "let collection = 1;\nlet coll".to_owned(),
+    ));
+
+    // Typing on: the name after `let` is being introduced, so nothing can
+    // complete it — the popup used to offer `collection` over it.
+    editor.update(AppEvent::TextInputAt {
+        character: 'e',
+        at: std::time::Instant::now(),
+    });
+    assert!(editor.completion_view().is_none());
+
+    // A use of the same word still completes.
+    editor.update(AppEvent::TextPaste(" = coll".to_owned()));
+    editor.update(AppEvent::TextInputAt {
+        character: 'e',
+        at: std::time::Instant::now(),
+    });
+    let view = editor.completion_view().expect("completion popup");
+    assert!(
+        view.items.iter().any(|label| label == "collection"),
+        "{:?}",
+        view.items
+    );
+}
+
+#[test]
+fn the_shorter_candidate_wins_a_tie_so_typing_on_can_still_reach_it() {
+    let mut editor = editor_with_lsp();
+    editor.update(AppEvent::TextPaste("Vec".to_owned()));
+
+    // The fuzzy score only measures the matched part, so these tie; the server
+    // happens to list the longer one first. `Vec` stays in the list because
+    // picking it does change the buffer — it fills in the type parameter.
+    complete_with(
+        &mut editor,
+        serde_json::json!([
+            {"label": "VecDeque", "insertTextFormat": 2, "insertText": "VecDeque<$0>"},
+            {"label": "Vec", "insertTextFormat": 2, "insertText": "Vec<$0>"},
+        ]),
+    );
+
+    // `Vec` is a prefix of both others, so no further keystroke could lift it —
+    // it has to be on top while it still can be.
+    let view = editor.completion_view().expect("completion popup");
+    assert_eq!(view.items.first().map(String::as_str), Some("Vec"));
+}
+
+#[test]
 fn a_snippet_completion_expands_its_placeholder() {
     let mut editor = editor_with_lsp();
     editor.update(AppEvent::TextPaste("wi".to_owned()));

@@ -1752,7 +1752,20 @@ impl Editor {
                             ))
                         })
                         .collect();
-                        items.sort_by_key(|right| std::cmp::Reverse(right.0));
+                        // Equal scores go to the shorter label. The fuzzy score
+                        // only measures the part that matched, so `Vec` and
+                        // `VecDeque` tie on a typed `Vec` — and no further typing
+                        // can lift `Vec` above a candidate it is a prefix of, so
+                        // the shorter one has to come first while it still can.
+                        items.sort_by(|left, right| {
+                            right.0.cmp(&left.0).then_with(|| {
+                                left.1
+                                    .label
+                                    .chars()
+                                    .count()
+                                    .cmp(&right.1.label.chars().count())
+                            })
+                        });
                         // Offer language snippets alongside the server's results,
                         // ranked to the top so `for`, `fn`, … are easy to reach.
                         let mut merged = language
@@ -1980,6 +1993,7 @@ impl Editor {
                     && active_doc == Some(doc)
                     && self.completion_suppressed != Some((doc, version))
                     && matches!(self.focus, Focus::Editor(_))
+                    && !self.typing_a_name_being_declared()
                 {
                     effects.extend(self.request_completion(false));
                 }
@@ -2079,9 +2093,68 @@ impl Editor {
     /// After typing a word character in a buffer without LSP completion, pop up
     /// word-based suggestions. LSP buffers use the debounced didChange path instead.
     fn autocomplete_after_typing(&mut self, character: char) {
-        if is_word(character) && self.active_lsp_context().is_none() {
+        if is_word(character)
+            && self.active_lsp_context().is_none()
+            && !self.typing_a_name_being_declared()
+        {
             self.word_completion(false);
         }
+    }
+
+    /// Whether the word being typed is a name being introduced — the `foo` of
+    /// `let foo`, `fn foo`, `struct Foo`. Nothing can complete a name that does
+    /// not exist yet, so the popup there only offers to overwrite it with
+    /// something else. A deliberate Ctrl+Space still opens it.
+    fn typing_a_name_being_declared(&self) -> bool {
+        // The words after which the next one is a new name, across the languages
+        // this editor highlights. `mut` covers `let mut foo`.
+        const DECLARES: [&str; 16] = [
+            "let",
+            "mut",
+            "var",
+            "const",
+            "static",
+            "fn",
+            "func",
+            "function",
+            "def",
+            "class",
+            "struct",
+            "enum",
+            "union",
+            "trait",
+            "interface",
+            "namespace",
+        ];
+        let Some(pane) = self.layout.active_editor(self.focus) else {
+            return false;
+        };
+        let Some(editable) = self
+            .documents
+            .get(&pane.view.doc)
+            .and_then(Document::editable_opt)
+        else {
+            return false;
+        };
+        let text = editable.text();
+        let head = pane.view.selections.primary().head.0.min(text.len_chars());
+        let mut word_start = head;
+        while word_start > 0 && is_word(text.char(word_start - 1)) {
+            word_start -= 1;
+        }
+        let mut gap_start = word_start;
+        while gap_start > 0 && matches!(text.char(gap_start - 1), ' ' | '\t') {
+            gap_start -= 1;
+        }
+        // No blank between the two: `foo.bar` and `Foo::bar` are not declarations.
+        if gap_start == word_start {
+            return false;
+        }
+        let mut keyword_start = gap_start;
+        while keyword_start > 0 && is_word(text.char(keyword_start - 1)) {
+            keyword_start -= 1;
+        }
+        DECLARES.contains(&text.slice(keyword_start..gap_start).to_string().as_str())
     }
 
     /// Completion fallback for buffers without an LSP: offer the identifiers that
