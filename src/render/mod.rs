@@ -14,7 +14,7 @@ use crate::{
 
 /// Stands in for the usual status line, which reports on an editable buffer a
 /// large file does not have.
-const LARGE_FILE_STATUS: &str = "READ ONLY · large file";
+const LARGE_FILE_STATUS: &str = "READ ONLY · 大容量のためリーダー表示";
 
 const BG: Color = Color::Rgb(0x16, 0x18, 0x21);
 const FG: Color = Color::Rgb(0xc6, 0xc8, 0xd1);
@@ -147,11 +147,7 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
         draw_status(frame, areas[1], editor, &buffer);
     } else if let Some(buffer) = editor.active_large_buffer() {
         draw_large_buffer(frame, areas[0], &buffer);
-        draw_status_text(
-            frame,
-            areas[1],
-            editor.status().unwrap_or(LARGE_FILE_STATUS),
-        );
+        draw_large_status(frame, areas[1], editor, &buffer);
     } else {
         frame.render_widget(
             Paragraph::new("my_editor").style(Style::default().fg(FG)),
@@ -1049,7 +1045,7 @@ fn draw_file_half(frame: &mut Frame<'_>, area: Rect, status: Rect, editor: &Edit
         draw_status(frame, status, editor, &buffer);
     } else if let Some(buffer) = editor.active_large_buffer() {
         draw_large_buffer(frame, area, &buffer);
-        draw_status_text(frame, status, editor.status().unwrap_or(LARGE_FILE_STATUS));
+        draw_large_status(frame, status, editor, &buffer);
     } else {
         draw_status_text(frame, status, editor.status().unwrap_or("Ready"));
     }
@@ -2183,6 +2179,52 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, editor: &Editor, buffer: &Acti
     );
 }
 
+/// The reader's own status line. It cannot reuse [`draw_status`], which reports
+/// on an editable buffer, so it says what the reader is and why it opened: the
+/// file, that it is read only, and the size that made it so.
+fn draw_large_status(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    editor: &Editor,
+    buffer: &crate::editor::LargeBuffer<'_>,
+) {
+    let mut segments = vec![
+        (buffer.name.clone(), Color::Rgb(0x35, 0x4f, 0x7a)),
+        (LARGE_FILE_STATUS.to_owned(), Color::Rgb(0x8a, 0x63, 0x35)),
+        (
+            format!(
+                "{} · 行 {}",
+                human_bytes(buffer.file.len_bytes()),
+                buffer.view.selections.primary().head.0 + 1
+            ),
+            Color::Rgb(0x3b, 0x4a, 0x62),
+        ),
+    ];
+    if let Some(status) = editor.status() {
+        segments.push((status.to_owned(), Color::Rgb(0x4b, 0x4f, 0x61)));
+    }
+    frame.render_widget(
+        Paragraph::new(segmented_line(segments)).style(Style::default().bg(STATUS_BG)),
+        area,
+    );
+}
+
+/// Sizes in the unit a reader would say out loud: 12.0MB, not 12582958 bytes.
+fn human_bytes(bytes: usize) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}B")
+    } else {
+        format!("{size:.1}{}", UNITS[unit])
+    }
+}
+
 fn git_status_label(branch: Option<&str>, status: Option<&str>) -> Option<String> {
     let branch = branch?;
     Some(status.map_or_else(
@@ -2907,7 +2949,7 @@ mod tests {
             std::env::temp_dir().join(format!("my_editor_render_large_{}.log", std::process::id()));
         std::fs::write(&path, b"aaa\nbbb\nccc\n").unwrap();
         let mut editor = Editor::default();
-        editor.update(crate::editor::AppEvent::Resize { cols: 40, rows: 6 });
+        editor.update(crate::editor::AppEvent::Resize { cols: 100, rows: 6 });
         editor.open_paths([path.clone()]);
         editor.update(crate::editor::AppEvent::Io(
             crate::editor::IoEvent::LargeFileLoaded {
@@ -2916,7 +2958,7 @@ mod tests {
             },
         ));
         editor.update(crate::editor::Command::ToggleShell.into());
-        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 6)).unwrap();
 
         terminal.draw(|frame| draw(frame, &editor)).unwrap();
 
@@ -2931,6 +2973,10 @@ mod tests {
             .collect();
         assert!(rendered.contains("aaa"), "{rendered}");
         assert!(rendered.contains("ccc"), "{rendered}");
+        // The status line names the file, says it is a reader, and gives the
+        // size that sent it there.
+        assert!(rendered.contains("READ ONLY"), "{rendered}");
+        assert!(rendered.contains("12B"), "{rendered}");
         std::fs::remove_file(path).unwrap();
     }
 

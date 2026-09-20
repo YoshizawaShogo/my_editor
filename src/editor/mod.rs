@@ -592,6 +592,10 @@ impl Editor {
         let pane = self.layout.active_editor(focus)?;
         let document = self.documents.get(&pane.view.doc)?;
         Some(LargeBuffer {
+            name: document
+                .path
+                .as_ref()
+                .map_or_else(|| "Untitled".to_owned(), |path| self.display_path(path)),
             file: document.large()?,
             view: &pane.view,
         })
@@ -6140,6 +6144,7 @@ pub struct ActiveBuffer<'a> {
 }
 
 pub struct LargeBuffer<'a> {
+    pub name: String,
     pub file: &'a LargeFile,
     pub view: &'a View,
 }
