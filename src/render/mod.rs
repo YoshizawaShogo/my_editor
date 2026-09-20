@@ -2193,7 +2193,9 @@ fn draw_large_status(
 ) {
     let mut segments = vec![
         (buffer.name.clone(), Color::Rgb(0x35, 0x4f, 0x7a)),
-        (LARGE_FILE_STATUS.to_owned(), Color::Rgb(0x8a, 0x63, 0x35)),
+        // The same slot colors as any other buffer: read-only is what the pane
+        // is, not a warning about it.
+        (LARGE_FILE_STATUS.to_owned(), Color::Rgb(0x35, 0x65, 0x70)),
         (
             format!(
                 "{} · 行 {}",

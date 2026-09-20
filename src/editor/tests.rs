@@ -1630,6 +1630,26 @@ fn clicking_the_run_button_replaces_every_match() {
 }
 
 #[test]
+fn the_status_line_is_retired_by_the_next_action() {
+    let mut editor = Editor::default();
+    editor.set_status("大容量ファイルを読み取り専用で開きました");
+
+    // Background traffic is not an action: a tick must not wipe the report.
+    editor.update(AppEvent::Tick);
+    assert_eq!(
+        editor.status(),
+        Some("大容量ファイルを読み取り専用で開きました")
+    );
+
+    // A keystroke is, and what that keystroke has to say takes the slot.
+    editor.update(Command::Reload.into());
+    assert_eq!(editor.status(), Some("再読込できるファイルがありません"));
+
+    editor.update(Command::CollapseSelections.into());
+    assert_eq!(editor.status(), None);
+}
+
+#[test]
 fn a_bad_pattern_is_reported_on_the_pane_not_the_status_bar() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 24 });
@@ -4584,7 +4604,7 @@ fn malformed_automatic_completion_response_does_not_replace_the_status() {
     editor.test_register_server("rust", 1).ready = true;
     editor.test_open_doc(DocumentId(0), 1);
     editor.update(AppEvent::TextPaste("cur".to_owned()));
-    editor.status = Some("保存しました".to_owned());
+    editor.set_status("保存しました");
     let request = editor
         .request_completion(false)
         .into_iter()

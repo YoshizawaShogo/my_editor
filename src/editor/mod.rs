@@ -156,7 +156,7 @@ pub struct Editor {
     /// hiding the pane has to keep the session so reopening resumes it.
     shell: Option<ShellSession>,
     terminal_size: (u16, u16),
-    status: Option<String>,
+    status: Option<StatusMessage>,
     notifications: Vec<Toast>,
     progress: HashMap<String, String>,
     dirty: bool,
@@ -214,12 +214,35 @@ impl Default for Editor {
 
 impl Editor {
     pub fn update(&mut self, event: AppEvent) -> Vec<Effect> {
+        // The status line reports on the last thing that happened, so the next
+        // deliberate action retires it — cleared before the event is applied, so
+        // a message this event produces is the one left standing. Background
+        // traffic (LSP, git, ticks, mouse movement) is not an action and leaves
+        // it alone.
+        if Self::is_user_action(&event) && self.status.take().is_some() {
+            self.dirty = true;
+        }
         let effects = self.apply_event(event);
         // Recorded here rather than inside `apply_event`: its arms return early
         // in several places, and a position saved only on the fall-through
         // path would be skipped exactly when one of those switched buffers.
         self.remember_visible_views();
         effects
+    }
+
+    fn is_user_action(event: &AppEvent) -> bool {
+        match event {
+            AppEvent::Command(_)
+            | AppEvent::TextInput(_)
+            | AppEvent::TextInputAt { .. }
+            | AppEvent::TextPaste(_)
+            | AppEvent::TerminalInput(_) => true,
+            AppEvent::Mouse(mouse) => matches!(
+                mouse.event.kind,
+                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ),
+            _ => false,
+        }
     }
 
     fn apply_event(&mut self, event: AppEvent) -> Vec<Effect> {
@@ -409,7 +432,7 @@ impl Editor {
                         self.start_lsps_for_open_documents()
                     }
                     Err(error) => {
-                        self.status = Some(error);
+                        self.set_status(error);
                         Vec::new()
                     }
                 };
@@ -470,6 +493,17 @@ impl Editor {
                 }
             },
             AppEvent::Tick => {
+                // Retire the status line on the same tick that retires toasts,
+                // so the bar stops reporting an event nobody remembers asking
+                // about.
+                if self
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.shown.elapsed() >= STATUS_TTL)
+                {
+                    self.status = None;
+                    self.dirty = true;
+                }
                 let toasts_before = self.notifications.len();
                 self.notifications
                     .retain(|toast| toast.created.elapsed() < toast.ttl);
@@ -489,7 +523,7 @@ impl Editor {
             }
             AppEvent::Error(message) => {
                 self.notify(ToastLevel::Error, message.clone());
-                self.status = Some(message);
+                self.set_status(message);
                 self.dirty = true;
                 Vec::new()
             }
@@ -515,8 +549,22 @@ impl Editor {
         self.focus
     }
 
+    /// The message on the right of the status bar, while it is still fresh. It
+    /// is a report on what just happened, so it expires: a line left standing
+    /// says an old event is current news.
     pub fn status(&self) -> Option<&str> {
-        self.status.as_deref()
+        self.status
+            .as_ref()
+            .filter(|status| status.shown.elapsed() < STATUS_TTL)
+            .map(|status| status.text.as_str())
+    }
+
+    fn set_status(&mut self, text: impl Into<String>) {
+        self.status = Some(StatusMessage {
+            text: text.into(),
+            shown: Instant::now(),
+        });
+        self.dirty = true;
     }
 
     pub fn terminal_size(&self) -> (u16, u16) {
@@ -531,10 +579,11 @@ impl Editor {
         std::mem::take(&mut self.dirty)
     }
 
-    /// Whether a toast is on screen. The runtime keeps its poll timer at the
-    /// fast cadence while one is visible so it expires on time.
+    /// Whether a toast or a status message is on screen. The runtime keeps its
+    /// poll timer at the fast cadence while one is visible so it expires on
+    /// time.
     pub fn has_notifications(&self) -> bool {
-        !self.notifications.is_empty()
+        !self.notifications.is_empty() || self.status().is_some()
     }
 
     pub fn active_buffer(&self) -> Option<ActiveBuffer<'_>> {
@@ -1285,17 +1334,17 @@ impl Editor {
                     self.apply_pending_caret_jump(id);
                     effects.extend(self.start_or_open_lsp(id));
                 }
-                Err(error) => self.status = Some(error),
+                Err(error) => self.set_status(error),
             },
             IoEvent::LargeFileLoaded { id, result } => match result {
                 Ok(large) => {
                     if let Some(document) = self.documents.get_mut(&id) {
                         document.load_large(large);
-                        self.status = Some("大容量ファイルを読み取り専用で開きました".to_owned());
+                        self.set_status("大容量ファイルを読み取り専用で開きました".to_owned());
                     }
                     self.apply_pending_caret_jump(id);
                 }
-                Err(error) => self.status = Some(error),
+                Err(error) => self.set_status(error),
             },
             IoEvent::FileSaved { id, result } => match result {
                 Ok(()) => {
@@ -1341,7 +1390,7 @@ impl Editor {
                 }
                 Err(error) => {
                     self.notify(ToastLevel::Error, error.clone());
-                    self.status = Some(error);
+                    self.set_status(error);
                 }
             },
             IoEvent::SaveConflict { id, path } => {
@@ -1362,22 +1411,22 @@ impl Editor {
                 Ok(files) => {
                     let message = format!("ディレクトリ置換完了: {files}ファイル");
                     self.notify(ToastLevel::Success, message.clone());
-                    self.status = Some(message);
+                    self.set_status(message);
                 }
                 Err(error) => {
                     self.notify(ToastLevel::Error, error.clone());
-                    self.status = Some(error);
+                    self.set_status(error);
                 }
             },
             IoEvent::ExternalEditsFinished { result } => match result {
                 Ok(path) => {
                     let message = format!("LSP変更を保存しました: {}", path.display());
                     self.notify(ToastLevel::Success, message.clone());
-                    self.status = Some(message);
+                    self.set_status(message);
                 }
                 Err(error) => {
                     self.notify(ToastLevel::Error, error.clone());
-                    self.status = Some(error);
+                    self.set_status(error);
                 }
             },
             IoEvent::DiskStateObserved { id, result } => match result {
@@ -1412,20 +1461,18 @@ impl Editor {
                             .is_some_and(|editable| editable.modified)
                         {
                             document.external_changed = true;
-                            self.status = Some(format!(
-                                "外部変更を検出しました（編集中）: {}",
-                                document.path.as_deref().map_or_else(
-                                    || "?".to_owned(),
-                                    |path| path.display().to_string()
-                                )
-                            ));
+                            let name = document
+                                .path
+                                .as_deref()
+                                .map_or_else(|| "?".to_owned(), |path| path.display().to_string());
+                            self.set_status(format!("外部変更を検出しました（編集中）: {name}"));
                         } else if let Some(path) = document.path.clone() {
                             effects.push(Effect::ReadFile { id, path });
-                            self.status = Some("外部変更を再読込しました".to_owned());
+                            self.set_status("外部変更を再読込しました");
                         }
                     }
                 }
-                Err(error) => self.status = Some(error),
+                Err(error) => self.set_status(error),
             },
             IoEvent::DirectPathResolved {
                 path,
@@ -1446,12 +1493,12 @@ impl Editor {
                         .map(|language| language.name.clone());
                     self.documents.insert(id, document);
                     self.show_only(View::new(id));
-                    self.status = Some(format!("新規ファイル: {}", path.display()));
+                    self.set_status(format!("新規ファイル: {}", path.display()));
                     effects.extend(self.start_or_open_lsp(id));
                 } else if inside_root {
-                    self.status = Some("ディレクトリが存在しません".to_owned());
+                    self.set_status("ディレクトリが存在しません".to_owned());
                 } else {
-                    self.status = Some("ワークスペース外には新規作成できません".to_owned());
+                    self.set_status("ワークスペース外には新規作成できません".to_owned());
                 }
                 self.focus = Focus::Editor(Side::Left);
             }
@@ -1734,7 +1781,7 @@ impl Editor {
                             ));
                         }
                     }
-                    Err(error) => self.status = Some(format!("定義ジャンプに失敗: {error}")),
+                    Err(error) => self.set_status(format!("定義ジャンプに失敗: {error}")),
                 },
                 Some(PendingLsp::Rename { doc }) => match result.and_then(|value| {
                     serde_json::from_value::<lsp_types::WorkspaceEdit>(value)
@@ -1742,9 +1789,9 @@ impl Editor {
                 }) {
                     Ok(edit) => {
                         effects.extend(self.apply_workspace_edit(doc, edit));
-                        self.status = Some("リネームを適用しました".to_owned());
+                        self.set_status("リネームを適用しました".to_owned());
                     }
-                    Err(error) => self.status = Some(format!("リネームに失敗: {error}")),
+                    Err(error) => self.set_status(format!("リネームに失敗: {error}")),
                 },
                 Some(PendingLsp::Formatting { doc }) => match result.and_then(|value| {
                     serde_json::from_value::<Option<Vec<lsp_types::TextEdit>>>(value)
@@ -1752,10 +1799,10 @@ impl Editor {
                 }) {
                     Ok(Some(edits)) => {
                         self.apply_text_edits(doc, edits);
-                        self.status = Some("整形を適用しました".to_owned());
+                        self.set_status("整形を適用しました".to_owned());
                     }
-                    Ok(None) => self.status = Some("整形による変更はありません".to_owned()),
-                    Err(error) => self.status = Some(format!("整形に失敗: {error}")),
+                    Ok(None) => self.set_status("整形による変更はありません".to_owned()),
+                    Err(error) => self.set_status(format!("整形に失敗: {error}")),
                 },
                 Some(PendingLsp::Hover { doc, line }) => match result.and_then(|value| {
                     serde_json::from_value::<Option<lsp_types::Hover>>(value)
@@ -2027,7 +2074,7 @@ impl Editor {
         };
         if prefix.is_empty() {
             if manual {
-                self.status = Some("補完候補がありません".to_owned());
+                self.set_status("補完候補がありません".to_owned());
                 self.dirty = true;
             }
             return Vec::new();
@@ -2085,7 +2132,7 @@ impl Editor {
         items.extend(words);
         if items.is_empty() {
             if manual {
-                self.status = Some("補完候補がありません".to_owned());
+                self.set_status("補完候補がありません".to_owned());
                 self.dirty = true;
             }
             return Vec::new();
@@ -2369,7 +2416,7 @@ impl Editor {
 
     fn request_formatting(&mut self) -> Vec<Effect> {
         let Some((server, path, _, _)) = self.active_lsp_context() else {
-            self.status = Some("このバッファでは整形を利用できません".to_owned());
+            self.set_status("このバッファでは整形を利用できません".to_owned());
             return Vec::new();
         };
         let Some(doc) = self
@@ -3224,7 +3271,7 @@ impl Editor {
                     self.focus = Focus::Overlay;
                     self.dirty = true;
                 } else {
-                    self.status = Some("このバッファではリネームを利用できません".to_owned());
+                    self.set_status("このバッファではリネームを利用できません".to_owned());
                 }
             }
             Command::GoToLine => {
@@ -3254,7 +3301,7 @@ impl Editor {
                     return Vec::new();
                 };
                 let Some(path) = document.path.clone() else {
-                    self.status = Some("再読込できるファイルがありません".to_owned());
+                    self.set_status("再読込できるファイルがありません".to_owned());
                     return Vec::new();
                 };
                 let modified = document
@@ -3492,7 +3539,7 @@ impl Editor {
             })
             .and_then(|config| config.line_comment.clone());
         let Some(comment) = language else {
-            self.status = Some("この言語のコメント記号は未設定です".to_owned());
+            self.set_status("この言語のコメント記号は未設定です".to_owned());
             self.dirty = true;
             return;
         };
@@ -3666,7 +3713,9 @@ impl Editor {
                     self.set_right_pane(restored);
                     self.focus = Focus::Editor(Side::Left);
                 }
-                self.status = error;
+                if let Some(error) = error {
+                    self.set_status(error);
+                }
                 true
             }
         };
@@ -3678,19 +3727,18 @@ impl Editor {
             return Vec::new();
         };
         let doc = pane.view.doc;
+        let mut refusal = None;
         let Some((path, contents, expected, language)) =
             self.documents.get(&doc).and_then(|document| {
                 let path = match document.path.clone() {
                     Some(path) => path,
                     None => {
-                        self.status = Some("無名バッファは保存できません".to_owned());
-                        self.dirty = true;
+                        refusal = Some("無名バッファは保存できません");
                         return None;
                     }
                 };
                 let Some(editable) = document.editable_opt() else {
-                    self.status = Some("大容量ファイルは読み取り専用です".to_owned());
-                    self.dirty = true;
+                    refusal = Some("大容量ファイルは読み取り専用です");
                     return None;
                 };
                 Some((
@@ -3701,6 +3749,9 @@ impl Editor {
                 ))
             })
         else {
+            if let Some(refusal) = refusal {
+                self.set_status(refusal);
+            }
             return Vec::new();
         };
         let version = self.doc_version(doc).unwrap_or(1);
@@ -4173,7 +4224,7 @@ impl Editor {
         // Diff also offers files that are not open yet, so an empty buffer list
         // is not a dead end there.
         if candidates.is_empty() && mode != PickerMode::Diff {
-            self.status = Some("他に開いているバッファがありません".to_owned());
+            self.set_status("他に開いているバッファがありません".to_owned());
             self.dirty = true;
             return Vec::new();
         }
@@ -4282,7 +4333,7 @@ impl Editor {
             path_listing_start: None,
         });
         self.focus = Focus::Overlay;
-        self.status = Some("ファイルを走査中…".to_owned());
+        self.set_status("ファイルを走査中…".to_owned());
         self.set_progress("file-scan", "ファイルを走査中…");
         self.dirty = true;
         vec![Effect::StartFileScan {
@@ -4367,7 +4418,7 @@ impl Editor {
                     && picker.scan_token == Some(token)
                 {
                     picker.scan_token = None;
-                    self.status = Some(error);
+                    self.set_status(error);
                     self.finish_progress("file-scan");
                 }
             }
@@ -4575,7 +4626,7 @@ impl Editor {
                 .insert_fragments(&mut selections, &fragments);
             self.mark_doc_dirty(id);
         }
-        self.status = Some("置換を適用しました".to_owned());
+        self.set_status("置換を適用しました".to_owned());
         self.dirty = true;
         // The hits point at text that is no longer there; re-run the search so
         // the list shows what is left rather than stale ranges.
@@ -5622,7 +5673,7 @@ impl Editor {
         self.confirm = None;
         if scanning {
             self.finish_progress("file-scan");
-            if self.status.as_deref() == Some("ファイルを走査中…") {
+            if self.status() == Some("ファイルを走査中…") {
                 self.status = None;
             }
         }
@@ -5858,7 +5909,7 @@ impl Editor {
             return;
         };
         if document.large().is_some() {
-            self.status = Some("大容量ファイルは読み取り専用です".to_owned());
+            self.set_status("大容量ファイルは読み取り専用です".to_owned());
             self.dirty = true;
             return;
         }
@@ -6552,6 +6603,17 @@ pub enum ToastLevel {
     Success,
     Warn,
     Error,
+}
+
+/// How long the status line keeps a message. Longer than a toast, which floats
+/// over the text, and short enough that the bar is not still reporting the save
+/// from ten minutes ago.
+const STATUS_TTL: Duration = Duration::from_secs(20);
+
+#[derive(Debug)]
+struct StatusMessage {
+    text: String,
+    shown: Instant,
 }
 
 #[derive(Debug)]

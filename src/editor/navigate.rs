@@ -91,12 +91,11 @@ impl super::Editor {
             self.nav_forward.pop()
         };
         let Some((side, doc, head)) = target else {
-            self.status = Some(if back {
-                "戻る履歴がありません".to_owned()
+            self.set_status(if back {
+                "戻る履歴がありません"
             } else {
-                "進む履歴がありません".to_owned()
+                "進む履歴がありません"
             });
-            self.dirty = true;
             return;
         };
         if !self.documents.contains_key(&doc) {
