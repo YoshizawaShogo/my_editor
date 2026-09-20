@@ -223,6 +223,9 @@ impl Editor {
             self.dirty = true;
         }
         let effects = self.apply_event(event);
+        // Checked at the single exit for the same reason as the views below: the
+        // caret can leave a snippet through any of the many paths that move it.
+        self.end_snippet_session_if_caret_left();
         // Recorded here rather than inside `apply_event`: its arms return early
         // in several places, and a position saved only on the fall-through
         // path would be skipped exactly when one of those switched buffers.

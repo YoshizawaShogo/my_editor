@@ -159,6 +159,44 @@ impl super::Editor {
         true
     }
 
+    /// End the session once the caret leaves the snippet. The stops travel with
+    /// edits, so the snippet is wherever they are: a caret outside the range they
+    /// span means the filling-in is over, and a Tab pressed long afterwards
+    /// belongs to indentation rather than pulling the caret back into a function
+    /// completed and forgotten about.
+    pub(super) fn end_snippet_session_if_caret_left(&mut self) {
+        let Some(doc) = self.snippet_session.as_ref().map(|session| session.doc) else {
+            return;
+        };
+        // The shell and the overlays hold no caret of their own; a snippet is not
+        // abandoned by opening one.
+        let Some(pane) = self.layout.active_editor(self.focus) else {
+            return;
+        };
+        let left = if pane.view.doc == doc {
+            let head = pane.view.selections.primary().head.0;
+            let span = self
+                .documents
+                .get(&doc)
+                .and_then(Document::editable_opt)
+                .and_then(|editable| {
+                    editable.snippet_stops().iter().fold(None, |span, stop| {
+                        Some(
+                            span.map_or((stop.start, stop.end), |(start, end): (usize, usize)| {
+                                (start.min(stop.start), end.max(stop.end))
+                            }),
+                        )
+                    })
+                });
+            span.is_none_or(|(start, end)| head < start || head > end)
+        } else {
+            true
+        };
+        if left {
+            self.clear_snippet_session();
+        }
+    }
+
     pub(super) fn clear_snippet_session(&mut self) {
         if let Some(session) = self.snippet_session.take()
             && let Some(document) = self.documents.get_mut(&session.doc)

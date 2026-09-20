@@ -744,6 +744,35 @@ fn tab_walks_snippet_stops_and_tracks_edits() {
 }
 
 #[test]
+fn a_snippet_left_behind_does_not_swallow_a_later_tab() {
+    let mut editor = Editor::default();
+    editor.open_paths([PathBuf::from("x.rs")]);
+    for character in "for".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+    editor.update(Command::ToggleCompletion.into());
+    editor.update(Command::PickerConfirm.into());
+
+    // Carry on elsewhere: the caret leaves the snippet, which ends it.
+    editor.update(
+        Command::Move {
+            direction: Direction::Right,
+            unit: Unit::Document,
+            extend: false,
+        }
+        .into(),
+    );
+    editor.update(Command::Indent.into());
+
+    // Tab indents where the caret is. It used to pull the caret back to a stop
+    // in a snippet filled in long before.
+    let buffer = editor.active_buffer().unwrap();
+    assert_eq!(buffer.text.to_string(), "for item in iter {\n    \n}    ");
+    let head = buffer.view.selections.primary().head.0;
+    assert_eq!(buffer.text.char_to_line(head), 2);
+}
+
+#[test]
 fn definition_without_a_language_server_falls_back_to_ctags() {
     let mut editor = Editor::default();
     editor.open_paths([PathBuf::from("x.rs")]);
