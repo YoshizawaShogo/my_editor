@@ -3148,10 +3148,10 @@ impl Editor {
                 }
             }
             Command::PickerConfirm => return self.confirm_picker(),
-            Command::PickerCancel => self.close_picker(),
+            Command::PickerCancel => self.cancel_overlay(),
             Command::Cancel => {
-                if self.search().is_none() {
-                    self.close_picker();
+                if self.confirm.is_some() || self.search().is_none() {
+                    self.cancel_overlay();
                 }
             }
             Command::SearchToggleField => {
@@ -4503,23 +4503,26 @@ impl Editor {
         effects
     }
 
-    /// The "Run Replace" button: replace every match in one shot.
+    /// The "Run Replace" button: replace every match in one shot. The pane stays
+    /// open — the button is one control inside it, and taking the pane away on a
+    /// press threw out the query, the scope and the hit list with it, including
+    /// when the confirmation that followed was declined.
     fn run_replace(&mut self) -> Vec<Effect> {
-        let Some(search) = self.take_search() else {
+        let Some(search) = self.search() else {
             return Vec::new();
         };
-        let Some(replacement) = search.replacement else {
+        let Some(replacement) = search.replacement.clone() else {
             return Vec::new();
         };
-        let Ok(pattern) = search_pattern(&search.query, search.options) else {
+        let (query, options, scope) = (search.query.clone(), search.options, search.scope);
+        let hits = search.hits.clone();
+        let Ok(pattern) = search_pattern(&query, options) else {
             self.status = Some("検索式が不正です".to_owned());
-            self.focus = Focus::Editor(Side::Left);
             self.dirty = true;
             return Vec::new();
         };
-        if search.scope == SearchScope::Directory {
-            let paths: HashSet<_> = search
-                .hits
+        if scope == SearchScope::Directory {
+            let paths: HashSet<_> = hits
                 .into_iter()
                 .filter_map(|hit| match hit {
                     SearchHit::Disk(hit) => Some(hit.path),
@@ -4542,7 +4545,7 @@ impl Editor {
             return Vec::new();
         }
         let mut by_document: HashMap<DocumentId, Vec<Selection>> = HashMap::new();
-        for hit in search.hits {
+        for hit in hits {
             if let SearchHit::Buffer { doc, range, .. } = hit {
                 by_document.entry(doc).or_default().push(Selection {
                     anchor: CharIdx(range.start),
@@ -4571,9 +4574,10 @@ impl Editor {
             self.mark_doc_dirty(id);
         }
         self.status = Some("置換を適用しました".to_owned());
-        self.focus = Focus::Editor(Side::Left);
         self.dirty = true;
-        Vec::new()
+        // The hits point at text that is no longer there; re-run the search so
+        // the list shows what is left rather than stale ranges.
+        self.refresh_search()
     }
 
     fn close_search_pane(&mut self) -> Vec<Effect> {
@@ -5146,21 +5150,28 @@ impl Editor {
         self.scroll_result_into_view(next);
     }
 
-    /// Keep the current row inside the visible slice of the result list.
-    fn scroll_result_into_view(&mut self, index: usize) {
+    /// Rows the result list can show. The list starts below its own border and
+    /// ends at the pane's bottom.
+    fn search_result_rows(&self) -> usize {
         let (_, _, _, pane_height) = self.search_pane_rect();
-        let Some(search) = self.search() else { return };
+        let Some(search) = self.search() else {
+            return 1;
+        };
         let layout = search_pane_layout(
             search.scope == SearchScope::Directory,
             search.replacement.is_some(),
         );
-        // The list starts below its own border and ends at the pane's bottom.
-        let visible = usize::from(
+        usize::from(
             pane_height
                 .saturating_sub(layout.results_top)
                 .saturating_sub(1),
         )
-        .max(1);
+        .max(1)
+    }
+
+    /// Keep the current row inside the visible slice of the result list.
+    fn scroll_result_into_view(&mut self, index: usize) {
+        let visible = self.search_result_rows();
         if let Some(search) = self.search_mut() {
             if index < search.results_scroll {
                 search.results_scroll = index;
@@ -5172,8 +5183,11 @@ impl Editor {
     }
 
     fn scroll_search_results(&mut self, delta: isize) {
+        let visible = self.search_result_rows();
         if let Some(search) = self.search_mut() {
-            let max = search.hits.len().saturating_sub(1);
+            // Stop once the last hit reaches the bottom row. Scrolling further
+            // only walked the list off the top into empty rows.
+            let max = search.hits.len().saturating_sub(visible);
             search.results_scroll = if delta < 0 {
                 search.results_scroll.saturating_sub(delta.unsigned_abs())
             } else {
@@ -5337,7 +5351,11 @@ impl Editor {
 
     fn confirm_picker(&mut self) -> Vec<Effect> {
         if let Some(confirm) = self.confirm.take() {
-            self.focus = Focus::Editor(Side::Left);
+            self.focus = if self.search().is_some() {
+                Focus::Overlay
+            } else {
+                Focus::Editor(Side::Left)
+            };
             match confirm.action {
                 ConfirmAction::Overwrite(doc) => {
                     let Some(document) = self.documents.get(&doc) else {
@@ -5556,6 +5574,22 @@ impl Editor {
         let x = viewport_width.saturating_sub(width) / 2;
         let y = 1;
         column >= x && column < x.saturating_add(width) && row >= y && row < y + height
+    }
+
+    /// Back out of the frontmost overlay only. The confirm dialog sits over
+    /// whatever raised it, so answering "no" has to leave that behind — the find
+    /// pane used to go with it, taking the query and the hit list along.
+    fn cancel_overlay(&mut self) {
+        if self.confirm.take().is_some() {
+            self.focus = if self.search().is_some() {
+                Focus::Overlay
+            } else {
+                Focus::Editor(self.focused_side())
+            };
+            self.dirty = true;
+            return;
+        }
+        self.close_picker();
     }
 
     fn close_picker(&mut self) {

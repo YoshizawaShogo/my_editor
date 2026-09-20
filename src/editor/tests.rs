@@ -1621,6 +1621,80 @@ fn clicking_the_run_button_replaces_every_match() {
     }));
 
     assert_eq!(editor.active_buffer().unwrap().text.to_string(), "X two X");
+    // The button is one control inside the pane, so pressing it must not close
+    // the pane out from under the next replace.
+    assert!(editor.search_pane_visible());
+    assert_eq!(editor.search_view().unwrap().query, "one");
+    // The old hits pointed at text that is gone, so the list is re-run.
+    assert!(editor.search_view().unwrap().items.is_empty());
+}
+
+#[test]
+fn the_result_list_stops_with_the_last_hit_on_screen() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+    let lines: Vec<_> = (0..40).map(|index| format!("hit {index}")).collect();
+    editor.update(AppEvent::TextPaste(lines.join("\n")));
+    editor.update(Command::OpenSearch.into());
+    for character in "hit".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+    let total = editor.search_view().unwrap().total;
+    assert_eq!(total, 40);
+
+    // Well past the end of the list.
+    for _ in 0..40 {
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 60,
+                row: 20,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+    }
+
+    // The last hit sits on the bottom row; scrolling never runs off into rows
+    // with no result on them.
+    let scroll = editor.search_view().unwrap().results_scroll;
+    let rows = editor.search_result_rows();
+    assert!(rows > 1 && rows < total, "rows {rows}");
+    assert_eq!(scroll, total - rows);
+}
+
+#[test]
+fn declining_a_directory_replace_keeps_the_find_pane() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 40, rows: 24 });
+    editor.update(AppEvent::TextPaste("one two one".to_owned()));
+    editor.update(Command::OpenReplace.into());
+    for character in "one".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+    editor.toggle_replace_field();
+    editor.update(AppEvent::TextInput('X'));
+    // CurrentBuffer -> AllBuffers -> Directory, where the replace asks first.
+    editor.update(Command::CycleSearchScope.into());
+    editor.update(Command::CycleSearchScope.into());
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 36,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+    assert!(editor.confirm_view().is_some());
+
+    editor.update(Command::PickerCancel.into());
+
+    // Answering "no" backs out of the question only.
+    assert!(editor.confirm_view().is_none());
+    assert!(editor.search_pane_visible());
+    assert_eq!(editor.search_view().unwrap().query, "one");
+    assert_eq!(editor.focus(), Focus::Overlay);
 }
 
 #[test]
