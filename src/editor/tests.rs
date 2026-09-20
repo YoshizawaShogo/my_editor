@@ -4512,38 +4512,49 @@ fn naming_a_declaration_does_not_open_the_completion_popup() {
 #[test]
 fn the_shorter_candidate_wins_a_tie_so_typing_on_can_still_reach_it() {
     let mut editor = editor_with_lsp();
-    editor.update(AppEvent::TextPaste("V".to_owned()));
+    editor.update(AppEvent::TextPaste("Ve".to_owned()));
 
-    // The fuzzy score only measures the matched part, so these tie; the server
-    // happens to list the longer one first. `Vec` stays in the list because
-    // picking it does change the buffer — it fills in the type parameter.
+    // Captured from rust-analyzer: both carry the same sortText, the labels
+    // carry type hints, and `Vec`'s filter text carries its aliases — which is
+    // longer than the whole of `VecDeque`.
     complete_with(
         &mut editor,
         serde_json::json!([
             {
                 "label": "VecDeque<…>",
+                "labelDetails": {"description": "VecDeque<{unknown}, {unknown}>"},
                 "filterText": "VecDeque",
+                "sortText": "7fffffff",
                 "insertTextFormat": 2,
-                "insertText": "VecDeque<$0>"
+                "textEdit": {
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 2}
+                    },
+                    "newText": "VecDeque<$0>"
+                }
             },
-            // The label carries the type hint and the aliases, so it is the
-            // longer of the two even though the name is shorter.
             {
-                "label": "Vec<…>(alias list, vector)",
-                "filterText": "Vec",
+                "label": "Vec<…>",
+                "labelDetails": {"detail": "(alias list, vector)"},
+                "filterText": "Veclistvector",
+                "sortText": "7fffffff",
                 "insertTextFormat": 2,
-                "insertText": "Vec<$0>"
+                "textEdit": {
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 2}
+                    },
+                    "newText": "Vec<$0>"
+                }
             },
         ]),
     );
 
-    // `Vec` is a prefix of both others, so no further keystroke could lift it —
+    // `Vec` is a prefix of `VecDeque`, so no further keystroke could lift it —
     // it has to be on top while it still can be.
     let view = editor.completion_view().expect("completion popup");
-    assert_eq!(
-        view.items.first().map(String::as_str),
-        Some("Vec<…>(alias list, vector)")
-    );
+    assert_eq!(view.items.first().map(String::as_str), Some("Vec<…>"));
 }
 
 #[test]
