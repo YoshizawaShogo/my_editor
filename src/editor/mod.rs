@@ -3362,7 +3362,21 @@ impl Editor {
         // Over any other right pane — the diff, find, the shell — this takes the
         // half over rather than merely dismissing it, the same way Ctrl+O and
         // Ctrl+F do. The diff has Esc and F6 for closing.
-        let view = self.layout.left.view.clone();
+        //
+        // 分割の目的はたいてい別のファイルを並べて見ることなので、他に開いて
+        // いるバッファがあればその先頭（最初に開いたもの）を右に出す。同じ
+        // ファイルを二画面で見たいときは分割後にCtrl+Gで選び直せばよい。
+        let left = self.layout.left.view.doc;
+        let view = match self
+            .documents
+            .keys()
+            .filter(|id| **id != left)
+            .min_by_key(|id| id.0)
+            .copied()
+        {
+            Some(other) => self.view_for(other),
+            None => self.layout.left.view.clone(),
+        };
         self.set_right_pane(Some(RightPane::Editor(EditorPane { view })));
         self.focus = Focus::Editor(Side::Right);
     }

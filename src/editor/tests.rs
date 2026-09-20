@@ -2651,15 +2651,17 @@ fn opening_a_file_from_picker_exits_diff_mode() {
 fn buffer_picker_replaces_the_mouse_focused_pane_without_closing_split() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 24 });
-    editor.open_paths([PathBuf::from("left.txt"), PathBuf::from("right.txt")]);
-    editor.update(AppEvent::Io(IoEvent::FileLoaded {
-        id: DocumentId(1),
-        result: Ok("left".to_owned()),
-    }));
-    editor.update(AppEvent::Io(IoEvent::FileLoaded {
-        id: DocumentId(2),
-        result: Ok("right".to_owned()),
-    }));
+    editor.open_paths([
+        PathBuf::from("first.txt"),
+        PathBuf::from("picked.txt"),
+        PathBuf::from("current.txt"),
+    ]);
+    for (id, text) in [(1, "first"), (2, "picked"), (3, "current")] {
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(id),
+            result: Ok(text.to_owned()),
+        }));
+    }
     editor.update(Command::ToggleSplit.into());
     editor.update(AppEvent::Mouse(MouseInput {
         event: MouseEvent {
@@ -2671,16 +2673,52 @@ fn buffer_picker_replaces_the_mouse_focused_pane_without_closing_split() {
         clicks: 1,
     }));
     editor.update(Command::OpenBufferPicker.into());
-    for character in "left.txt".chars() {
+    for character in "picked.txt".chars() {
         editor.update(AppEvent::TextInput(character));
     }
     editor.update(Command::PickerConfirm.into());
 
     let (left, right, diff) = editor.split_buffers().unwrap();
     assert!(!diff);
-    assert_eq!(left.text.to_string(), "left");
-    assert_eq!(right.text.to_string(), "right");
+    assert_eq!(left.text.to_string(), "picked");
+    assert_eq!(right.text.to_string(), "first");
     assert_eq!(editor.focus, Focus::Editor(Side::Left));
+}
+
+#[test]
+fn splitting_shows_the_first_other_buffer_on_the_right() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+    editor.open_paths([PathBuf::from("first.txt"), PathBuf::from("current.txt")]);
+    for (id, text) in [(1, "first"), (2, "current")] {
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(id),
+            result: Ok(text.to_owned()),
+        }));
+    }
+
+    editor.update(Command::ToggleSplit.into());
+
+    let (left, right, _) = editor.split_buffers().unwrap();
+    assert_eq!(left.text.to_string(), "current");
+    assert_eq!(right.text.to_string(), "first");
+}
+
+#[test]
+fn splitting_the_only_buffer_shows_it_on_both_sides() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+    editor.open_paths([PathBuf::from("only.txt")]);
+    editor.update(AppEvent::Io(IoEvent::FileLoaded {
+        id: DocumentId(1),
+        result: Ok("only".to_owned()),
+    }));
+
+    editor.update(Command::ToggleSplit.into());
+
+    let (left, right, _) = editor.split_buffers().unwrap();
+    assert_eq!(left.text.to_string(), "only");
+    assert_eq!(right.text.to_string(), "only");
 }
 
 #[test]
