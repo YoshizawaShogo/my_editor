@@ -64,6 +64,15 @@ impl LargeFile {
         })
     }
 
+    /// Index the whole file and answer with its last line. The scan walks the
+    /// rest of the mapping once — milliseconds for tens of megabytes — and every
+    /// later jump reuses the index it leaves behind, so the end of a log is one
+    /// keystroke away instead of a wheel's worth of scrolling.
+    pub fn scan_to_end(&self) -> usize {
+        self.ensure_line(usize::MAX);
+        self.last_line().unwrap_or(0)
+    }
+
     pub fn ensure_line(&self, target: usize) {
         let mut index = self.index.borrow_mut();
         while index.starts.len() <= target && !index.complete {

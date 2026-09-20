@@ -771,7 +771,7 @@ struct GitGutter { lines: HashMap<usize, GitLineStatus> }   // 変更行のみ
 
 - **git データ源**: `git` サブプロセスに委譲し、`git diff -U0 --no-color -- <path>` のハンク見出し（`@@ -a,b +c,d @@`）を解析して行範囲を `GitLineStatus` 化する。追加依存なし・SSH 開発サーバでは git 前提で、既存のプロセス起動基盤（LSP/PTY）と一貫。純 Rust にしたい場合は `gix` へ差し替え可能（要相談）。
 - **フロー**: `Effect::ComputeGitStatus { doc, path }` → git アクターが`git diff`、`git branch --show-current`、対象ファイルの`git status --porcelain`を実行 → `AppEvent::Git(GitEvent { doc, result: GitInfo })`。`GitInfo`はガター行、branch、対象ファイルのXY状態（`M`/`MM`/`??`等）を持つ。再計算は**ファイルオープン時・保存時**。git管理外のファイルはgit情報を空にする。
-- **大容量ファイル（§4.2.1）**: ガターの git/診断は付けない（読み取り専用・LSP なし）。行番号のみ。
+- **大容量ファイル（§4.2.1）**: ガターの git/診断は付けない（読み取り専用・LSP なし）。行番号のみ。キャレットは行単位で、クリック/ドラッグで行選択→コピー可。`Ctrl+Home`/`Ctrl+End`で先頭/末尾、`Ctrl+N`の行番号ジャンプ、`Ctrl+F`のヒットジャンプが効く（末尾と行番号は`LineIndex`を最後まで走査して解決し、以降のジャンプはその索引を使い回す）。ステータス行は通常と同じスロット構成で、言語の位置に`<read only>`、診断カウントの位置にファイルサイズを出す。
 
 ### 9.5 画面外インジケータ（エッジ矢印＋件数）
 

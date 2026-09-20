@@ -5494,7 +5494,13 @@ impl Editor {
                         .layout
                         .active_editor(self.focus)
                         .map(|pane| pane.view.doc)?;
-                    let editable = self.documents.get(&doc).and_then(Document::editable_opt)?;
+                    let document = self.documents.get(&doc)?;
+                    // The reader's caret is a line number already, so the jump
+                    // needs the index rather than a character offset.
+                    if let Some(large) = document.large() {
+                        return Some((doc, CharIdx((line - 1).min(large.scan_to_end()))));
+                    }
+                    let editable = document.editable_opt()?;
                     let text = editable.text();
                     let last = text.len_lines().saturating_sub(1);
                     Some((doc, CharIdx(text.line_to_char((line - 1).min(last)))))
@@ -6036,6 +6042,9 @@ impl Editor {
             let target = match (direction, unit) {
                 (Direction::Left | Direction::Up, Unit::Document) => 0,
                 (Direction::Left | Direction::Up, _) => current.saturating_sub(1),
+                // The end of a log is where the reading usually starts, and the
+                // line index is what makes it reachable at all.
+                (Direction::Right | Direction::Down, Unit::Document) => large.scan_to_end(),
                 (Direction::Right | Direction::Down, _) => current.saturating_add(1),
             };
             let target = if large.line(target).is_some() {
@@ -6088,18 +6097,18 @@ impl Editor {
             let focus = self.focus;
             let (documents, layout) = (&self.documents, &mut self.layout);
             if let Some(pane) = layout.active_editor_mut(focus)
-                && let Some(editable) = documents
-                    .get(&pane.view.doc)
-                    .and_then(Document::editable_opt)
+                && let Some(document) = documents.get(&pane.view.doc)
             {
-                let head = pane
-                    .view
-                    .selections
-                    .primary()
-                    .head
-                    .0
-                    .min(editable.text().len_chars());
-                let line = editable.text().char_to_line(head);
+                let head = pane.view.selections.primary().head.0;
+                // A reader's caret is a line; a buffer's is a character offset
+                // that has to be resolved to one.
+                let line = match &document.kind {
+                    crate::document::DocumentKind::Editable(editable) => {
+                        let text = editable.text();
+                        text.char_to_line(head.min(text.len_chars()))
+                    }
+                    crate::document::DocumentKind::Large(_) => head,
+                };
                 pane.view.scroll.top_line = line.saturating_sub(rows / 3);
                 pane.view.scroll.wrapped_row_offset = 0;
             }

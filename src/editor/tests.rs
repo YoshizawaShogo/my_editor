@@ -2994,6 +2994,42 @@ fn opening_a_hit_in_the_reader_puts_the_caret_on_that_line() {
 }
 
 #[test]
+fn the_reader_jumps_to_the_end_and_to_a_line_number() {
+    let lines: Vec<_> = (0..300).map(|index| format!("line {index}")).collect();
+    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let (mut editor, path) = large_reader(&borrowed);
+
+    // Ctrl+End: the end of a log is where the reading usually starts.
+    editor.update(
+        Command::Move {
+            direction: Direction::Right,
+            unit: Unit::Document,
+            extend: false,
+        }
+        .into(),
+    );
+    let reader = editor.active_large_buffer().expect("the reader is open");
+    assert_eq!(reader.view.selections.primary().head.0, 299);
+    assert!(reader.view.scroll.top_line > 280);
+
+    // Ctrl+N: a line number reaches anywhere without scrolling to it.
+    editor.update(Command::GoToLine.into());
+    for digit in "150".chars() {
+        editor.update(AppEvent::TextInput(digit));
+    }
+    editor.update(Command::PickerConfirm.into());
+
+    let reader = editor.active_large_buffer().expect("the reader is open");
+    assert_eq!(reader.view.selections.primary().head.0, 149);
+    let top = reader.view.scroll.top_line;
+    assert!(
+        top <= 149 && 149 < top + 9,
+        "line 150 off screen from {top}"
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn the_reader_stops_scrolling_at_the_last_line() {
     let (mut editor, path) = large_reader(&["aaa", "bbb", "ccc"]);
 
