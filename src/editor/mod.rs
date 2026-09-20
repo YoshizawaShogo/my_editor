@@ -214,6 +214,17 @@ impl Default for Editor {
 
 impl Editor {
     pub fn update(&mut self, event: AppEvent) -> Vec<Effect> {
+        // The popup describes the spot it was asked about, so any deliberate
+        // action moves on from it — not just the arrows it used to answer to.
+        // Esc is the exception: it peels the popup off and leaves the selections
+        // alone, which it can only decide while the popup is still there. A
+        // click dismisses before it asks again, so its own answer survives.
+        if Self::is_user_action(&event)
+            && !matches!(event, AppEvent::Command(Command::CollapseSelections))
+        {
+            self.dirty |= self.hover.is_some();
+            self.dismiss_hover();
+        }
         // The status line reports on the last thing that happened, so the next
         // deliberate action retires it — cleared before the event is applied, so
         // a message this event produces is the one left standing. Background

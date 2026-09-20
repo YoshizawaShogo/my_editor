@@ -796,7 +796,7 @@ struct EdgeSummary { errors: usize, warnings: usize, git_changes: usize, search_
 
 - **ステータスバー**: カーソル行に診断があれば、最優先（error > warning）1 件のメッセージを 1 行で常時表示。ソースも添える（例 `⚠ unused variable \`a\` — rustc(unused_variables)`）。at-a-glance 用。
 - **行末virtual text**: 各論理行で最優先の診断を`› message`としてseverity色＋italicで描画する。Rope/Selectionには入れず、クリックやカーソル移動の対象にしない。
-- **ホバーtooltip（`Overlay::Hover`, §4.6）**: 通常クリックで入力カーソルを単一caretへ移した時に、**LSP hover情報＋その位置の全診断**を集約表示する（focusを奪わない）。左右エディタ分割中は操作中ペインと反対側（右操作中は左）へ表示し、中央の分割線側へ寄せて操作位置との距離を抑える。Markdownをtree-sitterで、Rustのコードフェンス・シグネチャ・例をRust文法で再着色する。MouseMovedや範囲選択中は要求せず、選択開始時は既存Hoverを閉じる。Hover単体の要求失敗は通常statusへ出さず、表示を閉じる。
+- **ホバーtooltip（`Overlay::Hover`, §4.6）**: 通常クリックで入力カーソルを単一caretへ移した時に、**LSP hover情報＋その位置の全診断**を集約表示する（focusを奪わない）。左右エディタ分割中は操作中ペインと反対側（右操作中は左）へ表示し、中央の分割線側へ寄せて操作位置との距離を抑える。Markdownをtree-sitterで、Rustのコードフェンス・シグネチャ・例をRust文法で再着色する。MouseMovedや範囲選択中は要求せず、選択開始時は既存Hoverを閉じる。Hover単体の要求失敗は通常statusへ出さず、表示を閉じる。**表示後は次のユーザー操作（キー入力・コマンド・ホイール・クリック）で閉じる**（`update`の入口で一括。Escだけは例外で、Hover表示中は選択を触らずHoverだけを閉じる。クリックは閉じた直後に自分で問い直すので、その答えは残る）。
 - **初回コストの前倒し**: tree-sitterのMarkdown/Rust highlight queryは`OnceLock`で共有し、設定読込時に短いサンプルをparseして初回コンパイルを済ませる。LSP側も上記の識別子プローブで実Hover計算を`ready`前に実行する。
 - カーソルがある行には下線を引かない（入力途中の `open: ` は型を打ち終わるまで構文エラーで、下線が打ち間違いに見えるため）。gutterのマークと行末の仮想テキストは出したままで、行を離れると下線も戻る。
 - 波線下線の色は severity に対応（error=`RED` / warning=`ORANGE`, §9.3）。`Editable.diagnostics` が唯一の source（gutter・下線・ステータス・ホバーはすべてここから描画時に導出）。

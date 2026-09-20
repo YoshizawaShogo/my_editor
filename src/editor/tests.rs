@@ -77,6 +77,33 @@ fn opening_a_right_pane_replaces_whichever_one_was_there() {
 }
 
 #[test]
+fn any_keystroke_closes_the_hover_popup() {
+    for event in [
+        AppEvent::TextInput('x'),
+        AppEvent::Command(Command::Copy),
+        AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }),
+    ] {
+        let mut editor = Editor::default();
+        editor.update(AppEvent::TextPaste("hello".to_owned()));
+        editor.hover = Some("Diagnostic: unused variable".to_owned());
+
+        editor.update(event);
+
+        // The popup answers about where the caret was, so carrying on with
+        // anything at all is done with it — not only the arrows.
+        assert!(editor.hover_view().is_none());
+    }
+}
+
+#[test]
 fn esc_closes_the_hover_popup_before_touching_the_selection() {
     let mut editor = Editor::default();
     editor.update(AppEvent::TextPaste("hello world".to_owned()));
