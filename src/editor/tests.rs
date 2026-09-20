@@ -4512,7 +4512,7 @@ fn naming_a_declaration_does_not_open_the_completion_popup() {
 #[test]
 fn the_shorter_candidate_wins_a_tie_so_typing_on_can_still_reach_it() {
     let mut editor = editor_with_lsp();
-    editor.update(AppEvent::TextPaste("Vec".to_owned()));
+    editor.update(AppEvent::TextPaste("V".to_owned()));
 
     // The fuzzy score only measures the matched part, so these tie; the server
     // happens to list the longer one first. `Vec` stays in the list because
@@ -4520,15 +4520,30 @@ fn the_shorter_candidate_wins_a_tie_so_typing_on_can_still_reach_it() {
     complete_with(
         &mut editor,
         serde_json::json!([
-            {"label": "VecDeque", "insertTextFormat": 2, "insertText": "VecDeque<$0>"},
-            {"label": "Vec", "insertTextFormat": 2, "insertText": "Vec<$0>"},
+            {
+                "label": "VecDeque<…>",
+                "filterText": "VecDeque",
+                "insertTextFormat": 2,
+                "insertText": "VecDeque<$0>"
+            },
+            // The label carries the type hint and the aliases, so it is the
+            // longer of the two even though the name is shorter.
+            {
+                "label": "Vec<…>(alias list, vector)",
+                "filterText": "Vec",
+                "insertTextFormat": 2,
+                "insertText": "Vec<$0>"
+            },
         ]),
     );
 
     // `Vec` is a prefix of both others, so no further keystroke could lift it —
     // it has to be on top while it still can be.
     let view = editor.completion_view().expect("completion popup");
-    assert_eq!(view.items.first().map(String::as_str), Some("Vec"));
+    assert_eq!(
+        view.items.first().map(String::as_str),
+        Some("Vec<…>(alias list, vector)")
+    );
 }
 
 #[test]

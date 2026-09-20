@@ -1752,6 +1752,10 @@ impl Editor {
                                 .collect();
                             Some((
                                 score,
+                                // What gets typed, not what gets shown: a label
+                                // may carry aliases and type hints that say
+                                // nothing about how long the name is.
+                                filter.chars().count(),
                                 CompletionCandidate {
                                     snippet_body: snippet.then(|| insert.clone()),
                                     insert,
@@ -1763,19 +1767,13 @@ impl Editor {
                             ))
                         })
                         .collect();
-                        // Equal scores go to the shorter label. The fuzzy score
+                        // Equal scores go to the shorter name. The fuzzy score
                         // only measures the part that matched, so `Vec` and
-                        // `VecDeque` tie on a typed `Vec` — and no further typing
+                        // `VecDeque` tie on a typed `V` — and no further typing
                         // can lift `Vec` above a candidate it is a prefix of, so
                         // the shorter one has to come first while it still can.
                         items.sort_by(|left, right| {
-                            right.0.cmp(&left.0).then_with(|| {
-                                left.1
-                                    .label
-                                    .chars()
-                                    .count()
-                                    .cmp(&right.1.label.chars().count())
-                            })
+                            right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
                         });
                         // Offer language snippets alongside the server's results,
                         // ranked to the top so `for`, `fn`, … are easy to reach.
@@ -1783,7 +1781,7 @@ impl Editor {
                             .as_deref()
                             .map(|language| snippet_candidates(language, &prefix))
                             .unwrap_or_default();
-                        merged.extend(items.into_iter().map(|(_, item)| item));
+                        merged.extend(items.into_iter().map(|(_, _, item)| item));
                         let items = merged;
                         if !items.is_empty() {
                             self.completion = Some(CompletionState {
