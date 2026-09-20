@@ -2943,6 +2943,60 @@ fn clicking_and_dragging_the_reader_selects_whole_lines_to_copy() {
 }
 
 #[test]
+fn reloading_the_reader_picks_up_appended_lines() {
+    let (mut editor, path) = large_reader(&["aaa", "bbb"]);
+    // A log grows under the editor; the mmap is a snapshot of the old length.
+    std::fs::write(&path, "aaa\nbbb\nccc\n").unwrap();
+
+    let effects = editor.update(Command::Reload.into());
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::ReadFile { id, .. }] if *id == DocumentId(1)
+    ));
+    // Re-opening remaps the file, which is what makes the new bytes readable.
+    editor.update(AppEvent::Io(IoEvent::LargeFileLoaded {
+        id: DocumentId(1),
+        result: crate::document::LargeFile::open(&path),
+    }));
+    let reader = editor.active_large_buffer().expect("the reader is open");
+    assert_eq!(reader.file.line(2).as_deref(), Some("ccc"));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn opening_a_hit_in_the_reader_puts_the_caret_on_that_line() {
+    let lines: Vec<_> = (0..200).map(|index| format!("line {index}")).collect();
+    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let (mut editor, path) = large_reader(&borrowed);
+    editor.update(Command::OpenSearch.into());
+    for character in "line".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+    // A large file is searched with grep rather than in memory.
+    let token = editor.search().unwrap().grep_token.expect("grep started");
+    editor.update(AppEvent::Grep(GrepEvent::Hits {
+        token,
+        hits: vec![GrepHit {
+            path: path.clone(),
+            line: 120,
+            text: "line 120".to_owned(),
+        }],
+    }));
+
+    editor.update(Command::PickerDown.into());
+
+    let reader = editor.active_large_buffer().expect("the reader is open");
+    assert_eq!(reader.view.selections.primary().head.0, 120);
+    let top = reader.view.scroll.top_line;
+    assert!(
+        top <= 120 && 120 < top + 9,
+        "line 120 off screen from {top}"
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn the_reader_stops_scrolling_at_the_last_line() {
     let (mut editor, path) = large_reader(&["aaa", "bbb", "ccc"]);
 

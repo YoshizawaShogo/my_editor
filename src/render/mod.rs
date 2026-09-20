@@ -14,7 +14,7 @@ use crate::{
 
 /// Stands in for the usual status line, which reports on an editable buffer a
 /// large file does not have.
-const LARGE_FILE_STATUS: &str = "READ ONLY · 大容量のためリーダー表示";
+const LARGE_FILE_STATUS: &str = "<read only> 大容量ファイル";
 
 const BG: Color = Color::Rgb(0x16, 0x18, 0x21);
 const FG: Color = Color::Rgb(0xc6, 0xc8, 0xd1);
@@ -2191,17 +2191,15 @@ fn draw_large_status(
     editor: &Editor,
     buffer: &crate::editor::LargeBuffer<'_>,
 ) {
+    // The same slots and colors as any other buffer. The language slot says what
+    // this pane is instead of which grammar it uses, and the diagnostic counts —
+    // nothing analyses a file this big — give their slot to the size, which is
+    // the reason it opened read only.
     let mut segments = vec![
         (buffer.name.clone(), Color::Rgb(0x35, 0x4f, 0x7a)),
-        // The same slot colors as any other buffer: read-only is what the pane
-        // is, not a warning about it.
         (LARGE_FILE_STATUS.to_owned(), Color::Rgb(0x35, 0x65, 0x70)),
         (
-            format!(
-                "{} · 行 {}",
-                human_bytes(buffer.file.len_bytes()),
-                buffer.view.selections.primary().head.0 + 1
-            ),
+            human_bytes(buffer.file.len_bytes()),
             Color::Rgb(0x3b, 0x4a, 0x62),
         ),
     ];
@@ -2980,7 +2978,7 @@ mod tests {
         assert!(rendered.contains("ccc"), "{rendered}");
         // The status line names the file, says it is a reader, and gives the
         // size that sent it there.
-        assert!(rendered.contains("READ ONLY"), "{rendered}");
+        assert!(rendered.contains("<read only>"), "{rendered}");
         assert!(rendered.contains("12B"), "{rendered}");
         std::fs::remove_file(path).unwrap();
     }

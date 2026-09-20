@@ -810,6 +810,7 @@ impl Editor {
                 }
             }
         });
+        let rows = usize::from(self.terminal_size.1.saturating_sub(1)).max(1);
         // Only the pane the jump was aimed at: the same file may be open in the
         // other pane too, showing the usage the jump started from.
         if let Some(pane) = self
@@ -819,9 +820,21 @@ impl Editor {
         {
             match selection {
                 Some(selection) => pane.view.selections.set_single(selection),
-                // Large files have no editable text to hold a caret; scroll the
-                // target line into view instead.
-                None => pane.view.scroll.top_line = range.start.line as usize,
+                // A large file has no character positions, but its caret is a
+                // line — so the jump lands on the hit rather than merely putting
+                // it on screen, and the line stays marked once it is there.
+                None => {
+                    let line = range.start.line as usize;
+                    pane.view
+                        .selections
+                        .set_single(Selection::caret(CharIdx(line)));
+                    let top = pane.view.scroll.top_line;
+                    if line < top || line >= top + rows {
+                        // A few lines of lead-in, so a hit does not land on the
+                        // very first row with its context off screen above.
+                        pane.view.scroll.top_line = line.saturating_sub(rows / 4);
+                    }
+                }
             }
         }
         if selection.is_some() {
@@ -4525,8 +4538,14 @@ impl Editor {
                 if let Some((doc, _)) = self.documents.iter().find(|(_, document)| {
                     document.path.as_ref() == Some(&hit.path) && document.large().is_some()
                 }) {
+                    // The reader's caret is a line, so the hit is marked rather
+                    // than merely scrolled to — with lead-in above it, instead of
+                    // pinned to the top row with its context off screen.
+                    let rows = usize::from(self.terminal_size.1.saturating_sub(1)).max(1);
                     let mut view = View::new(*doc);
-                    view.scroll.top_line = hit.line;
+                    view.selections
+                        .set_single(Selection::caret(CharIdx(hit.line)));
+                    view.scroll.top_line = hit.line.saturating_sub(rows / 4);
                     self.layout.left = EditorPane { view };
                     Vec::new()
                 } else {
