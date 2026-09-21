@@ -4504,6 +4504,29 @@ fn a_lower_case_prefix_reaches_both_cases_and_a_capital_only_its_own() {
 }
 
 #[test]
+fn a_pattern_match_completes_even_though_it_starts_with_let() {
+    let mut editor = Editor::default();
+    editor.open_paths([PathBuf::from("x.rs")]);
+    editor.update(AppEvent::TextPaste(
+        "let something = 1;\nwhile let som".to_owned(),
+    ));
+
+    editor.update(AppEvent::TextInputAt {
+        character: 'e',
+        at: std::time::Instant::now(),
+    });
+
+    // `while let Some(x)` matches a pattern: what follows `let` is a constructor
+    // to complete, not a name being coined.
+    let view = editor.completion_view().expect("completion popup");
+    assert!(
+        view.items.iter().any(|label| label == "something"),
+        "{:?}",
+        view.items
+    );
+}
+
+#[test]
 fn a_reference_to_something_mutable_still_completes() {
     let mut editor = Editor::default();
     editor.open_paths([PathBuf::from("x.rs")]);

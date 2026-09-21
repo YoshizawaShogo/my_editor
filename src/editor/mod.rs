@@ -2116,6 +2116,24 @@ impl Editor {
         }
     }
 
+    /// The word ending just before `at`, with blanks between the two, and where
+    /// it starts. `None` when nothing separates them — `foo.bar` and `Foo::bar`
+    /// are one expression, not a word followed by another.
+    fn word_before(text: &Rope, at: usize) -> Option<(String, usize)> {
+        let mut gap = at;
+        while gap > 0 && matches!(text.char(gap - 1), ' ' | '\t') {
+            gap -= 1;
+        }
+        if gap == at {
+            return None;
+        }
+        let mut start = gap;
+        while start > 0 && is_word(text.char(start - 1)) {
+            start -= 1;
+        }
+        (start < gap).then(|| (text.slice(start..gap).to_string(), start))
+    }
+
     /// Whether the word being typed is a name being introduced — the `foo` of
     /// `let foo`, `fn foo`, `struct Foo`. Nothing can complete a name that does
     /// not exist yet, so the popup there only offers to overwrite it with
@@ -2155,34 +2173,28 @@ impl Editor {
         while word_start > 0 && is_word(text.char(word_start - 1)) {
             word_start -= 1;
         }
-        let mut gap_start = word_start;
-        while gap_start > 0 && matches!(text.char(gap_start - 1), ' ' | '\t') {
-            gap_start -= 1;
-        }
-        // No blank between the two: `foo.bar` and `Foo::bar` are not declarations.
-        if gap_start == word_start {
+        let Some((keyword, keyword_start)) = Self::word_before(text, word_start) else {
             return false;
-        }
-        let mut keyword_start = gap_start;
-        while keyword_start > 0 && is_word(text.char(keyword_start - 1)) {
-            keyword_start -= 1;
-        }
-        let keyword = text.slice(keyword_start..gap_start).to_string();
+        };
         // `mut` introduces a name in `let mut x`, but `&mut x` is a use of one —
         // and that is the common one, so it only counts behind a binding.
-        if keyword == "mut" {
-            let mut gap = keyword_start;
-            while gap > 0 && matches!(text.char(gap - 1), ' ' | '\t') {
-                gap -= 1;
+        let (keyword, keyword_start) = if keyword == "mut" {
+            match Self::word_before(text, keyword_start) {
+                Some((word, start)) if matches!(word.as_str(), "let" | "static" | "const") => {
+                    (word, start)
+                }
+                _ => return false,
             }
-            let mut start = gap;
-            while start > 0 && is_word(text.char(start - 1)) {
-                start -= 1;
-            }
-            return matches!(
-                text.slice(start..gap).to_string().as_str(),
-                "let" | "static" | "const"
-            );
+        } else {
+            (keyword, keyword_start)
+        };
+        // `if let Some(x)` and `while let Some(x)` match a pattern: what follows
+        // `let` there is a constructor to be completed, not a name to be coined.
+        if keyword == "let"
+            && Self::word_before(text, keyword_start)
+                .is_some_and(|(word, _)| matches!(word.as_str(), "if" | "while"))
+        {
+            return false;
         }
         DECLARES.contains(&keyword.as_str())
     }
