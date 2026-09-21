@@ -468,6 +468,12 @@ impl Editor {
             }
             AppEvent::TerminalInput(bytes) => {
                 if let Some(shell) = self.shell.as_mut() {
+                    // Enter runs whatever is on the cursor's line, so that is the
+                    // line worth remembering — recorded before the shell replaces
+                    // it with the command's output.
+                    if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
+                        shell.remember_command_line();
+                    }
                     shell.selection = None;
                     shell.parser.set_scrollback(0);
                 }
@@ -3555,6 +3561,7 @@ impl Editor {
             token,
             parser: vt100::Parser::new(rows, cols, TERMINAL_SCROLLBACK_LINES),
             selection: None,
+            commands: Vec::new(),
         });
         vec![Effect::SpawnShell {
             token,
@@ -7091,6 +7098,38 @@ struct ShellSession {
     token: u64,
     parser: vt100::Parser,
     selection: Option<TerminalSelection>,
+    /// The command lines that have been run, as the screen showed them at the
+    /// moment they were entered — prompt and all. The log is ours, but nothing
+    /// in it says which lines were commands, and a prompt is whatever the shell
+    /// decides to print. Remembering the line as it was run is the one answer
+    /// that does not depend on guessing a prompt's shape.
+    commands: Vec<String>,
+}
+
+impl ShellSession {
+    /// How many command lines to keep. Enough to walk back through a session's
+    /// worth of work, far short of the scrollback it is searched against.
+    const REMEMBERED_COMMANDS: usize = 200;
+
+    /// Record the line the cursor is on as a command that was run. Consecutive
+    /// repeats collapse: pressing Enter on an empty prompt, or running the same
+    /// thing twice in a row, should not fill the list with one line.
+    fn remember_command_line(&mut self) {
+        let screen = self.parser.screen();
+        let (_, cols) = screen.size();
+        let (row, _) = screen.cursor_position();
+        let line = screen
+            .contents_between(row, 0, row, cols)
+            .trim_end()
+            .to_owned();
+        if line.trim().is_empty() || self.commands.last() == Some(&line) {
+            return;
+        }
+        self.commands.push(line);
+        if self.commands.len() > Self::REMEMBERED_COMMANDS {
+            self.commands.remove(0);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

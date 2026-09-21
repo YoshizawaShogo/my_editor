@@ -256,8 +256,30 @@ fn shell_focus_key(key: KeyEvent) -> Option<AppEvent> {
 }
 
 fn shell_key(key: KeyEvent) -> Option<Vec<u8>> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // xterm's modifier encoding, carried as the sequence's first parameter:
+    // 1 + shift + 2·alt + 4·ctrl. Without it every arrow arrives as a bare one,
+    // so a shell that binds Ctrl+Left to word-left sees a plain Left instead —
+    // the key did nothing it was asked to do.
+    let modifier = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+    let cursor = |final_byte: char| {
+        if modifier == 1 {
+            format!("\x1b[{final_byte}").into_bytes()
+        } else {
+            format!("\x1b[1;{modifier}{final_byte}").into_bytes()
+        }
+    };
+    let editing = |number: u8| {
+        if modifier == 1 {
+            format!("\x1b[{number}~").into_bytes()
+        } else {
+            format!("\x1b[{number};{modifier}~").into_bytes()
+        }
+    };
     match key.code {
-        KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(character) if ctrl => {
             match character {
                 // crossterm decodes 0x1c..=0x1f (Ctrl+\ ] ^ _) as Ctrl+4..=7. Send those
                 // bytes back; masking the digit instead would turn Ctrl+] into ^U,
@@ -273,16 +295,30 @@ fn shell_key(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Null => Some(vec![0]),
         KeyCode::Char(character) => {
             let mut bytes = [0; 4];
-            Some(character.encode_utf8(&mut bytes).as_bytes().to_vec())
+            let typed = character.encode_utf8(&mut bytes).as_bytes();
+            // Alt travels as an ESC prefix, which is how a shell reads Alt+b and
+            // Alt+f — the other half of word-wise movement.
+            Some(if alt {
+                [b"\x1b".as_slice(), typed].concat()
+            } else {
+                typed.to_vec()
+            })
         }
         KeyCode::Enter => Some(vec![b'\r']),
         KeyCode::Backspace => Some(vec![0x7f]),
         KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
         KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Up => Some(cursor('A')),
+        KeyCode::Down => Some(cursor('B')),
+        KeyCode::Right => Some(cursor('C')),
+        KeyCode::Left => Some(cursor('D')),
+        KeyCode::Home => Some(cursor('H')),
+        KeyCode::End => Some(cursor('F')),
+        KeyCode::Insert => Some(editing(2)),
+        KeyCode::Delete => Some(editing(3)),
+        KeyCode::PageUp => Some(editing(5)),
+        KeyCode::PageDown => Some(editing(6)),
         _ => None,
     }
 }
@@ -318,6 +354,60 @@ mod tests {
         let event = translate(raw, &Focus::Editor(Side::Left), &mut pending);
 
         assert_eq!(event, Some(AppEvent::Command(Command::Quit)));
+    }
+
+    #[test]
+    fn the_shell_receives_modified_keys_as_their_escape_sequences() {
+        let mut pending = KeyChordState::default();
+        let sent = |key: KeyEvent, pending: &mut KeyChordState| match translate(
+            raw_key(key),
+            &Focus::Shell,
+            pending,
+        ) {
+            Some(AppEvent::TerminalInput(bytes)) => String::from_utf8(bytes).unwrap(),
+            other => panic!("expected terminal input, got {other:?}"),
+        };
+
+        // Word-wise movement: the shell binds these, and a bare `\x1b[D` is the
+        // one-character move it does not mean.
+        assert_eq!(
+            sent(
+                KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+                &mut pending
+            ),
+            "\x1b[1;5D"
+        );
+        assert_eq!(
+            sent(
+                KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+                &mut pending
+            ),
+            "\x1b[1;5C"
+        );
+        // Alt travels as an ESC prefix, the other half of word-wise movement.
+        assert_eq!(
+            sent(
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+                &mut pending
+            ),
+            "\x1bb"
+        );
+        // Unmodified keys keep their short forms, and the editing keys arrive at
+        // all now.
+        assert_eq!(
+            sent(
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+                &mut pending
+            ),
+            "\x1b[D"
+        );
+        assert_eq!(
+            sent(
+                KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+                &mut pending
+            ),
+            "\x1b[3~"
+        );
     }
 
     #[test]
