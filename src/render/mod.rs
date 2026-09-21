@@ -38,6 +38,23 @@ const CODE_STRING: Color = Color::Rgb(0xb4, 0xbe, 0x82); // green: "text", 'c'
 const CODE_NUMBER: Color = Color::Rgb(0xd7, 0xb8, 0x7a); // amber: 0, 1, 2, true
 const CODE_BUILTIN: Color = Color::Rgb(0xc6, 0x8b, 0xa5); // dusty rose: macros, lifetimes
 const SELECTION: Color = Color::Rgb(0x27, 0x2c, 0x42);
+/// One colour per indent level, cycling. Dim enough to sit under the code
+/// rather than compete with it, while the change of hue still counts the
+/// levels at a glance.
+const INDENT_GUIDES: [Color; 6] = [
+    Color::Rgb(0x5c, 0x3c, 0x42), // red
+    Color::Rgb(0x5c, 0x4c, 0x36), // amber
+    Color::Rgb(0x55, 0x57, 0x3b), // olive
+    Color::Rgb(0x3a, 0x57, 0x46), // green
+    Color::Rgb(0x36, 0x4a, 0x62), // blue
+    Color::Rgb(0x4b, 0x3e, 0x5e), // violet
+];
+/// Blanks nobody meant to leave, at the end of a line.
+const TRAILING_WHITESPACE: Color = Color::Rgb(0x7d, 0x46, 0x4d);
+/// Behind a character that passes for ASCII but is not. A full-width space is
+/// the reason this is a background and not a colour: there is no glyph to
+/// colour, so the block itself has to be what shows.
+const CONFUSABLE_BG: Color = Color::Rgb(0x5f, 0x33, 0x3c);
 /// A more prominent selection tint for list rows (pickers), where the subtle
 /// editor selection colour is hard to spot.
 const SELECTION_STRONG: Color = Color::Rgb(0x3c, 0x4a, 0x78);
@@ -1707,6 +1724,16 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
         let mut rows: Vec<Vec<Span>> = vec![Vec::new()];
         let line = buffer.text.line(line_index);
         let line_start = buffer.text.line_to_char(line_index);
+        // Where the indentation ends and where the trailing blanks start. A line
+        // that is nothing but blanks is all trailing: there is no indentation to
+        // guide, only whitespace left behind.
+        let blanks: Vec<bool> = line
+            .chars()
+            .take_while(|character| !matches!(character, '\r' | '\n'))
+            .map(|character| matches!(character, ' ' | '\t'))
+            .collect();
+        let indent_end = blanks.iter().take_while(|blank| **blank).count();
+        let trailing_start = blanks.len() - blanks.iter().rev().take_while(|b| **b).count();
         let mut display_col = 0;
         for (char_col, character) in line.chars().enumerate() {
             if matches!(character, '\r' | '\n') {
@@ -1763,11 +1790,28 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
                 }
                 style
             };
+            let leading = char_col < indent_end;
+            // Not on the line being typed on: the blank after the word just
+            // typed is about to be typed over, and dotting it reads as a
+            // mistake the moment the space bar is pressed. The same reasoning
+            // keeps the diagnostic underline off that line.
+            let trailing = char_col >= trailing_start && editing_line != Some(line_index);
             if character == '\t' {
                 for column in display_col..next_col {
-                    push_cell(&mut rows, column / text_width, " ".to_owned(), style);
+                    let (glyph, cell) =
+                        blank_cell(column, leading, trailing, buffer.tab_size, style);
+                    push_cell(&mut rows, column / text_width, glyph, cell);
                 }
+            } else if character == ' ' {
+                let (glyph, cell) =
+                    blank_cell(display_col, leading, trailing, buffer.tab_size, style);
+                push_cell(&mut rows, display_col / text_width, glyph, cell);
             } else {
+                let style = if confusable_with_ascii(character) {
+                    style.bg(CONFUSABLE_BG)
+                } else {
+                    style
+                };
                 // Keep a wide glyph whole: if it would straddle a wrap boundary,
                 // place it on the row where it finishes.
                 let target_row = next_col.saturating_sub(1) / text_width;
@@ -2063,6 +2107,53 @@ fn matching_bracket_indices(text: &ropey::Rope, cursor: usize) -> Vec<usize> {
         }
     }
     Vec::new()
+}
+
+/// How a blank column is drawn: an indent guide at the start of each level of
+/// the indentation, a dot in whitespace trailing the line, and an ordinary
+/// space everywhere else — between words, where marking every blank would make
+/// prose unreadable.
+fn blank_cell(
+    column: usize,
+    leading: bool,
+    trailing: bool,
+    tab_size: usize,
+    style: Style,
+) -> (String, Style) {
+    if trailing {
+        return ("·".to_owned(), style.fg(TRAILING_WHITESPACE));
+    }
+    let tab_size = tab_size.max(1);
+    if leading && column.is_multiple_of(tab_size) {
+        let level = column / tab_size;
+        return (
+            "│".to_owned(),
+            style.fg(INDENT_GUIDES[level % INDENT_GUIDES.len()]),
+        );
+    }
+    (" ".to_owned(), style)
+}
+
+/// Characters that read as ASCII but are not, and are worth pointing out in
+/// code: the invisible spaces, the full-width punctuation, the dashes and
+/// quotes a Japanese IME leaves behind. Full-width letters and digits are left
+/// alone — they are legible as themselves, and flagging them would light up
+/// ordinary Japanese text.
+fn confusable_with_ascii(character: char) -> bool {
+    if matches!(
+        character,
+        '\u{3000}'                       // 全角スペース
+            | '\u{00a0}'                 // NBSP
+            | '\u{2000}'..='\u{200b}'    // その他の不可視スペース
+            | '\u{2010}'..='\u{2015}'    // ‐ ‑ ‒ – — ―
+            | '\u{2018}' | '\u{2019}'    // ' '
+            | '\u{201c}' | '\u{201d}'    // " "
+            | '\u{2212}'                 // 数学のマイナス
+            | '\u{30fc}' // 長音符 ー
+    ) {
+        return true;
+    }
+    matches!(character, '\u{ff01}'..='\u{ff5e}') && !character.is_alphanumeric()
 }
 
 fn push_cell(rows: &mut Vec<Vec<Span<'static>>>, row: usize, text: String, style: Style) {
@@ -2625,12 +2716,46 @@ mod tests {
         terminal.draw(|frame| draw(frame, &editor)).unwrap();
 
         let buffer = terminal.backend().buffer();
-        // gutter is 5 wide, so text begins at column 5: row 0 shows "    a".
-        assert!((5..9).all(|column| buffer[(column, 0)].symbol() == " "));
+        // gutter is 5 wide, so text begins at column 5: row 0 shows "    a", the
+        // first column of the indentation carrying its guide.
+        assert_eq!(buffer[(5, 0)].symbol(), "│");
+        assert!((6..9).all(|column| buffer[(column, 0)].symbol() == " "));
         assert_eq!(buffer[(9, 0)].symbol(), "a");
         // The continuation row resumes with the very next character, "bcdef".
         assert_eq!(buffer[(5, 1)].symbol(), "b");
         assert_eq!(buffer[(6, 1)].symbol(), "c");
+    }
+
+    #[test]
+    fn indentation_trailing_blanks_and_look_alikes_are_all_visible() {
+        let backend = TestBackend::new(24, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 24, rows: 6 });
+        editor.update(crate::editor::AppEvent::TextPaste(
+            "if a {\n    b\n        c  \n}\n\u{3000}x".to_owned(),
+        ));
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // The gutter is 5 wide, so the text starts at column 5.
+        // One indent: a guide at the start of the level, then plain blanks.
+        assert_eq!(buffer[(5, 1)].symbol(), "│");
+        assert_eq!(buffer[(5, 1)].fg, INDENT_GUIDES[0]);
+        assert!((6..9).all(|column| buffer[(column, 1)].symbol() == " "));
+        assert_eq!(buffer[(9, 1)].symbol(), "b");
+
+        // Two indents: the second level takes the next colour along.
+        assert_eq!(buffer[(9, 2)].symbol(), "│");
+        assert_eq!(buffer[(9, 2)].fg, INDENT_GUIDES[1]);
+        // Blanks left at the end of the line are dotted rather than guided.
+        assert_eq!(buffer[(14, 2)].symbol(), "·");
+        assert_eq!(buffer[(14, 2)].fg, TRAILING_WHITESPACE);
+
+        // A full-width space has no glyph to colour, so the block shows instead.
+        assert_eq!(buffer[(5, 4)].bg, CONFUSABLE_BG);
+        assert_eq!(buffer[(7, 4)].symbol(), "x");
     }
 
     #[test]
