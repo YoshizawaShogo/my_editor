@@ -7351,23 +7351,29 @@ impl ShellSession {
             .position(|window| window == PREFIX)
         {
             let body = &self.osc_pending[start + PREFIX.len()..];
-            // BEL or ST ends the sequence; neither yet means it is still arriving.
-            let Some((payload, consumed)) = body
+            // BEL or ST ends the sequence, whichever comes first — a shell prints
+            // its window title right after this one, and that ends in a BEL. Take
+            // the far terminator and the title lands inside the path. Neither
+            // present yet means the sequence is still arriving.
+            let bel = body
                 .iter()
                 .position(|byte| *byte == 0x07)
-                .map(|end| (&body[..end], end + 1))
-                .or_else(|| {
-                    body.windows(2)
-                        .position(|window| window == b"\x1b\\")
-                        .map(|end| (&body[..end], end + 2))
-                })
-            else {
+                .map(|end| (end, end + 1));
+            let st = body
+                .windows(2)
+                .position(|window| window == b"\x1b\\")
+                .map(|end| (end, end + 2));
+            let nearest = match (bel, st) {
+                (Some(bel), Some(st)) => Some(bel.min(st)),
+                (found, None) | (None, found) => found,
+            };
+            let Some((end, consumed)) = nearest else {
                 // Drop what precedes the unfinished sequence so the scan does not
                 // start over from the top of the buffer next time.
                 self.osc_pending.drain(..start);
                 return;
             };
-            if let Some(directory) = shell_uri_directory(payload) {
+            if let Some(directory) = shell_uri_directory(&body[..end]) {
                 self.cwd = Some(directory);
             }
             self.osc_pending.drain(..start + PREFIX.len() + consumed);

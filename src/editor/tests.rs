@@ -412,9 +412,14 @@ fn ctrl_clicking_a_path_in_the_log_opens_it_at_that_line() {
     // The shell reports where it is with OSC 7 on every prompt, and what it
     // prints is relative to that — the editor's workspace root is the opened
     // file's own directory, which is a different place entirely.
+    // Exactly what the shell sends: the directory ends in ST, and the window
+    // title follows immediately — ending in a BEL that must not be mistaken for
+    // this sequence's terminator.
     editor.update(AppEvent::Terminal(TerminalEvent::Output {
         token,
-        bytes: b"\x1b]7;file://HOST/home/shogo/projects/my_atcoder_cli\x1b\\".to_vec(),
+        bytes:
+            b"\x1b]7;file://HOST/home/shogo/projects/my_atcoder_cli\x1b\\\x1b]2;my_atcoder_cli\x07"
+                .to_vec(),
     }));
     editor.update(AppEvent::Terminal(TerminalEvent::Output {
         token,
