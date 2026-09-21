@@ -2122,10 +2122,9 @@ impl Editor {
     /// something else. A deliberate Ctrl+Space still opens it.
     fn typing_a_name_being_declared(&self) -> bool {
         // The words after which the next one is a new name, across the languages
-        // this editor highlights. `mut` covers `let mut foo`.
-        const DECLARES: [&str; 16] = [
+        // this editor highlights.
+        const DECLARES: [&str; 14] = [
             "let",
-            "mut",
             "var",
             "const",
             "static",
@@ -2136,7 +2135,6 @@ impl Editor {
             "class",
             "struct",
             "enum",
-            "union",
             "trait",
             "interface",
             "namespace",
@@ -2169,7 +2167,24 @@ impl Editor {
         while keyword_start > 0 && is_word(text.char(keyword_start - 1)) {
             keyword_start -= 1;
         }
-        DECLARES.contains(&text.slice(keyword_start..gap_start).to_string().as_str())
+        let keyword = text.slice(keyword_start..gap_start).to_string();
+        // `mut` introduces a name in `let mut x`, but `&mut x` is a use of one —
+        // and that is the common one, so it only counts behind a binding.
+        if keyword == "mut" {
+            let mut gap = keyword_start;
+            while gap > 0 && matches!(text.char(gap - 1), ' ' | '\t') {
+                gap -= 1;
+            }
+            let mut start = gap;
+            while start > 0 && is_word(text.char(start - 1)) {
+                start -= 1;
+            }
+            return matches!(
+                text.slice(start..gap).to_string().as_str(),
+                "let" | "static" | "const"
+            );
+        }
+        DECLARES.contains(&keyword.as_str())
     }
 
     /// Completion fallback for buffers without an LSP: offer the identifiers that

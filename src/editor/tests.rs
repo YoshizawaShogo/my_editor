@@ -4504,6 +4504,28 @@ fn a_lower_case_prefix_reaches_both_cases_and_a_capital_only_its_own() {
 }
 
 #[test]
+fn a_reference_to_something_mutable_still_completes() {
+    let mut editor = Editor::default();
+    editor.open_paths([PathBuf::from("x.rs")]);
+    editor.update(AppEvent::TextPaste(
+        "let sorted = 1;\nfoo(&mut sor".to_owned(),
+    ));
+
+    editor.update(AppEvent::TextInputAt {
+        character: 't',
+        at: std::time::Instant::now(),
+    });
+
+    // `&mut sorted` uses a name; only `let mut sorted` introduces one.
+    let view = editor.completion_view().expect("completion popup");
+    assert!(
+        view.items.iter().any(|label| label == "sorted"),
+        "{:?}",
+        view.items
+    );
+}
+
+#[test]
 fn naming_a_declaration_does_not_open_the_completion_popup() {
     let mut editor = Editor::default();
     editor.open_paths([PathBuf::from("x.rs")]);
