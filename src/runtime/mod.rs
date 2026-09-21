@@ -7,9 +7,24 @@ use std::{
     os::unix::{io::AsRawFd, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use lsp_server::{Message, Notification, Request, RequestId, Response, ResponseError};
+
+/// How long one pass may spend draining events before it has to draw. Long
+/// enough to collapse a burst into one repaint, short enough that endless
+/// output still leaves the editor answering the keyboard.
+const DRAIN_BUDGET: Duration = Duration::from_millis(8);
+
+/// How much shell output may be waiting to be consumed before its reader stops
+/// reading. One screen of a wide terminal is a few KB; this is room for a burst
+/// without letting an endless one grow without bound.
+const PTY_UNREAD_LIMIT: usize = 256 * 1024;
 use nix::pty::{Winsize, openpty};
 use tokio::sync::mpsc;
 
@@ -158,7 +173,13 @@ impl Runtime {
         // spinning the mouse wheel — collapses into a single redraw instead of
         // one per event. This matters most over SSH, where each redraw is a
         // network round-trip and a scroll repaint can be tens of KB.
-        loop {
+        //
+        // Bounded, because a command that never stops printing — `yes` — keeps
+        // handing the drain more work than it can finish: the loop would never
+        // reach the draw below, nor the effects that carry the Ctrl+C meant to
+        // stop it.
+        let deadline = Instant::now() + DRAIN_BUDGET;
+        'drain: loop {
             let mut progressed = false;
             while let Ok(raw) = self.raw_rx.try_recv() {
                 if let Some(event) = translate(raw, &self.editor.focus(), &mut self.pending_keys) {
@@ -171,6 +192,12 @@ impl Runtime {
                 self.observe_runtime_event(&event);
                 effects.extend(self.editor.update(event));
                 progressed = true;
+                // Checked here and not only once around the loop: output arrives
+                // faster than it can be drawn, so this queue never runs dry and
+                // the pass has to stop itself.
+                if Instant::now() >= deadline {
+                    break 'drain;
+                }
             }
             if !progressed {
                 break;
@@ -815,9 +842,17 @@ impl Runtime {
             Err(_) => return,
         };
         let tx = self.tx.clone();
+        let unread = Arc::new(AtomicUsize::new(0));
+        let reader_unread = Arc::clone(&unread);
         std::thread::spawn(move || {
             let mut buffer = [0u8; 8192];
             loop {
+                // Wait for the editor to work through what it already has. The
+                // PTY fills while we wait, which is what makes the shell itself
+                // block on write — the backpressure a terminal normally applies.
+                while reader_unread.load(Ordering::Relaxed) > PTY_UNREAD_LIMIT {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
                 match reader.read(&mut buffer) {
                     Ok(0) => {
                         let _ = tx.send(AppEvent::Terminal(TerminalEvent::Exited {
@@ -827,6 +862,7 @@ impl Runtime {
                         break;
                     }
                     Ok(read) => {
+                        reader_unread.fetch_add(read, Ordering::Relaxed);
                         let _ = tx.send(AppEvent::Terminal(TerminalEvent::Output {
                             token,
                             bytes: buffer[..read].to_vec(),
@@ -853,6 +889,7 @@ impl Runtime {
             token,
             writer: master,
             child,
+            unread,
         });
     }
 
@@ -860,6 +897,11 @@ impl Runtime {
     /// a session already replaced by [`Self::spawn_shell`] — must not tear down
     /// the handle that succeeded it.
     fn observe_runtime_event(&mut self, event: &AppEvent) {
+        if let AppEvent::Terminal(TerminalEvent::Output { token, bytes }) = event
+            && let Some(shell) = self.shell.as_ref().filter(|shell| shell.token == *token)
+        {
+            shell.unread.fetch_sub(bytes.len(), Ordering::Relaxed);
+        }
         if let AppEvent::Terminal(TerminalEvent::Exited { token, .. }) = event
             && let Some(mut shell) = self.shell.take_if(|shell| shell.token == *token)
         {
@@ -890,6 +932,11 @@ struct ShellHandle {
     token: u64,
     writer: File,
     child: Child,
+    /// Output the reader has handed over that the editor has not consumed yet.
+    /// A command like `yes` writes faster than any screen can show it, and the
+    /// reader waits on this rather than filling memory with a backlog nobody
+    /// will ever read.
+    unread: Arc<AtomicUsize>,
 }
 
 impl Drop for Runtime {

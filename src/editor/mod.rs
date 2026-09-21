@@ -41,6 +41,12 @@ use crate::{
 const PICKER_VIEW_WINDOW: usize = 20;
 const TERMINAL_SCROLLBACK_LINES: usize = 10_000;
 
+/// The smallest grid the terminal emulator is given. A single row or column
+/// underflows inside vt100 as soon as a character wraps — one row leaves it
+/// subtracting the scrolled line from row zero — and a window can be dragged
+/// that small, or start that way before the first resize arrives.
+const MIN_SHELL_SIZE: u16 = 2;
+
 /// One language server's lifecycle and negotiated capabilities.
 ///
 /// These used to be eight parallel maps keyed by the server id, so every
@@ -310,8 +316,8 @@ impl Editor {
                 self.terminal_size = (cols, rows);
                 let mut effects = Vec::new();
                 if let Some(shell) = self.shell.as_mut() {
-                    let shell_cols = split_right_width(cols).max(1);
-                    let shell_rows = rows.saturating_sub(1).max(1);
+                    let shell_cols = split_right_width(cols).max(MIN_SHELL_SIZE);
+                    let shell_rows = rows.saturating_sub(1).max(MIN_SHELL_SIZE);
                     shell.parser.screen_mut().set_size(shell_rows, shell_cols);
                     effects.push(Effect::TerminalResize {
                         cols: shell_cols,
@@ -3581,8 +3587,8 @@ impl Editor {
         //
         // A zero-sized grid panics inside vt100, and the size is still (0, 0)
         // until the first resize arrives.
-        let rows = self.terminal_size.1.saturating_sub(1).max(1);
-        let cols = split_right_width(self.terminal_size.0).max(1);
+        let rows = self.terminal_size.1.saturating_sub(1).max(MIN_SHELL_SIZE);
+        let cols = split_right_width(self.terminal_size.0).max(MIN_SHELL_SIZE);
         let token = self.next_shell_token;
         self.next_shell_token += 1;
         self.shell = Some(ShellSession {

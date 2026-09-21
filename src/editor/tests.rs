@@ -329,6 +329,23 @@ fn the_working_directory_is_read_even_when_its_report_arrives_in_pieces() {
 }
 
 #[test]
+fn a_window_too_small_for_a_shell_still_gets_one() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+    let token = open_shell(&mut editor);
+
+    // Dragged down to nothing: a one-row grid underflowed inside the terminal
+    // emulator as soon as a line wrapped, taking the editor with it.
+    editor.update(AppEvent::Resize { cols: 1, rows: 1 });
+    editor.update(AppEvent::Terminal(TerminalEvent::Output {
+        token,
+        bytes: b"abcdefghij\r\nklmnopqrst".to_vec(),
+    }));
+
+    assert!(editor.terminal_contents().is_some());
+}
+
+#[test]
 fn closing_a_buffer_leaves_the_shell_open() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 10 });
