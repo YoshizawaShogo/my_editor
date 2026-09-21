@@ -4480,6 +4480,30 @@ fn completion_applies_the_extra_edits_that_come_with_it() {
 }
 
 #[test]
+fn a_lower_case_prefix_reaches_both_cases_and_a_capital_only_its_own() {
+    // No language server here, so this is the word completion over the buffer.
+    let mut editor = Editor::default();
+    editor.open_paths([PathBuf::from("x.rs")]);
+    editor.update(AppEvent::TextPaste(
+        "Some SomeThing something\nsome".to_owned(),
+    ));
+
+    editor.update(Command::ToggleCompletion.into());
+
+    // Typing lower case reaches `Some` — which is not a no-op, it corrects the
+    // case — while words in the case actually typed come first.
+    let view = editor.completion_view().expect("completion popup");
+    assert_eq!(view.items, vec!["something", "Some", "SomeThing"]);
+    editor.update(Command::PickerCancel.into());
+
+    // A typed capital is deliberate, so lower-case words are not offered back.
+    editor.update(AppEvent::TextPaste("\nSome".to_owned()));
+    editor.update(Command::ToggleCompletion.into());
+    let view = editor.completion_view().expect("completion popup");
+    assert_eq!(view.items, vec!["SomeThing"]);
+}
+
+#[test]
 fn naming_a_declaration_does_not_open_the_completion_popup() {
     let mut editor = Editor::default();
     editor.open_paths([PathBuf::from("x.rs")]);
@@ -4507,6 +4531,50 @@ fn naming_a_declaration_does_not_open_the_completion_popup() {
         "{:?}",
         view.items
     );
+}
+
+#[test]
+fn a_lower_case_prefix_still_reaches_a_capitalised_completion() {
+    let mut editor = editor_with_lsp();
+    editor.update(AppEvent::TextPaste(
+        "let value: Option<usize> = some".to_owned(),
+    ));
+
+    // Captured from rust-analyzer for a typed `some`: it does offer `Some(…)`,
+    // and the popup has to keep it rather than drop it as a no-op.
+    complete_with(
+        &mut editor,
+        serde_json::json!([{
+            "label": "Some(…)",
+            "labelDetails": {"description": "Some(T)"},
+            "filterText": "Some()",
+            "sortText": "7fffffec",
+            "insertTextFormat": 2,
+            "textEdit": {
+                "range": {
+                    "start": {"line": 0, "character": 27},
+                    "end": {"line": 0, "character": 31}
+                },
+                "newText": "Some(${1:()})$0"
+            }
+        }]),
+    );
+
+    let view = editor.completion_view().expect("completion popup");
+    assert_eq!(view.items, vec!["Some(…)"]);
+}
+
+#[test]
+fn a_plain_capitalised_candidate_is_offered_over_a_lower_case_prefix() {
+    let mut editor = editor_with_lsp();
+    editor.update(AppEvent::TextPaste("some".to_owned()));
+
+    // No snippet, no text edit: picking it replaces `some` with `Some`, which
+    // is a change — it used to be dropped as identical.
+    complete_with(&mut editor, serde_json::json!([{"label": "Some"}]));
+
+    let view = editor.completion_view().expect("completion popup");
+    assert_eq!(view.items, vec!["Some"]);
 }
 
 #[test]

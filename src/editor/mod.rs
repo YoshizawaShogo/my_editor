@@ -1728,8 +1728,10 @@ impl Editor {
                             // Drop a candidate only when picking it would change
                             // nothing — its insertion equals what's already typed.
                             // A method like `push` completing to `push()` still
-                            // edits the buffer, so it stays even beside `push_str`.
-                            if !prefix.is_empty() && insert.eq_ignore_ascii_case(&prefix) {
+                            // edits the buffer, so it stays even beside `push_str`;
+                            // so does `Some` over a typed `some`, which corrects
+                            // the case.
+                            if !prefix.is_empty() && insert == prefix {
                                 return None;
                             }
                             let cursor_back = usize::from(
@@ -2197,12 +2199,24 @@ impl Editor {
         };
         let prefix_lower = prefix.to_lowercase();
         let prefix_len = prefix.chars().count();
+        // Lower case is the easier thing to type, so typing it asks about both
+        // cases — `some` reaches `Some` — while its own case is offered first.
+        // Reaching for a capital is deliberate, and answering it with lower case
+        // would be offering to undo that.
+        let typed_a_capital = prefix.chars().any(char::is_uppercase);
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for word in text.split(|character| !is_word(character)) {
-            if word.chars().count() <= prefix_len {
+            // Only a word identical to what is typed has nothing to offer; one
+            // that differs in case still corrects it.
+            if word == prefix || word.chars().count() < prefix_len {
                 continue;
             }
-            if word.to_lowercase().starts_with(&prefix_lower) {
+            let matches = if typed_a_capital {
+                word.starts_with(prefix.as_str())
+            } else {
+                word.to_lowercase().starts_with(&prefix_lower)
+            };
+            if matches {
                 *counts.entry(word).or_insert(0) += 1;
             }
         }
@@ -2212,8 +2226,10 @@ impl Editor {
             .collect();
         ranked.sort_by(|left, right| {
             right
-                .0
-                .cmp(&left.0)
+                .1
+                .starts_with(prefix.as_str())
+                .cmp(&left.1.starts_with(prefix.as_str()))
+                .then_with(|| right.0.cmp(&left.0))
                 .then_with(|| left.1.len().cmp(&right.1.len()))
                 .then_with(|| left.1.cmp(right.1))
         });
