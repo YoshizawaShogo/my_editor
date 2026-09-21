@@ -3866,18 +3866,25 @@ impl Editor {
                     '{' => '}',
                     quote => quote,
                 };
+                // A quote opens and closes with the same character, so typing
+                // one where that character already sits is a way past it. A
+                // bracket is not: `[` inside `[]` is a pair of its own, and
+                // stepping over the `]` left no way to nest one.
+                let quote = closing == character;
                 self.edit_active(|document, view| {
-                    if !document
-                        .editable_mut()
-                        .skip_closing_character(&mut view.selections, closing)
+                    if quote
+                        && document
+                            .editable_mut()
+                            .skip_closing_character(&mut view.selections, closing)
                     {
-                        document.editable_mut().insert_pair(
-                            &mut view.selections,
-                            character,
-                            closing,
-                            at,
-                        );
+                        return;
                     }
+                    document.editable_mut().insert_pair(
+                        &mut view.selections,
+                        character,
+                        closing,
+                        at,
+                    );
                 });
             }
             '}' => self.edit_active(|document, view| {

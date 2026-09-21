@@ -5241,6 +5241,31 @@ fn bracketed_multiline_paste_is_inserted_literally_and_normalizes_line_endings()
 }
 
 #[test]
+fn a_bracket_nests_while_a_quote_steps_over_its_twin() {
+    let mut editor = Editor::default();
+
+    // Inside `[]`, another `[` is a pair of its own — it used to step over the
+    // `]` instead, leaving no way to nest one.
+    editor.update(AppEvent::TextInput('['));
+    editor.update(AppEvent::TextInput('['));
+
+    let buffer = editor.active_buffer().unwrap();
+    assert_eq!(buffer.text.to_string(), "[[]]");
+    assert_eq!(buffer.view.selections.primary().head, CharIdx(2));
+    drop(buffer);
+
+    // A quote closes with the character it opens with, so typing it where that
+    // character already sits is how you get past it.
+    let mut editor = Editor::default();
+    editor.update(AppEvent::TextInput('"'));
+    editor.update(AppEvent::TextInput('"'));
+
+    let buffer = editor.active_buffer().unwrap();
+    assert_eq!(buffer.text.to_string(), "\"\"");
+    assert_eq!(buffer.view.selections.primary().head, CharIdx(2));
+}
+
+#[test]
 fn typed_opening_delimiters_insert_pairs_without_treating_paste_as_typing() {
     let mut editor = Editor::default();
 
