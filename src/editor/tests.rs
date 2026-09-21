@@ -292,6 +292,67 @@ fn hiding_the_shell_pane_keeps_the_session_but_an_exit_ends_it() {
 }
 
 #[test]
+fn the_working_directory_is_read_even_when_its_report_arrives_in_pieces() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 10 });
+    let token = open_shell(&mut editor);
+    let output = |editor: &mut Editor, bytes: &[u8]| {
+        editor.update(AppEvent::Terminal(TerminalEvent::Output {
+            token,
+            bytes: bytes.to_vec(),
+        }));
+    };
+
+    // A read can end anywhere, including the middle of the escape sequence.
+    output(&mut editor, b"done\r\n\x1b]7;file://HOST/home/shogo/pro");
+    output(&mut editor, b"jects/some%20dir\x07src/main.rs:3\r\n");
+
+    let effects = editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 41 + 2,
+            row: 1,
+            modifiers: KeyModifiers::CONTROL,
+        },
+        clicks: 1,
+    }));
+
+    // And the percent-encoding a path with a space arrives in is decoded.
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::ReadFile { path, .. }]
+                if path == &PathBuf::from("/home/shogo/projects/some dir/src/main.rs")
+        ),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn closing_a_buffer_leaves_the_shell_open() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 10 });
+    editor.open_paths([PathBuf::from("first.txt"), PathBuf::from("second.txt")]);
+    open_shell(&mut editor);
+    // Back to the file half; the shell swallows every key while it has focus.
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+
+    editor.update(Command::CloseBuffer.into());
+
+    // The shell is a pane of its own; the buffer that closed was not in it.
+    assert!(editor.shell_visible());
+    assert_eq!(editor.active_buffer().unwrap().name, "first.txt");
+}
+
+#[test]
 fn the_prev_command_button_walks_the_log_back_to_the_command_line() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 10 });
@@ -348,6 +409,13 @@ fn ctrl_clicking_a_path_in_the_log_opens_it_at_that_line() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 10 });
     let token = open_shell(&mut editor);
+    // The shell reports where it is with OSC 7 on every prompt, and what it
+    // prints is relative to that — the editor's workspace root is the opened
+    // file's own directory, which is a different place entirely.
+    editor.update(AppEvent::Terminal(TerminalEvent::Output {
+        token,
+        bytes: b"\x1b]7;file://HOST/home/shogo/projects/my_atcoder_cli\x1b\\".to_vec(),
+    }));
     editor.update(AppEvent::Terminal(TerminalEvent::Output {
         token,
         bytes: b"  --> src/editor/mod.rs:120:5\r\n".to_vec(),
@@ -367,7 +435,8 @@ fn ctrl_clicking_a_path_in_the_log_opens_it_at_that_line() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::ReadFile { path, .. }] if path.ends_with("src/editor/mod.rs")
+            [Effect::ReadFile { path, .. }]
+                if path == &PathBuf::from("/home/shogo/projects/my_atcoder_cli/src/editor/mod.rs")
         ),
         "{effects:?}"
     );

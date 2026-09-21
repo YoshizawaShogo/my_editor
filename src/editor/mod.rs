@@ -3589,6 +3589,8 @@ impl Editor {
             token,
             parser: vt100::Parser::new(rows, cols, TERMINAL_SCROLLBACK_LINES),
             selection: None,
+            cwd: None,
+            osc_pending: Vec::new(),
             commands: Vec::new(),
         });
         vec![Effect::SpawnShell {
@@ -3697,16 +3699,38 @@ impl Editor {
             self.deferred_hover = None;
         }
         self.pending_self_disk_updates.remove(&id);
-        if let Some(next) = self.documents.keys().next().copied() {
-            let view = self.view_for(next);
+        let next = match self.documents.keys().min_by_key(|id| id.0).copied() {
+            Some(next) => next,
+            None => {
+                // Nothing left to show: a fresh scratch buffer stands in, the
+                // way the editor starts up.
+                let scratch = DocumentId(self.next_doc_id);
+                self.next_doc_id += 1;
+                self.documents.insert(scratch, Document::scratch());
+                scratch
+            }
+        };
+        let view = self.view_for(next);
+        // A diff of the file that just went away has nothing left to compare.
+        if self.layout.is_diff()
+            && self
+                .layout
+                .panes_mut()
+                .iter()
+                .any(|pane| pane.view.doc == id)
+        {
             self.show_only(view);
+            self.focus = Focus::Editor(Side::Left);
         } else {
-            let id = DocumentId(self.next_doc_id);
-            self.next_doc_id += 1;
-            self.documents.insert(id, Document::scratch());
-            self.show_only(View::new(id));
+            // Only the panes that were showing it. Closing a buffer is no reason
+            // to take down the shell, the find pane or a second file, which is
+            // what collapsing the whole layout used to do.
+            for pane in self.layout.panes_mut() {
+                if pane.view.doc == id {
+                    pane.view = view.clone();
+                }
+            }
         }
-        self.focus = Focus::Editor(Side::Left);
         self.dirty = true;
         did_close.into_iter().collect()
     }
@@ -3887,6 +3911,7 @@ impl Editor {
         let dirty = match event {
             TerminalEvent::Output { bytes, .. } => {
                 let shell = self.shell.as_mut().expect("checked above");
+                shell.note_working_directory(&bytes);
                 shell.parser.process(&bytes);
                 shell.selection.is_none()
             }
@@ -4201,10 +4226,17 @@ impl Editor {
         let (_, cols) = screen.size();
         let line = screen.contents_between(row, 0, row, cols);
         let (path, line_number, column_number) = parse_path_reference(&line, usize::from(col))?;
+        // Relative to where the shell is, which is where the command that
+        // printed the path was run — not to the editor's workspace root.
+        let base = self
+            .shell
+            .as_ref()
+            .and_then(|shell| shell.cwd.clone())
+            .unwrap_or_else(|| self.workspace_root.clone());
         let path = if path.is_absolute() {
             path
         } else {
-            self.workspace_root.join(path)
+            base.join(path)
         };
         Some((
             path,
@@ -6992,6 +7024,30 @@ pub(crate) fn search_run_button_range(inner_x: u16) -> (u16, u16) {
 /// refresh is a button rather than something inferred from a document changing.
 pub(crate) const SEARCH_RELOAD_BUTTON: &str = "[ Reload ]";
 
+/// The path out of a `file://host/path` URI, percent-decoded. The host is
+/// whatever the shell thinks the machine is called and says nothing about where
+/// the file is, so it is dropped. (Distinct from [`file_uri_path`], which reads
+/// the `file://` URIs a language server sends, where there is no host.)
+fn shell_uri_directory(payload: &[u8]) -> Option<PathBuf> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let rest = text.strip_prefix("file://")?;
+    let path = &rest[rest.find('/')?..];
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let hex: String = bytes.by_ref().take(2).map(char::from).collect();
+            match u8::from_str_radix(&hex, 16) {
+                Ok(decoded_byte) => decoded.push(decoded_byte),
+                Err(_) => return None,
+            }
+        } else {
+            decoded.push(byte);
+        }
+    }
+    Some(PathBuf::from(String::from_utf8(decoded).ok()?))
+}
+
 /// The path, line and column named at `column` of a line of log output. The
 /// forms compilers and test runners actually print: `src/main.rs:12:5`,
 /// `--> src/main.rs:12`, `"src/main.rs", line 12`, or a bare path. A bare word
@@ -7253,6 +7309,14 @@ struct ShellSession {
     token: u64,
     parser: vt100::Parser,
     selection: Option<TerminalSelection>,
+    /// Where the shell says it is, from the `OSC 7` it prints with each prompt.
+    /// Paths in its output are relative to this, not to the editor's workspace
+    /// root — which is the file's own directory when the editor was opened on a
+    /// file, and resolving `src/main.rs` against that lands on `src/src/main.rs`.
+    cwd: Option<PathBuf>,
+    /// Output waiting to be scanned for `OSC 7`, since a sequence can be split
+    /// across reads.
+    osc_pending: Vec<u8>,
     /// The command lines that have been run, as the screen showed them at the
     /// moment they were entered — prompt and all. The log is ours, but nothing
     /// in it says which lines were commands, and a prompt is whatever the shell
@@ -7265,6 +7329,54 @@ impl ShellSession {
     /// How many command lines to keep. Enough to walk back through a session's
     /// worth of work, far short of the scrollback it is searched against.
     const REMEMBERED_COMMANDS: usize = 200;
+
+    /// How much unterminated output to keep while waiting for an `OSC 7` to
+    /// finish. Longer than any path a shell would report, short enough that a
+    /// stray escape with no terminator cannot grow without bound.
+    const OSC_SCAN_LIMIT: usize = 4096;
+
+    /// Pick the working directory out of the shell's output. `OSC 7` is how a
+    /// shell announces where it is — `ESC ] 7 ; file://host/path ST` — and it is
+    /// printed with every prompt, so this stays current as the shell moves.
+    fn note_working_directory(&mut self, bytes: &[u8]) {
+        const PREFIX: &[u8] = b"\x1b]7;";
+        self.osc_pending.extend_from_slice(bytes);
+        if self.osc_pending.len() > Self::OSC_SCAN_LIMIT {
+            let excess = self.osc_pending.len() - Self::OSC_SCAN_LIMIT;
+            self.osc_pending.drain(..excess);
+        }
+        while let Some(start) = self
+            .osc_pending
+            .windows(PREFIX.len())
+            .position(|window| window == PREFIX)
+        {
+            let body = &self.osc_pending[start + PREFIX.len()..];
+            // BEL or ST ends the sequence; neither yet means it is still arriving.
+            let Some((payload, consumed)) = body
+                .iter()
+                .position(|byte| *byte == 0x07)
+                .map(|end| (&body[..end], end + 1))
+                .or_else(|| {
+                    body.windows(2)
+                        .position(|window| window == b"\x1b\\")
+                        .map(|end| (&body[..end], end + 2))
+                })
+            else {
+                // Drop what precedes the unfinished sequence so the scan does not
+                // start over from the top of the buffer next time.
+                self.osc_pending.drain(..start);
+                return;
+            };
+            if let Some(directory) = shell_uri_directory(payload) {
+                self.cwd = Some(directory);
+            }
+            self.osc_pending.drain(..start + PREFIX.len() + consumed);
+        }
+        // Keep only a possible partial escape at the tail.
+        if let Some(tail) = self.osc_pending.len().checked_sub(PREFIX.len() - 1) {
+            self.osc_pending.drain(..tail);
+        }
+    }
 
     /// Record the line the cursor is on as a command that was run. Consecutive
     /// repeats collapse: pressing Enter on an empty prompt, or running the same
