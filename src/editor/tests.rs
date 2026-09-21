@@ -422,6 +422,50 @@ fn the_prev_command_button_walks_the_log_back_to_the_command_line() {
 }
 
 #[test]
+fn a_suggested_command_is_still_found_in_the_log() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 10 });
+    let token = open_shell(&mut editor);
+    let output = |editor: &mut Editor, bytes: &[u8]| {
+        editor.update(AppEvent::Terminal(TerminalEvent::Output {
+            token,
+            bytes: bytes.to_vec(),
+        }));
+    };
+
+    // The shell writes what it suggests into the same row, so the line under
+    // the cursor when Enter is pressed reads past what was typed.
+    output(&mut editor, b"$ ec\x1b[38;5;8mho marker_one\x1b[0m");
+    editor.update(AppEvent::TerminalInput(b"\r".to_vec()));
+    // Running it leaves only the typed part behind in the log.
+    output(
+        &mut editor,
+        b"\r\x1b[2K$ ec\r\nbash: ec: command not found\r\n",
+    );
+    for index in 0..40 {
+        output(&mut editor, format!("filler {index}\r\n").as_bytes());
+    }
+    assert!(!editor.terminal_contents().unwrap().contains("$ ec"));
+
+    let button = crate::editor::terminal_prev_button_range(41, 39).expect("a button");
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: button.0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+
+    assert!(
+        editor.terminal_contents().unwrap().contains("$ ec"),
+        "{}",
+        editor.terminal_contents().unwrap()
+    );
+}
+
+#[test]
 fn ctrl_clicking_a_path_in_the_log_opens_it_at_that_line() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 10 });

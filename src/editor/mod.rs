@@ -6156,11 +6156,7 @@ impl Editor {
                 break;
             }
             let line = shell.parser.screen().contents_between(0, 0, 0, cols);
-            if shell
-                .commands
-                .iter()
-                .any(|command| command.trim_end() == line.trim_end())
-            {
+            if shell.is_command_line(&line) {
                 found = Some(offset);
                 break;
             }
@@ -7388,6 +7384,23 @@ impl ShellSession {
         if let Some(tail) = self.osc_pending.len().checked_sub(PREFIX.len() - 1) {
             self.osc_pending.drain(..tail);
         }
+    }
+
+    /// Whether a line of the log is one of the command lines that were run. The
+    /// two are not identical strings: a shell that suggests the rest of a
+    /// command draws the suggestion into the same row, so the line recorded when
+    /// Enter was pressed reads `$ echo marker_one` where the log afterwards
+    /// keeps only the `$ ec` that was typed. Either being the start of the other
+    /// is the match, and both are command lines regardless of which it is.
+    fn is_command_line(&self, line: &str) -> bool {
+        let line = line.trim_end();
+        if line.trim().len() < 2 {
+            return false;
+        }
+        self.commands.iter().any(|command| {
+            let command = command.trim_end();
+            command.starts_with(line) || line.starts_with(command)
+        })
     }
 
     /// Record the line the cursor is on as a command that was run. Consecutive
