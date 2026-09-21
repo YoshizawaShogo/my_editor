@@ -19,12 +19,9 @@ version = 2
 # Flag unmaintained crates anywhere in the tree (workspace or transitive).
 unmaintained = "all"
 yanked = "deny"
-ignore = [
-    # `paste` (unmaintained), pulled in transitively by ratatui 0.29. It is a
-    # compile-time proc-macro with no runtime exposure. Revisit when ratatui
-    # drops it.
-    "RUSTSEC-2024-0436",
-]
+# ratatui 0.30 dropped `paste` (RUSTSEC-2024-0436), which was the only entry
+# here. Nothing is ignored now.
+ignore = []
 
 [bans]
 # Duplicate versions are a size/build concern, not a correctness one, and the

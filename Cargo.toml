@@ -14,7 +14,7 @@ lsp-server = "0.7.8"
 lsp-types = "0.97.0"
 memmap2 = "0.9"
 nix = { version = "0.31.1", features = ["fs", "process", "term"] }
-ratatui = "0.29.0"
+ratatui = "0.30.2"
 ropey = "1.6.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.140"
@@ -27,7 +27,7 @@ tree-sitter-md-025 = "0.5.6"
 tree-sitter-rust = "0.24.2"
 tree-sitter-toml-ng = "0.7.0"
 unicode-width = "0.2"
-vt100 = "0.15.2"
+vt100 = "0.16.2"
 walkdir = "2.5.0"
 tree-sitter-bash = "0.25.1"
 # Tcl grammar. No canonical `tree-sitter-tcl` is published to crates.io; this

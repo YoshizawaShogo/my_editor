@@ -281,7 +281,7 @@ impl Editor {
                 if self.focus == Focus::Shell {
                     if let Some(shell) = self.shell.as_mut() {
                         let bracketed = shell.parser.screen().bracketed_paste();
-                        shell.parser.set_scrollback(0);
+                        shell.parser.screen_mut().set_scrollback(0);
                         let mut bytes = text.into_bytes();
                         if bracketed {
                             bytes.splice(0..0, b"\x1b[200~".iter().copied());
@@ -312,7 +312,7 @@ impl Editor {
                 if let Some(shell) = self.shell.as_mut() {
                     let shell_cols = split_right_width(cols).max(1);
                     let shell_rows = rows.saturating_sub(1).max(1);
-                    shell.parser.set_size(shell_rows, shell_cols);
+                    shell.parser.screen_mut().set_size(shell_rows, shell_cols);
                     effects.push(Effect::TerminalResize {
                         cols: shell_cols,
                         rows: shell_rows,
@@ -370,6 +370,34 @@ impl Editor {
                         MouseEventKind::ScrollDown => {
                             self.scroll_terminal(-3);
                             return Vec::new();
+                        }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if mouse.event.row == 0
+                                && terminal_prev_button_range(
+                                    split_left_width(self.terminal_size.0).saturating_add(1),
+                                    split_right_width(self.terminal_size.0),
+                                )
+                                .is_some_and(|(start, end)| {
+                                    (start..end).contains(&mouse.event.column)
+                                })
+                            {
+                                self.jump_to_previous_command();
+                                return Vec::new();
+                            }
+                            // Ctrl+click follows a path the log printed, the way
+                            // it follows a definition in the text.
+                            if mouse.event.modifiers.contains(KeyModifiers::CONTROL)
+                                && let Some((path, line, column)) =
+                                    self.terminal_link_at(mouse.event.column, mouse.event.row)
+                            {
+                                // Straight out of the shell and into the file:
+                                // `focus_file_pane` only moves between panes and
+                                // would leave the caret in the terminal.
+                                self.focus = Focus::Editor(Side::Left);
+                                self.record_jump_origin();
+                                let at = lsp_types::Position::new(line, column);
+                                return self.open_path_at(path, lsp_types::Range::new(at, at));
+                            }
                         }
                         _ => {}
                     }
@@ -475,7 +503,7 @@ impl Editor {
                         shell.remember_command_line();
                     }
                     shell.selection = None;
-                    shell.parser.set_scrollback(0);
+                    shell.parser.screen_mut().set_scrollback(0);
                 }
                 self.dirty = true;
                 vec![Effect::TerminalInput(bytes)]
@@ -4163,6 +4191,28 @@ impl Editor {
         }
     }
 
+    /// The file the log names under a click, with the line and column it gives.
+    /// Compiler and test output is full of `src/main.rs:12:5`, and the log is the
+    /// editor's own text — so a click on one can open it, rather than leaving the
+    /// path to be retyped into the file picker.
+    fn terminal_link_at(&self, column: u16, row: u16) -> Option<(PathBuf, u32, u32)> {
+        let (row, col) = self.terminal_mouse_position(column, row)?;
+        let screen = self.terminal_screen()?;
+        let (_, cols) = screen.size();
+        let line = screen.contents_between(row, 0, row, cols);
+        let (path, line_number, column_number) = parse_path_reference(&line, usize::from(col))?;
+        let path = if path.is_absolute() {
+            path
+        } else {
+            self.workspace_root.join(path)
+        };
+        Some((
+            path,
+            line_number.saturating_sub(1),
+            column_number.saturating_sub(1),
+        ))
+    }
+
     fn terminal_mouse_position(&self, column: u16, row: u16) -> Option<(u16, u16)> {
         if !self.layout.is_shell() {
             return None;
@@ -6047,6 +6097,54 @@ impl Editor {
         self.dirty = true;
     }
 
+    /// Scroll the log back to the command line above the top of the view. The
+    /// lines were recorded as they ran, so this looks for one of those rather
+    /// than guessing which lines in the log were prompts.
+    fn jump_to_previous_command(&mut self) {
+        let Some(shell) = self.shell.as_mut() else {
+            return;
+        };
+        if shell.commands.is_empty() {
+            self.set_status("No command has been run in this shell yet");
+            return;
+        }
+        let start = shell.parser.screen().scrollback();
+        let (_, cols) = shell.parser.screen().size();
+        let mut found = None;
+        for offset in start + 1..=start + TERMINAL_SCROLLBACK_LINES {
+            shell.parser.screen_mut().set_scrollback(offset);
+            // The offset stops growing at the oldest line the log still holds.
+            if shell.parser.screen().scrollback() != offset {
+                break;
+            }
+            let line = shell.parser.screen().contents_between(0, 0, 0, cols);
+            if shell
+                .commands
+                .iter()
+                .any(|command| command.trim_end() == line.trim_end())
+            {
+                found = Some(offset);
+                break;
+            }
+        }
+        match found {
+            // One line further back, so whatever the prompt printed above the
+            // command — a path, a branch — is on screen with it.
+            Some(offset) => shell
+                .parser
+                .screen_mut()
+                .set_scrollback(offset.saturating_add(1)),
+            None => {
+                shell.parser.screen_mut().set_scrollback(start);
+                self.set_status("No earlier command line in the log");
+            }
+        }
+        if let Some(shell) = self.shell.as_mut() {
+            shell.selection = None;
+        }
+        self.dirty = true;
+    }
+
     fn scroll_terminal(&mut self, amount: isize) {
         let Some(shell) = self.shell.as_mut() else {
             return;
@@ -6057,7 +6155,7 @@ impl Editor {
         } else {
             current.saturating_add(amount as usize)
         };
-        shell.parser.set_scrollback(target);
+        shell.parser.screen_mut().set_scrollback(target);
         shell.selection = None;
         self.dirty = true;
     }
@@ -6893,6 +6991,63 @@ pub(crate) fn search_run_button_range(inner_x: u16) -> (u16, u16) {
 /// buffer, and edits made outside the editor cannot be noticed at all, so the
 /// refresh is a button rather than something inferred from a document changing.
 pub(crate) const SEARCH_RELOAD_BUTTON: &str = "[ Reload ]";
+
+/// The path, line and column named at `column` of a line of log output. The
+/// forms compilers and test runners actually print: `src/main.rs:12:5`,
+/// `--> src/main.rs:12`, `"src/main.rs", line 12`, or a bare path. A bare word
+/// is not one — a path has to look like a path, with a directory or a suffix —
+/// or every word in a sentence would offer to open a file.
+fn parse_path_reference(line: &str, column: usize) -> Option<(PathBuf, u32, u32)> {
+    let mut start = 0;
+    for token in line.split_whitespace() {
+        // `split_whitespace` drops the offsets, so walk them back out.
+        let offset = line[start..].find(token)? + start;
+        start = offset + token.len();
+        if !(offset..start).contains(&column) {
+            continue;
+        }
+        let token = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | ','
+            )
+        });
+        let mut parts = token.split(':');
+        let path = parts.next()?;
+        if path.is_empty() {
+            continue;
+        }
+        let numbers: Vec<u32> = parts.filter_map(|part| part.parse().ok()).collect();
+        let looks_like_a_path = path.contains('/') || path.contains('.');
+        if !looks_like_a_path {
+            continue;
+        }
+        return Some((
+            PathBuf::from(path),
+            numbers.first().copied().unwrap_or(1),
+            numbers.get(1).copied().unwrap_or(1),
+        ));
+    }
+    None
+}
+
+/// Walks the log back to the previous command line. A button rather than a key:
+/// the shell owns the keyboard while it has focus, so any chord taken for this
+/// would be one the shell no longer gets.
+pub(crate) const TERMINAL_PREV_BUTTON: &str = "[ prev cmd ]";
+
+/// Sits flush with the right edge of the shell pane's top row. ASCII for the
+/// same reason as the reload button: an arrow glyph is double-width in some
+/// terminals and would slide out from under this hit range.
+pub(crate) fn terminal_prev_button_range(pane_x: u16, pane_width: u16) -> Option<(u16, u16)> {
+    let width = TERMINAL_PREV_BUTTON.chars().count() as u16;
+    // A pane too narrow for the label has no button, and must not have the
+    // corner of its output swallowed by one that was never drawn.
+    (pane_width > width).then(|| {
+        let start = pane_x + pane_width - width;
+        (start, start + width)
+    })
+}
 
 /// Sits flush with the right edge of the result list's header row. ASCII like
 /// the other buttons: a symbol such as `⟳` is double-width in some terminals,

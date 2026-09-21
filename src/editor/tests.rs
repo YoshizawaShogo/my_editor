@@ -292,6 +292,90 @@ fn hiding_the_shell_pane_keeps_the_session_but_an_exit_ends_it() {
 }
 
 #[test]
+fn the_prev_command_button_walks_the_log_back_to_the_command_line() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 10 });
+    let token = open_shell(&mut editor);
+    let output = |editor: &mut Editor, bytes: &[u8]| {
+        editor.update(AppEvent::Terminal(TerminalEvent::Output {
+            token,
+            bytes: bytes.to_vec(),
+        }));
+    };
+
+    output(&mut editor, b"$ cargo test\r\n");
+    // Enter is what runs the line, so the line under the cursor is the command.
+    output(&mut editor, b"$ cargo build");
+    editor.update(AppEvent::TerminalInput(b"\r".to_vec()));
+    output(&mut editor, b"\r\n");
+    for index in 0..40 {
+        output(
+            &mut editor,
+            format!("   compiling crate {index}\r\n").as_bytes(),
+        );
+    }
+    // The command has scrolled off the top by now.
+    assert!(
+        !editor
+            .terminal_contents()
+            .unwrap()
+            .contains("$ cargo build")
+    );
+
+    let button = crate::editor::terminal_prev_button_range(41, 39).expect("a button");
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: button.0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+
+    assert!(
+        editor
+            .terminal_contents()
+            .unwrap()
+            .contains("$ cargo build"),
+        "{}",
+        editor.terminal_contents().unwrap()
+    );
+}
+
+#[test]
+fn ctrl_clicking_a_path_in_the_log_opens_it_at_that_line() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 10 });
+    let token = open_shell(&mut editor);
+    editor.update(AppEvent::Terminal(TerminalEvent::Output {
+        token,
+        bytes: b"  --> src/editor/mod.rs:120:5\r\n".to_vec(),
+    }));
+
+    // The click lands on the path, in the right half of the split.
+    let effects = editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 41 + 8,
+            row: 0,
+            modifiers: KeyModifiers::CONTROL,
+        },
+        clicks: 1,
+    }));
+
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::ReadFile { path, .. }] if path.ends_with("src/editor/mod.rs")
+        ),
+        "{effects:?}"
+    );
+    // The caret waits for the file, one line below what the log counted from 1.
+    assert_eq!(editor.focus(), Focus::Editor(Side::Left));
+}
+
+#[test]
 fn shell_drag_selection_copies_a_stable_snapshot_and_clears_hover() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 20, rows: 6 });

@@ -47,6 +47,10 @@ impl Write for StableCrosstermBackend {
 }
 
 impl Backend for StableCrosstermBackend {
+    /// The same error the wrapped crossterm backend reports; this only reorders
+    /// the cells handed to it.
+    type Error = io::Error;
+
     fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,

@@ -236,6 +236,20 @@ fn draw_terminal(
         Paragraph::new(lines).style(Style::default().fg(FG).bg(Color::Rgb(0x12, 0x14, 0x1c))),
         area,
     );
+    // Over the top-right of the log, where output is least likely to be busy.
+    // It is the only way back to the previous command: the shell owns the
+    // keyboard, so a key for this would be one the shell stops receiving.
+    if let Some((start, end)) = crate::editor::terminal_prev_button_range(area.x, area.width)
+        && area.height > 0
+    {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                crate::editor::TERMINAL_PREV_BUTTON,
+                Style::default().fg(FG).bg(SELECTION),
+            ))),
+            Rect::new(start, area.y, end - start, 1),
+        );
+    }
     if focused && screen.scrollback() == 0 {
         let (row, col) = screen.cursor_position();
         if row < rows && col < cols {
@@ -273,7 +287,7 @@ fn terminal_lines(
                 }
                 run_style = Some(style);
                 if cell.has_contents() {
-                    run.push_str(&cell.contents());
+                    run.push_str(cell.contents());
                 } else {
                     run.push(' ');
                 }
