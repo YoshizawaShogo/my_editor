@@ -808,9 +808,8 @@ impl Runtime {
             Err(_) => return,
         };
         let slave_fd = pty.slave.as_raw_fd();
-        let shell = configured_shell
-            .or_else(|| std::env::var("SHELL").ok())
-            .unwrap_or_else(|| "/bin/sh".to_owned());
+        let shell =
+            crate::status::shell_command(configured_shell.as_deref(), &crate::status::which);
         let mut shell_command = Command::new(shell);
         shell_command
             .stdin(stdin)

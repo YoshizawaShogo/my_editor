@@ -41,6 +41,30 @@ fn tool_row(name: String, role: &'static str, resolve: &impl Fn(&str) -> Option<
     Row { name, role, detail }
 }
 
+/// The shell the terminal pane runs when the config does not name one. `$SHELL`
+/// is deliberately not consulted: it is read by every program on the machine, so
+/// pointing it at this one to steer the pane changes what everything else
+/// spawns too.
+pub const DEFAULT_SHELL: &str = "my_shell_using_crates";
+
+/// What the pane falls back to where the editor's own shell is not installed.
+pub const FALLBACK_SHELL: &str = "bash";
+
+/// The shell command the terminal pane runs: what the config names, else the
+/// editor's own shell, else bash.
+pub fn shell_command(
+    configured: Option<&str>,
+    resolve: &impl Fn(&str) -> Option<PathBuf>,
+) -> String {
+    if let Some(configured) = configured {
+        return configured.to_owned();
+    }
+    if resolve(DEFAULT_SHELL).is_some() {
+        return DEFAULT_SHELL.to_owned();
+    }
+    FALLBACK_SHELL.to_owned()
+}
+
 /// Tools that help across every language (definition tags, …).
 const GENERAL_TOOLS: &[Tool] = &[Tool {
     command: "ctags",
@@ -144,6 +168,13 @@ pub fn tool_report(
             .iter()
             .map(|tool| tool_row(tool.command.to_owned(), tool.role, &resolve))
             .collect(),
+    ));
+    // Which shell the terminal pane will run, and whether it is there to run.
+    // Reported because it is no longer whatever `$SHELL` happens to say.
+    let shell = shell_command(config.editor.shell.as_deref(), &resolve);
+    sections.push((
+        "terminal".to_owned(),
+        vec![tool_row(shell, "shell", &resolve)],
     ));
     // The clipboard is not on PATH: the editor owns the selection itself, so the
     // caller probes the display server and this only renders the answer.
@@ -290,6 +321,38 @@ mod tests {
         assert!(report.contains("not implemented"));
         // Plain mode emits no ANSI escapes.
         assert!(!report.contains('\x1b'));
+    }
+
+    #[test]
+    fn the_terminal_pane_reports_the_shell_it_will_run() {
+        let installed = |names: &'static [&'static str]| {
+            move |command: &str| {
+                names
+                    .contains(&command)
+                    .then(|| PathBuf::from(format!("/usr/bin/{command}")))
+            }
+        };
+
+        // The editor's own shell when it is there — `$SHELL` is never consulted,
+        // so changing that to steer this pane is not something anyone has to do.
+        let report = tool_report(
+            &Config::default(),
+            installed(&["my_shell_using_crates"]),
+            &[],
+            false,
+        );
+        assert!(report.contains("terminal"));
+        assert!(report.contains("✓ my_shell_using_crates"));
+
+        // bash where it is not installed, and the report says so either way.
+        let report = tool_report(&Config::default(), installed(&["bash"]), &[], false);
+        assert!(report.contains("✓ bash"), "{report}");
+
+        // What the config names wins over both.
+        let mut config = Config::default();
+        config.editor.shell = Some("/bin/zsh".to_owned());
+        let report = tool_report(&config, installed(&["my_shell_using_crates"]), &[], false);
+        assert!(report.contains("✗ /bin/zsh"), "{report}");
     }
 
     #[test]
