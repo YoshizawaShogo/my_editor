@@ -70,10 +70,13 @@ impl Runtime {
         let (tx, rx) = mpsc::unbounded_channel();
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
         let mut editor = Editor::default();
-        editor.set_workspace_root(workspace_root(&paths));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        editor.set_workspace_root(workspace_root(&paths, &cwd));
         editor.set_workspace_ignored(paths.first().is_some_and(|path| is_git_ignored(path)));
         let mut startup_effects = vec![Effect::LoadConfig];
-        startup_effects.extend(editor.open_paths(paths));
+        // A directory argument names the workspace, not a buffer: opening it as a
+        // file only ever produced `Is a directory`.
+        startup_effects.extend(editor.open_paths(paths.into_iter().filter(|path| !path.is_dir())));
         Self {
             editor,
             tx,
@@ -1366,17 +1369,37 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// argument opens in that directory as given. With no path at all we open in the
 /// current working directory. In every case the argument (or the cwd) is taken
 /// at face value and is never widened up to the enclosing git/project root.
-fn workspace_root(paths: &[PathBuf]) -> PathBuf {
-    let cwd = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match paths.first() {
-        None => cwd(),
-        Some(path) if path.is_dir() => path.clone(),
-        Some(path) => path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(cwd),
+/// Where the workspace is, from the first argument and the directory the editor
+/// was started in.
+///
+/// - No argument: where it was started.
+/// - A directory: exactly that directory. Naming one is how the scope is chosen
+///   — a subdirectory of a large repository, so the picker and the search are
+///   not wading through all of it — and widening it would take that away.
+/// - A file: its directory is incidental, so the walk goes up to the repository
+///   it belongs to, but no further than the directory the editor was started in.
+///   Starting from a file used to leave the workspace as narrow as `src/`, where
+///   the picker could not see `Cargo.toml` and the log's relative paths missed.
+///   `.git` is the mark rather than `Cargo.toml` and its kin: a crate inside a
+///   workspace has its own manifest, and stopping there is narrower than wanted.
+fn workspace_root(paths: &[PathBuf], cwd: &Path) -> PathBuf {
+    let Some(path) = paths.first() else {
+        return cwd.to_path_buf();
+    };
+    if path.is_dir() {
+        return path.clone();
     }
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return cwd.to_path_buf();
+    };
+    parent
+        .ancestors()
+        .find(|directory| *directory == cwd || directory.join(".git").exists())
+        .unwrap_or(parent)
+        .to_path_buf()
 }
 
 /// Whether `path` is excluded by a `.gitignore` rule. Opening such a path means
@@ -1767,10 +1790,34 @@ mod tests {
         let file = nested.join("main.rs");
         fs::write(&file, "").unwrap();
 
-        // A file argument opens in the directory that contains it, not the file.
-        assert_eq!(workspace_root(std::slice::from_ref(&file)), nested);
+        // Outside any repository and outside where it started: the file's own
+        // directory, as before.
+        // (Only compared, never visited, so it need not exist.)
+        let elsewhere = PathBuf::from("/somewhere/else");
+        assert_eq!(
+            workspace_root(std::slice::from_ref(&file), &elsewhere),
+            nested
+        );
         // A directory argument opens in that directory as given.
-        assert_eq!(workspace_root(std::slice::from_ref(&nested)), nested);
+        assert_eq!(
+            workspace_root(std::slice::from_ref(&nested), &elsewhere),
+            nested
+        );
+
+        // Inside a repository: up to its root — `src/` alone hid `Cargo.toml`
+        // from the picker.
+        fs::create_dir_all(root.join(".git")).unwrap();
+        assert_eq!(
+            workspace_root(std::slice::from_ref(&file), &elsewhere),
+            root
+        );
+        // But never past where the editor was started: `cd` into part of a large
+        // repository is how its scope is narrowed.
+        assert_eq!(workspace_root(std::slice::from_ref(&file), &nested), nested);
+        // And a directory named outright is never widened to the repository.
+        assert_eq!(workspace_root(std::slice::from_ref(&nested), &root), nested);
+        // No argument: where it was started.
+        assert_eq!(workspace_root(&[], &nested), nested);
 
         fs::remove_dir_all(root).unwrap();
     }
