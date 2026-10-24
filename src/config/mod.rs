@@ -76,6 +76,9 @@ impl Default for Config {
                     ],
                     insert_spaces: Some(false),
                     tab_size: Some(4),
+                    // So Ctrl+/ comments a line out instead of reporting that
+                    // make has no comment syntax.
+                    line_comment: Some("#".to_owned()),
                     ..LanguageConfig::default()
                 },
             ],

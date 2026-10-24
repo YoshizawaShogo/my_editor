@@ -39,6 +39,9 @@ tree-sitter-tcl = { package = "bca-tree-sitter-tcl", version = "2.2.0" }
 # Colours Python locally; pylsp provides no semantic tokens, so tree-sitter is
 # the only colour source for .py files.
 tree-sitter-python = "0.25.0"
+# Makefile grammar. Highlighted with a vendored query (highlight/make_highlights.scm):
+# the crate's own paints recipes as strings and uses captures this palette lacks.
+tree-sitter-make = "1.1.1"
 # X11 clipboard, in pure Rust (no libxcb, no xclip/xsel). X11 has no clipboard
 # push: the copying client owns the selection and serves the data on paste, so
 # the editor holds it itself (src/clipboard/x11.rs).

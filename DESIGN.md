@@ -844,6 +844,11 @@ name = "make"
 filenames = ["Makefile", "makefile", "GNUmakefile"]
 tab_size = 4
 insert_spaces = false             # Make recipeでは実タブを入力
+line_comment = "#"
+# lsp 無し → tree-sitter-make で着色。クエリは同梱の highlight/make_highlights.scm
+# （文法同梱のクエリはレシピ全体を文字列色で塗り、この配色に無いcapture名を使うため）。
+# ターゲット=関数色、変数=property色、組み込み関数=関数色、$@等=macro色、
+# ディレクティブと .PHONY 等=keyword色。レシピ本体（シェル）は無地。
 
 [editor]
 tab_size = 4

@@ -146,6 +146,7 @@ fn cached_query(
     static BASH: OnceLock<Option<Query>> = OnceLock::new();
     static TCL: OnceLock<Option<Query>> = OnceLock::new();
     static PYTHON: OnceLock<Option<Query>> = OnceLock::new();
+    static MAKE: OnceLock<Option<Query>> = OnceLock::new();
     let slot = match language_name {
         "json" => &JSON,
         "toml" => &TOML,
@@ -154,6 +155,7 @@ fn cached_query(
         "bash" => &BASH,
         "tcl" => &TCL,
         "python" => &PYTHON,
+        "make" => &MAKE,
         _ => return None,
     };
     slot.get_or_init(|| Query::new(language, query_source).ok())
@@ -209,6 +211,10 @@ fn grammar(name: &str) -> Option<(Language, &'static str)> {
         "python" => Some((
             tree_sitter_python::LANGUAGE.into(),
             tree_sitter_python::HIGHLIGHTS_QUERY,
+        )),
+        "make" => Some((
+            tree_sitter_make::LANGUAGE.into(),
+            include_str!("make_highlights.scm"),
         )),
         _ => None,
     }
@@ -326,6 +332,35 @@ mod tests {
         assert!(has("number"), "no number span: {spans:?}");
         assert!(has("keyword"), "no keyword span: {spans:?}");
         assert!(has("function"), "no function span: {spans:?}");
+    }
+
+    #[test]
+    fn makefile_targets_variables_functions_and_directives_are_highlighted() {
+        let source = "# build everything\nCC := gcc\nSRCS = $(wildcard src/*.c)\n\n.PHONY: all\nall: app\n\napp: $(SRCS)\n\t$(CC) -o $@ $^\n\nifeq ($(DEBUG),1)\nCFLAGS += -g\nendif\n";
+        let spans = highlight("make", source);
+        // The kind the editor will draw a piece of text in: the innermost span,
+        // which is the one the renderer picks.
+        let kind_of = |needle: &str| {
+            let start = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} not in source"));
+            spans
+                .iter()
+                .rfind(|span| span.start_byte <= start && start < span.end_byte)
+                .map(|span| span.kind.clone())
+        };
+
+        assert_eq!(kind_of("# build").as_deref(), Some("comment"), "{spans:?}");
+        assert_eq!(kind_of("CC :=").as_deref(), Some("property"));
+        assert_eq!(kind_of(":= gcc").as_deref(), Some("operator"));
+        assert_eq!(kind_of("wildcard").as_deref(), Some("function"));
+        assert_eq!(kind_of(".PHONY").as_deref(), Some("keyword"));
+        assert_eq!(kind_of("all: app").as_deref(), Some("function"));
+        assert_eq!(kind_of("$@").as_deref(), Some("macro"));
+        assert_eq!(kind_of("ifeq").as_deref(), Some("keyword"));
+        // A recipe is shell, not a string: the grammar's own query painted every
+        // recipe line one colour.
+        assert_eq!(kind_of("-o $@"), None);
     }
 
     #[test]
