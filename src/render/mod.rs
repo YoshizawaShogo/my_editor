@@ -92,6 +92,11 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
         if let Some(search) = editor.search_view() {
             draw_search_pane(frame, right, &search);
         }
+    } else if let Some(tree) = editor.tree_view() {
+        let (left, divider, right) = split_panes(areas[0]);
+        draw_file_half(frame, left, areas[1], editor, true);
+        draw_split_divider(frame, divider);
+        draw_tree_pane(frame, right, &tree);
     } else if editor.shell_visible() {
         let (left, divider, right) = split_panes(areas[0]);
         draw_file_half(frame, left, areas[1], editor, !editor.shell_focused());
@@ -219,6 +224,50 @@ fn draw_split_divider(frame: &mut Frame<'_>, area: Rect) {
             .border_style(Style::default().fg(MUTED).bg(BG)),
         area,
     );
+}
+
+/// The workspace's folders: the root on a heading line, then each entry
+/// indented by depth — a folder with ▸ or ▾ for shut or open, a file under the
+/// same indent. The file the left pane shows is marked, so the tree says where
+/// it sits as well as what is around it.
+fn draw_tree_pane(frame: &mut Frame<'_>, area: Rect, tree: &crate::editor::TreeView<'_>) {
+    if area.height == 0 {
+        return;
+    }
+    let background = Style::default().bg(POPUP_BG);
+    let mut lines = vec![Line::from(Span::styled(
+        tree.root.clone(),
+        Style::default().fg(MUTED).bg(POPUP_BG),
+    ))];
+    lines.extend(
+        tree.rows
+            .iter()
+            .skip(tree.scroll)
+            .take(usize::from(area.height.saturating_sub(1)))
+            .map(|row| {
+                let marker = match (row.entry.is_dir, row.expanded) {
+                    (true, true) => "▾ ",
+                    (true, false) => "▸ ",
+                    (false, _) => "  ",
+                };
+                let style = if row.current {
+                    Style::default().fg(FG).bg(SELECTION_STRONG)
+                } else if row.entry.is_dir {
+                    Style::default()
+                        .fg(CODE_FUNCTION)
+                        .bg(POPUP_BG)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(FG).bg(POPUP_BG)
+                };
+                Line::from(vec![
+                    Span::styled("  ".repeat(row.depth), background),
+                    Span::styled(marker, Style::default().fg(MUTED).bg(POPUP_BG)),
+                    Span::styled(row.entry.name.clone(), style),
+                ])
+            }),
+    );
+    frame.render_widget(Paragraph::new(lines).style(background), area);
 }
 
 fn draw_terminal(

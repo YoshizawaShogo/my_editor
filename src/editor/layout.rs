@@ -1,5 +1,6 @@
 use crate::view::View;
 
+use super::tree::TreePane;
 use super::{Focus, SearchState, Side};
 
 #[derive(Debug)]
@@ -37,6 +38,9 @@ pub(super) enum RightPane {
     /// screen — the same way an [`EditorPane`] names a document that is kept in
     /// `Editor::documents`.
     Shell,
+    /// The workspace's folders. Boxed for the same reason as the find pane: it
+    /// holds every listing it has been sent.
+    Tree(Box<TreePane>),
 }
 
 /// The diff view's own state. Its scroll position is an index into the aligned
@@ -155,5 +159,19 @@ impl Layout {
 
     pub(super) fn is_shell(&self) -> bool {
         matches!(self.right, Some(RightPane::Shell))
+    }
+
+    pub(super) fn tree(&self) -> Option<&TreePane> {
+        match &self.right {
+            Some(RightPane::Tree(tree)) => Some(tree),
+            _ => None,
+        }
+    }
+
+    pub(super) fn tree_mut(&mut self) -> Option<&mut TreePane> {
+        match &mut self.right {
+            Some(RightPane::Tree(tree)) => Some(tree),
+            _ => None,
+        }
     }
 }

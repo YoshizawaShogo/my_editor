@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::document::{DiskState, DocumentId, LargeFile};
 use crate::lsp::LspEvent;
 
-use super::{Command, Side};
+use super::{Command, Side, TreeEntry};
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum AppEvent {
@@ -137,6 +137,12 @@ pub enum FileScanEvent {
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum IoEvent {
+    /// A folder's entries for the file tree: folders first, then files, each
+    /// in name order.
+    DirectoryListed {
+        path: std::path::PathBuf,
+        result: Result<Vec<TreeEntry>, String>,
+    },
     FileLoaded {
         id: DocumentId,
         result: Result<String, String>,

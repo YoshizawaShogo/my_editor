@@ -6,6 +6,7 @@ mod focus;
 mod layout;
 mod navigate;
 mod snippet_session;
+mod tree;
 
 pub use command::{Command, Direction, Unit, VerticalDirection};
 pub use effect::Effect;
@@ -17,6 +18,7 @@ pub use focus::{Focus, Side};
 use layout::{DiffPane, RightPane};
 pub use layout::{EditorPane, Layout};
 use snippet_session::SnippetSession;
+pub use tree::{TreeEntry, TreeRowView, TreeView};
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -389,6 +391,29 @@ impl Editor {
                         }
                         _ => {}
                     }
+                }
+                // The tree is driven entirely from here: the wheel scrolls it, a
+                // click below its heading opens a folder or a file, and nothing
+                // else over it reaches the editor.
+                if self.layout.tree().is_some()
+                    && mouse.event.column > split_left_width(self.terminal_size.0)
+                {
+                    return match mouse.event.kind {
+                        MouseEventKind::ScrollUp => {
+                            self.scroll_tree(-3);
+                            Vec::new()
+                        }
+                        MouseEventKind::ScrollDown => {
+                            self.scroll_tree(3);
+                            Vec::new()
+                        }
+                        MouseEventKind::Down(MouseButton::Left) if mouse.event.row > 0 => {
+                            let row = usize::from(mouse.event.row - 1)
+                                + self.tree_view().map_or(0, |tree| tree.scroll);
+                            self.tree_click(row)
+                        }
+                        _ => Vec::new(),
+                    };
                 }
                 let over_terminal = self.layout.is_shell()
                     && mouse.event.column > split_left_width(self.terminal_size.0);
@@ -993,9 +1018,10 @@ impl Editor {
         // 奪ったら元のファイルペインを取っておき、閉じたときに分割へ戻す。
         // diffは左ペインも差し替えるモード切替なので、戻す対象にはしない。
         self.stashed_split = match (previous, &self.layout.right) {
-            (Some(RightPane::Editor(pane)), Some(RightPane::Shell | RightPane::Search(_))) => {
-                Some(pane)
-            }
+            (
+                Some(RightPane::Editor(pane)),
+                Some(RightPane::Shell | RightPane::Search(_) | RightPane::Tree(_)),
+            ) => Some(pane),
             _ => None,
         };
         // Focus must not outlive the pane it pointed at. `Overlay` belongs to the
@@ -1413,6 +1439,9 @@ impl Editor {
     fn apply_io(&mut self, event: IoEvent) -> Vec<Effect> {
         let mut effects = Vec::new();
         match event {
+            IoEvent::DirectoryListed { path, result } => {
+                self.apply_directory_listing(path, result);
+            }
             IoEvent::FileLoaded { id, result } => match result {
                 Ok(contents) => {
                     if let Some(document) = self.documents.get_mut(&id) {
@@ -3547,6 +3576,7 @@ impl Editor {
             }
             Command::Format => return self.request_formatting(),
             Command::ToggleShell => return self.toggle_shell(),
+            Command::ToggleTree => return self.toggle_tree(),
             Command::ToggleSplit => self.toggle_split(),
             Command::DiffNextHunk => self.jump_diff_hunk(true),
             Command::DiffPrevHunk => self.jump_diff_hunk(false),
@@ -6847,6 +6877,12 @@ const COMMAND_PALETTE: &[CommandPaletteEntry] = &[
         name: "Terminal",
         description: "Toggle the integrated terminal",
         command: Command::ToggleShell,
+    },
+    CommandPaletteEntry {
+        key: "Ctrl+B",
+        name: "File Tree",
+        description: "Toggle the folder tree of the workspace",
+        command: Command::ToggleTree,
     },
     CommandPaletteEntry {
         key: "F4",

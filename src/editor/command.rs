@@ -51,6 +51,8 @@ pub enum Command {
     Reload,
     Format,
     ToggleShell,
+    /// Ctrl+B: the workspace's folder tree in the right pane.
+    ToggleTree,
     ToggleSplit,
     DiffNextHunk,
     DiffPrevHunk,

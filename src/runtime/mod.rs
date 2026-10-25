@@ -38,7 +38,7 @@ use crate::{
     document::{DiskState, LargeFile},
     editor::{
         AppEvent, CtagsDefinitionEvent, Editor, Effect, FileScanEvent, GitEvent, GitInfo, GitLine,
-        GitLineKind, GrepEvent, GrepHit, IoEvent, ShellcheckEvent, TerminalEvent,
+        GitLineKind, GrepEvent, GrepHit, IoEvent, ShellcheckEvent, TerminalEvent, TreeEntry,
     },
     input::{KeyChordState, RawInput, translate},
     render,
@@ -513,6 +513,16 @@ impl Runtime {
                         doc,
                         version,
                     }));
+                });
+            }
+            Effect::ListDirectory {
+                path,
+                respect_ignore_files,
+            } => {
+                let tx = self.tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = list_directory(&path, respect_ignore_files);
+                    let _ = tx.send(AppEvent::Io(IoEvent::DirectoryListed { path, result }));
                 });
             }
             Effect::ScheduleDragScroll { delay_ms } => {
@@ -1409,6 +1419,51 @@ fn workspace_root(paths: &[PathBuf], cwd: &Path) -> PathBuf {
         .to_path_buf()
 }
 
+/// One folder's entries for the file tree, folders first and then files, each
+/// in name order regardless of case. Filtered the way the file picker's walk is
+/// — hidden entries out, ignore files honoured unless the workspace itself sits
+/// in an ignored tree — so the tree shows the same files the picker can find.
+fn list_directory(
+    path: &Path,
+    respect_ignore_files: bool,
+) -> std::result::Result<Vec<TreeEntry>, String> {
+    let mut entries = Vec::new();
+    let mut error = None;
+    let walk = ignore::WalkBuilder::new(path)
+        .max_depth(Some(1))
+        .hidden(true)
+        .git_ignore(respect_ignore_files)
+        .git_exclude(respect_ignore_files)
+        .ignore(respect_ignore_files)
+        .build();
+    // The first entry is the folder itself.
+    for entry in walk.skip(1) {
+        match entry {
+            Ok(entry) => entries.push(TreeEntry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                // Followed, so a symlink to a folder opens like one.
+                is_dir: entry.path().is_dir(),
+                path: entry.into_path(),
+            }),
+            Err(failure) => {
+                error.get_or_insert_with(|| format!("Cannot list {}: {failure}", path.display()));
+            }
+        }
+    }
+    if entries.is_empty()
+        && let Some(error) = error
+    {
+        return Err(error);
+    }
+    entries.sort_by(|left, right| {
+        right
+            .is_dir
+            .cmp(&left.is_dir)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
 /// Whether `path` is excluded by a `.gitignore` rule. Opening such a path means
 /// the workspace root sits inside an ignored subtree (`target/`, `node_modules/`,
 /// …); the file picker and search must then ignore the ignore files, or the walk
@@ -1785,6 +1840,41 @@ mod tests {
             vec!["beta.rs".to_owned()]
         );
         assert!(list_path_completions("/no/such/directory/x", &root).is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_folder_lists_folders_first_without_what_git_ignores() {
+        let root = std::env::temp_dir().join(format!("my_editor_tree_{}", std::process::id()));
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        fs::write(root.join("b.txt"), "").unwrap();
+        fs::write(root.join("A.txt"), "").unwrap();
+        fs::write(root.join(".hidden"), "").unwrap();
+        let names = |respect| {
+            list_directory(&root, respect)
+                .unwrap()
+                .into_iter()
+                .map(|entry| (entry.name, entry.is_dir))
+                .collect::<Vec<_>>()
+        };
+
+        // Folders first, then files, by name whatever the case; hidden entries
+        // and what the repository ignores are left out, as in the picker.
+        assert_eq!(
+            names(true),
+            vec![
+                ("src".to_owned(), true),
+                ("A.txt".to_owned(), false),
+                ("b.txt".to_owned(), false),
+            ]
+        );
+        // A workspace inside an ignored tree shows everything, as the picker
+        // does in the same case.
+        assert!(names(false).contains(&("target".to_owned(), true)));
 
         fs::remove_dir_all(root).unwrap();
     }

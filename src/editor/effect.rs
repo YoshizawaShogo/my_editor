@@ -95,6 +95,11 @@ pub enum Effect {
         version: i32,
         delay_ms: u64,
     },
+    /// List one folder's entries for the file tree, one level deep.
+    ListDirectory {
+        path: std::path::PathBuf,
+        respect_ignore_files: bool,
+    },
     /// Come back in `delay_ms` to scroll a drag-selection that is held at the
     /// edge of the text, as [`super::AppEvent::DragScrollDue`].
     ScheduleDragScroll {

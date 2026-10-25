@@ -1643,6 +1643,119 @@ fn dragging_in_the_find_field_selects_and_dragging_over_results_does_not() {
 }
 
 #[test]
+fn the_file_tree_opens_down_to_the_file_and_follows_clicks() {
+    let root = PathBuf::from("/ws");
+    let mut editor = Editor::default();
+    editor.set_workspace_root(root.clone());
+    editor.update(AppEvent::Resize { cols: 80, rows: 20 });
+    editor.open_paths([root.join("src/editor/mod.rs")]);
+
+    let effects = editor.update(Command::ToggleTree.into());
+
+    // The folders down to the file being edited are asked for straight away,
+    // so the tree opens on it rather than on a row of shut folders.
+    let mut listed: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::ListDirectory { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec![root.clone(), root.join("src"), root.join("src/editor")]
+    );
+    assert_eq!(editor.focus(), Focus::Editor(Side::Left));
+
+    let entry = |path: &str, is_dir| TreeEntry {
+        name: path.rsplit('/').next().unwrap().to_owned(),
+        path: root.join(path),
+        is_dir,
+    };
+    let listed = |editor: &mut Editor, folder: &str, entries| {
+        editor.update(AppEvent::Io(IoEvent::DirectoryListed {
+            path: if folder.is_empty() {
+                root.clone()
+            } else {
+                root.join(folder)
+            },
+            result: Ok(entries),
+        }));
+    };
+    listed(
+        &mut editor,
+        "",
+        vec![entry("src", true), entry("Cargo.toml", false)],
+    );
+    listed(
+        &mut editor,
+        "src",
+        vec![entry("src/editor", true), entry("src/main.rs", false)],
+    );
+    listed(
+        &mut editor,
+        "src/editor",
+        vec![
+            entry("src/editor/mod.rs", false),
+            entry("src/editor/tree.rs", false),
+        ],
+    );
+    let rows = |editor: &Editor| {
+        editor
+            .tree_view()
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| (row.depth, row.entry.name.clone(), row.current))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows(&editor),
+        vec![
+            (0, "src".to_owned(), false),
+            (1, "editor".to_owned(), false),
+            (2, "mod.rs".to_owned(), true),
+            (2, "tree.rs".to_owned(), false),
+            (1, "main.rs".to_owned(), false),
+            (0, "Cargo.toml".to_owned(), false),
+        ]
+    );
+
+    // Rows start under the heading; the right pane starts at column 41.
+    let click = |editor: &mut Editor, row: u16| {
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 50,
+                row: row + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }))
+    };
+    // A folder shuts on a click, and opening it again lists it afresh.
+    assert!(click(&mut editor, 1).is_empty());
+    assert_eq!(rows(&editor).len(), 4);
+    assert!(matches!(
+        click(&mut editor, 1).as_slice(),
+        [Effect::ListDirectory { path, .. }] if path == &root.join("src/editor")
+    ));
+
+    // A file opens in the left pane, with the tree left standing beside it.
+    let effects = click(&mut editor, 3);
+    assert!(
+        matches!(effects.as_slice(), [Effect::ReadFile { path, .. }] if path.ends_with("tree.rs")),
+        "{effects:?}"
+    );
+    assert!(editor.tree_view().is_some());
+
+    // Ctrl+B again puts it away.
+    editor.update(Command::ToggleTree.into());
+    assert!(editor.tree_view().is_none());
+}
+
+#[test]
 fn a_search_across_files_heads_each_file_with_its_lines_below() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 30 });
