@@ -1643,6 +1643,78 @@ fn dragging_in_the_find_field_selects_and_dragging_over_results_does_not() {
 }
 
 #[test]
+fn a_search_across_files_heads_each_file_with_its_lines_below() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 30 });
+    editor.update(Command::OpenSearch.into());
+    // CurrentBuffer -> AllBuffers -> Directory.
+    editor.update(Command::CycleSearchScope.into());
+    editor.update(Command::CycleSearchScope.into());
+    for character in "foo".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+    let token = editor.search().unwrap().grep_token.expect("grep started");
+    let hit = |path: &str, line, text: &str| GrepHit {
+        path: PathBuf::from(path),
+        line,
+        text: text.to_owned(),
+    };
+    editor.update(AppEvent::Grep(GrepEvent::Hits {
+        token,
+        hits: vec![
+            hit("src/a.rs", 0, "let foo = 1;"),
+            hit("src/a.rs", 11, "foo();"),
+            hit("src/b.rs", 4, "use foo;"),
+        ],
+    }));
+
+    // The path on a row of its own, then the file's lines the way a one-file
+    // search shows them — it used to share every row with the text, pushing the
+    // match off to the right.
+    let view = editor.search_view().unwrap();
+    let rows: Vec<_> = view
+        .items
+        .iter()
+        .map(|item| (item.text.as_str(), item.hit))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("src/a.rs", None),
+            (" 1 ┆ let foo = 1;", Some(0)),
+            ("12 ┆ foo();", Some(1)),
+            ("src/b.rs", None),
+            (" 5 ┆ use foo;", Some(2)),
+        ]
+    );
+    assert_eq!(view.total, 3, "headings are not hits");
+
+    // Clicking a heading opens the first hit in its file; the rows below a
+    // heading still open their own hit, headings and all being counted.
+    let (_, pane_y, _, _) = editor.search_pane_rect();
+    let list_top = pane_y + crate::editor::search_pane_layout(true, false).results_top + 1;
+    let click = |editor: &mut Editor, row: u16| {
+        editor.update(AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 60,
+                row: list_top + row,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }))
+    };
+    let effects = click(&mut editor, 3);
+    assert!(
+        matches!(effects.as_slice(), [Effect::ReadFile { path, .. }] if path.ends_with("src/b.rs")),
+        "{effects:?}"
+    );
+    assert_eq!(editor.search_view().unwrap().current, Some(2));
+    click(&mut editor, 2);
+    assert_eq!(editor.search_view().unwrap().current, Some(1));
+}
+
+#[test]
 fn a_drag_held_past_the_bottom_keeps_selecting_until_released() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 40, rows: 10 });

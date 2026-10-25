@@ -1173,64 +1173,65 @@ impl Editor {
         // Locating the match inside a grep line needs the same pattern the search
         // ran with; built once rather than per hit.
         let pattern = search_pattern(&search.query, search.options).ok();
-        // Each row is built as (location, text, match-within-text), then the
-        // location column is padded to a common width so the dashed separator
-        // forms a straight line even where line numbers differ in digits.
-        let rows: Vec<(String, String, Option<std::ops::Range<usize>>)> = search
-            .hits
-            .iter()
-            .take(500)
-            .map(|hit| match hit {
-                SearchHit::Buffer {
-                    doc,
-                    range,
-                    preview,
-                } => {
-                    // Show the matched line's text instead of raw char offsets: a
-                    // "foo.rs  120..125" tells the reader nothing about the match.
-                    // The file path only earns its space when several buffers are
-                    // in scope; for a single-buffer search it is just noise.
-                    // Straight from the snapshot — reading the document here would
-                    // drift as soon as it was edited.
-                    let location = if search.scope == SearchScope::AllBuffers {
-                        format!("{}:{}", self.document_label(*doc), preview.line + 1)
-                    } else {
-                        (preview.line + 1).to_string()
-                    };
+        // A hit row is the line number, the separator and the matched line —
+        // the same whether the search covers one file or many, since the file
+        // is named on its own heading row above. Line numbers are padded to a
+        // common width so the separator forms a straight line down the list.
+        let hit_row = |hit: &SearchHit| -> (usize, String, Option<std::ops::Range<usize>>) {
+            match hit {
+                SearchHit::Buffer { range, preview, .. } => {
+                    // Straight from the snapshot — reading the document here
+                    // would drift as soon as it was edited.
                     let limit = preview.text.chars().count();
                     let end = preview.column + range.end.saturating_sub(range.start);
                     let matched = (preview.column < limit).then(|| preview.column..end.min(limit));
-                    (location, preview.text.clone(), matched)
+                    (preview.line + 1, preview.text.clone(), matched)
                 }
                 SearchHit::Disk(hit) => {
                     // grep reports the line but not the column, so re-run the
                     // pattern over the line to place the highlight.
                     let line_text = hit.text.trim();
-                    let location = format!("{}:{}", self.display_path(&hit.path), hit.line + 1);
                     let matched = pattern.as_ref().and_then(|pattern| {
                         let found = pattern.find(line_text)?;
                         let start = line_text[..found.start()].chars().count();
                         Some(start..start + found.as_str().chars().count())
                     });
-                    (location, line_text.to_owned(), matched)
+                    (hit.line + 1, line_text.to_owned(), matched)
                 }
-            })
-            .collect();
-        let location_width = rows
+            }
+        };
+        let rows = result_rows(search);
+        let number_width = rows
             .iter()
-            .map(|(location, _, _)| location.chars().count())
+            .filter_map(|row| match row {
+                ResultRow::Hit(index) => Some(hit_row(&search.hits[*index]).0),
+                ResultRow::File(_) => None,
+            })
             .max()
-            .unwrap_or(0);
+            .map_or(0, |line| line.to_string().len());
         let items = rows
-            .into_iter()
-            .map(|(location, line_text, matched)| {
-                let pad = location_width - location.chars().count();
-                let prefix = format!("{location}{}{SEARCH_COLUMN_SEPARATOR}", " ".repeat(pad));
-                let prefix_len = prefix.chars().count();
-                SearchResultItem {
-                    text: format!("{prefix}{line_text}"),
-                    prefix_len,
-                    matched: matched.map(|range| prefix_len + range.start..prefix_len + range.end),
+            .iter()
+            .map(|row| match *row {
+                ResultRow::File(first) => SearchResultItem {
+                    text: match &search.hits[first] {
+                        SearchHit::Buffer { doc, .. } => self.document_label(*doc),
+                        SearchHit::Disk(hit) => self.display_path(&hit.path),
+                    },
+                    prefix_len: 0,
+                    matched: None,
+                    hit: None,
+                },
+                ResultRow::Hit(index) => {
+                    let (line, line_text, matched) = hit_row(&search.hits[index]);
+                    let prefix = format!("{line:>number_width$}{SEARCH_COLUMN_SEPARATOR}");
+                    let prefix_len = prefix.chars().count();
+                    SearchResultItem {
+                        text: format!("{prefix}{line_text}"),
+                        prefix_len,
+                        matched: matched
+                            .map(|range| prefix_len + range.start..prefix_len + range.end),
+                        hit: Some(index),
+                    }
                 }
             })
             .collect();
@@ -5064,9 +5065,17 @@ impl Editor {
             return Some(Vec::new());
         }
         if relative > layout.results_top {
-            let index = usize::from(relative - layout.results_top - 1)
+            let row = usize::from(relative - layout.results_top - 1)
                 + self.search().map_or(0, |search| search.results_scroll);
-            return Some(self.open_search_hit(index));
+            // A heading opens the first hit in its file.
+            let hit = self
+                .search()
+                .and_then(|search| result_rows(search).get(row).copied())
+                .map(|row| match row {
+                    ResultRow::File(first) => first,
+                    ResultRow::Hit(index) => index,
+                });
+            return Some(hit.map_or_else(Vec::new, |hit| self.open_search_hit(hit)));
         }
         Some(Vec::new())
     }
@@ -5539,14 +5548,25 @@ impl Editor {
         .max(1)
     }
 
-    /// Keep the current row inside the visible slice of the result list.
+    /// Keep hit `index` inside the visible slice of the result list — along with
+    /// its file's heading, when that is the row just above it.
     fn scroll_result_into_view(&mut self, index: usize) {
         let visible = self.search_result_rows();
+        let Some(rows) = self.search().map(result_rows) else {
+            return;
+        };
+        let Some(row) = rows.iter().position(|row| *row == ResultRow::Hit(index)) else {
+            return;
+        };
+        let top = match row.checked_sub(1).map(|above| rows[above]) {
+            Some(ResultRow::File(_)) => row - 1,
+            _ => row,
+        };
         if let Some(search) = self.search_mut() {
-            if index < search.results_scroll {
-                search.results_scroll = index;
-            } else if index >= search.results_scroll + visible {
-                search.results_scroll = index + 1 - visible;
+            if top < search.results_scroll {
+                search.results_scroll = top;
+            } else if row >= search.results_scroll + visible {
+                search.results_scroll = row + 1 - visible;
             }
             self.dirty = true;
         }
@@ -5555,9 +5575,9 @@ impl Editor {
     fn scroll_search_results(&mut self, delta: isize) {
         let visible = self.search_result_rows();
         if let Some(search) = self.search_mut() {
-            // Stop once the last hit reaches the bottom row. Scrolling further
-            // only walked the list off the top into empty rows.
-            let max = search.hits.len().saturating_sub(visible);
+            // Stop once the last row reaches the bottom. Scrolling further only
+            // walked the list off the top into empty rows.
+            let max = result_rows(search).len().saturating_sub(visible);
             search.results_scroll = if delta < 0 {
                 search.results_scroll.saturating_sub(delta.unsigned_abs())
             } else {
@@ -7298,6 +7318,46 @@ pub struct SearchResultItem {
     pub text: String,
     pub prefix_len: usize,
     pub matched: Option<std::ops::Range<usize>>,
+    /// The hit this row opens, or `None` for a file heading.
+    pub hit: Option<usize>,
+}
+
+/// One row of the result list: a file heading the hits below it, or a hit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResultRow {
+    /// The file the following hits are in. Carries the first of them, so a
+    /// click on the heading has somewhere to go.
+    File(usize),
+    Hit(usize),
+}
+
+/// How many hits the list shows. Past this the list is no longer read row by
+/// row, and building it would only slow every keystroke in the query.
+const SEARCH_LIST_LIMIT: usize = 500;
+
+/// The rows the result list shows. A search that spans files — every buffer,
+/// or a directory — heads each file's hits with its path on a line of its own,
+/// so the hits under it read the way a single-file search does: a line number
+/// and the line. Putting the path on every hit's row pushed the text it was
+/// found in off to the right.
+fn result_rows(search: &SearchState) -> Vec<ResultRow> {
+    let grouped = search.scope != SearchScope::CurrentBuffer;
+    let same_file = |left: &SearchHit, right: &SearchHit| match (left, right) {
+        (SearchHit::Buffer { doc: left, .. }, SearchHit::Buffer { doc: right, .. }) => {
+            left == right
+        }
+        (SearchHit::Disk(left), SearchHit::Disk(right)) => left.path == right.path,
+        _ => false,
+    };
+    let mut rows = Vec::new();
+    for (index, hit) in search.hits.iter().take(SEARCH_LIST_LIMIT).enumerate() {
+        let new_file = index == 0 || !same_file(&search.hits[index - 1], hit);
+        if grouped && new_file {
+            rows.push(ResultRow::File(index));
+        }
+        rows.push(ResultRow::Hit(index));
+    }
+    rows
 }
 
 pub struct SearchView {

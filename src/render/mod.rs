@@ -910,11 +910,11 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
         let lines = search
             .items
             .iter()
-            .enumerate()
             .skip(search.results_scroll)
             .take(usize::from(inner.height))
-            .map(|(index, item)| {
-                search_result_line(item, search.current == Some(index), inner.width)
+            .map(|item| match item.hit {
+                Some(index) => search_result_line(item, search.current == Some(index), inner.width),
+                None => search_heading_line(item),
             })
             .collect::<Vec<_>>();
         frame.render_widget(
@@ -948,6 +948,19 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
 
 /// One result row: the `path:line ┆ ` column dimmed, the line text in the normal
 /// foreground, and the matched span picked out so the hit is findable at a glance.
+/// A file heading in the result list: the path the hits below it are in, in the
+/// colour paths get elsewhere and bold, so the list reads as files, each with
+/// its lines, rather than as one run of rows.
+fn search_heading_line(item: &crate::editor::SearchResultItem) -> Line<'static> {
+    Line::from(Span::styled(
+        item.text.clone(),
+        Style::default()
+            .fg(CODE_TYPE)
+            .bg(POPUP_BG)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
 fn search_result_line(
     item: &crate::editor::SearchResultItem,
     current: bool,
