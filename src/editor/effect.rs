@@ -95,6 +95,11 @@ pub enum Effect {
         version: i32,
         delay_ms: u64,
     },
+    /// Come back in `delay_ms` to scroll a drag-selection that is held at the
+    /// edge of the text, as [`super::AppEvent::DragScrollDue`].
+    ScheduleDragScroll {
+        delay_ms: u64,
+    },
     ScheduleHoverProbe {
         doc: DocumentId,
         delay_ms: u64,

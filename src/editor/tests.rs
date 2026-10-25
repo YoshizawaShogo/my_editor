@@ -1643,6 +1643,66 @@ fn dragging_in_the_find_field_selects_and_dragging_over_results_does_not() {
 }
 
 #[test]
+fn a_drag_held_past_the_bottom_keeps_selecting_until_released() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 40, rows: 10 });
+    let lines: Vec<_> = (0..200).map(|index| format!("line {index}")).collect();
+    editor.update(AppEvent::TextPaste(lines.join("\n")));
+    editor.update(
+        Command::Move {
+            direction: Direction::Left,
+            unit: Unit::Document,
+            extend: false,
+        }
+        .into(),
+    );
+    let mouse = |kind, row| {
+        AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind,
+                column: 8,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 1,
+        })
+    };
+    editor.update(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+
+    // One drag event to the bottom edge, then the pointer is held still: a
+    // terminal sends nothing more, so the scrolling has to come from a timer.
+    let effects = editor.update(mouse(MouseEventKind::Drag(MouseButton::Left), 9));
+    assert!(
+        matches!(effects.as_slice(), [Effect::ScheduleDragScroll { .. }]),
+        "{effects:?}"
+    );
+    for _ in 0..20 {
+        editor.update(AppEvent::DragScrollDue);
+    }
+
+    // The selection has carried on well past the screen it started on.
+    let head_line = {
+        let buffer = editor.active_buffer().unwrap();
+        buffer
+            .text
+            .char_to_line(buffer.view.selections.primary().head.0)
+    };
+    assert!(head_line > 25, "head stopped at line {head_line}");
+
+    // Letting go stops it: a timer still in flight does nothing more.
+    editor.update(mouse(MouseEventKind::Up(MouseButton::Left), 9));
+    let effects = editor.update(AppEvent::DragScrollDue);
+    assert!(effects.is_empty(), "{effects:?}");
+    let after = {
+        let buffer = editor.active_buffer().unwrap();
+        buffer
+            .text
+            .char_to_line(buffer.view.selections.primary().head.0)
+    };
+    assert_eq!(after, head_line);
+}
+
+#[test]
 fn the_find_field_cuts_copies_and_pastes_through_the_shared_register() {
     let mut editor = find_pane_with("foo", "foo");
 

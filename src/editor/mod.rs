@@ -41,6 +41,14 @@ use crate::{
 const PICKER_VIEW_WINDOW: usize = 20;
 const TERMINAL_SCROLLBACK_LINES: usize = 10_000;
 
+/// How often a drag-selection held past the edge of the text scrolls.
+const DRAG_SCROLL_INTERVAL_MS: u64 = 30;
+/// How long it takes at the edge for each step to scroll one more line.
+const DRAG_SCROLL_RAMP_MS: isize = 250;
+/// The most lines a step scrolls — about 200 a second. Faster than that and the
+/// selection outruns the eye trying to see where to let go.
+const DRAG_SCROLL_MAX_LINES: isize = 6;
+
 /// The smallest grid the terminal emulator is given. A single row or column
 /// underflows inside vt100 as soon as a character wraps — one row leaves it
 /// subtracting the scrolled line from row zero — and a window can be dragged
@@ -103,6 +111,15 @@ pub struct Editor {
     focus: Focus,
     clipboard: Register,
     drag_anchor: Option<CharIdx>,
+    /// A drag-selection held at the top or bottom edge of the text, scrolling on
+    /// a timer. Terminals only report a drag when the pointer moves, so without
+    /// this the selection grew one line per wiggle and stopped dead whenever the
+    /// pointer was held still past the edge — which is exactly how a selection
+    /// is carried off screen.
+    drag_scroll: Option<DragScroll>,
+    /// Whether a [`Effect::ScheduleDragScroll`] is already in flight, so a burst
+    /// of drag events does not stack a timer per event.
+    drag_scroll_pending: bool,
     picker: Option<PickerState>,
     config: Config,
     workspace_root: PathBuf,
@@ -180,6 +197,8 @@ impl Default for Editor {
             focus: Focus::Editor(Side::Left),
             clipboard: Register::default(),
             drag_anchor: None,
+            drag_scroll: None,
+            drag_scroll_pending: false,
             picker: None,
             config: Config::default(),
             workspace_root: PathBuf::from("."),
@@ -230,6 +249,12 @@ impl Editor {
         {
             self.dirty |= self.hover.is_some();
             self.dismiss_hover();
+        }
+        // A held drag ends with its release, but a release lost outside the
+        // window must not leave the text scrolling on its own: anything else
+        // deliberate — a click, a key, the wheel — ends it too.
+        if Self::is_user_action(&event) {
+            self.drag_scroll = None;
         }
         // The status line reports on the last thing that happened, so the next
         // deliberate action retires it — cleared before the event is applied, so
@@ -450,6 +475,12 @@ impl Editor {
                     }
                 }
                 self.apply_mouse(mouse);
+                if self.drag_scroll.is_some() && !self.drag_scroll_pending {
+                    self.drag_scroll_pending = true;
+                    return vec![Effect::ScheduleDragScroll {
+                        delay_ms: DRAG_SCROLL_INTERVAL_MS,
+                    }];
+                }
                 if copy_shell_selection {
                     self.copy_shell_selection()
                 } else if definition {
@@ -546,6 +577,10 @@ impl Editor {
                     Vec::new()
                 }
             },
+            AppEvent::DragScrollDue => {
+                self.drag_scroll_pending = false;
+                return self.step_drag_scroll();
+            }
             AppEvent::Tick => {
                 // Retire the status line on the same tick that retires toasts,
                 // so the bar stops reporting an event nobody remembers asking
@@ -4395,22 +4430,38 @@ impl Editor {
                 let Some(anchor) = self.drag_anchor else {
                     return;
                 };
-                // Extend past the viewport: when the drag reaches the top or bottom
-                // edge of the text area, scroll a line at a time so the selection can
-                // grow beyond what's on screen. Terminals only emit drag events on
-                // movement, so holding still at the edge just stops scrolling — no
-                // timer, and no runaway once the document end is reached (scroll_at
-                // clamps and mouse_position then lands on the last position).
+                // Extend past the viewport: at the top or bottom edge of the text,
+                // scroll so the selection can grow beyond what is on screen — a
+                // line now, and then on a timer for as long as the pointer stays
+                // there (see `step_drag_scroll`). Terminals report a drag only
+                // when the pointer moves, so this event alone would leave the
+                // selection stuck the moment the pointer is held past the edge.
                 let text_bottom = self.terminal_size.1.saturating_sub(2);
-                let head = if mouse.row == 0 {
-                    self.scroll_at(mouse.column, -1);
-                    self.mouse_position(mouse.column, 0)
+                let edge = if mouse.row == 0 {
+                    Some(-1)
                 } else if mouse.row >= text_bottom {
-                    self.scroll_at(mouse.column, 1);
-                    self.mouse_position(mouse.column, text_bottom)
+                    Some(1)
                 } else {
-                    self.mouse_position(mouse.column, mouse.row)
+                    None
                 };
+                self.drag_scroll = edge.map(|direction| DragScroll {
+                    column: mouse.column,
+                    direction,
+                    // Kept while it stays at the same edge, so the scroll keeps
+                    // speeding up instead of starting over at every small move.
+                    since: match self.drag_scroll {
+                        Some(held) if held.direction == direction => held.since,
+                        _ => Instant::now(),
+                    },
+                });
+                let row = match edge {
+                    Some(direction) => {
+                        self.scroll_at(mouse.column, direction);
+                        if direction < 0 { 0 } else { text_bottom }
+                    }
+                    None => mouse.row,
+                };
+                let head = self.mouse_position(mouse.column, row);
                 let Some(head) = head else {
                     return;
                 };
@@ -4423,6 +4474,7 @@ impl Editor {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag_anchor = None;
+                self.drag_scroll = None;
                 if self.focus == Focus::Shell
                     && let Some(shell) = self.shell.as_mut()
                     && shell
@@ -6103,6 +6155,45 @@ impl Editor {
     /// Scroll the pane the mouse is over, not the focused one — hovering a split
     /// and spinning the wheel scrolls whichever side the cursor sits on, which is
     /// what other editors do. Focus is left untouched.
+    /// One step of a drag held past the edge of the text: scroll — further the
+    /// longer it has been held — and carry the selection's head to the edge.
+    /// Comes back for another until the button is released, the pointer returns
+    /// inside, or there is nothing left to scroll to.
+    fn step_drag_scroll(&mut self) -> Vec<Effect> {
+        let (Some(drag), Some(anchor)) = (self.drag_scroll, self.drag_anchor) else {
+            self.drag_scroll = None;
+            return Vec::new();
+        };
+        let held = drag.since.elapsed().as_millis() as isize;
+        let lines = (1 + held / DRAG_SCROLL_RAMP_MS).min(DRAG_SCROLL_MAX_LINES);
+        let top = |editor: &Self| {
+            editor
+                .layout
+                .active_editor(editor.focus)
+                .map(|pane| pane.view.scroll.top_line)
+        };
+        let before = top(self);
+        self.scroll_at(drag.column, drag.direction * lines);
+        let moved = top(self) != before;
+        let text_bottom = self.terminal_size.1.saturating_sub(2);
+        let row = if drag.direction < 0 { 0 } else { text_bottom };
+        if let Some(head) = self.mouse_position(drag.column, row)
+            && let Some(pane) = self.layout.active_editor_mut(self.focus)
+        {
+            pane.view.selections.set_single(Selection { anchor, head });
+        }
+        self.dirty = true;
+        if !moved {
+            // The end of the text is on screen; a new drag re-arms it.
+            self.drag_scroll = None;
+            return Vec::new();
+        }
+        self.drag_scroll_pending = true;
+        vec![Effect::ScheduleDragScroll {
+            delay_ms: DRAG_SCROLL_INTERVAL_MS,
+        }]
+    }
+
     fn scroll_at(&mut self, column: u16, amount: isize) {
         if self.layout.is_diff() {
             self.scroll_diff(amount);
@@ -7312,6 +7403,16 @@ fn split_right_width(total: u16) -> u16 {
 
 /// A running shell and the screen it has drawn so far. The child process lives
 /// in the runtime; this is the editor's view of it.
+/// A drag-selection held at an edge of the text: where the pointer was, which
+/// way the text is scrolling, and since when, so the scroll can speed up the
+/// longer it is held.
+#[derive(Clone, Copy, Debug)]
+struct DragScroll {
+    column: u16,
+    direction: isize,
+    since: Instant,
+}
+
 struct ShellSession {
     /// Distinguishes this session from one it replaced, whose reader thread
     /// reports its exit only after the successor is already running.

@@ -31,6 +31,8 @@ pub enum AppEvent {
         rows: u16,
     },
     Tick,
+    /// Time for the next step of a drag-selection held at the edge of the text.
+    DragScrollDue,
     Error(String),
 }
 

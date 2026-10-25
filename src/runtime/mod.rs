@@ -515,6 +515,13 @@ impl Runtime {
                     }));
                 });
             }
+            Effect::ScheduleDragScroll { delay_ms } => {
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    let _ = tx.send(AppEvent::DragScrollDue);
+                });
+            }
             Effect::ScheduleCompletionRefresh {
                 doc,
                 version,
