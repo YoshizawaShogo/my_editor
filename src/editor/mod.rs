@@ -43,6 +43,10 @@ use crate::{
 const PICKER_VIEW_WINDOW: usize = 20;
 const TERMINAL_SCROLLBACK_LINES: usize = 10_000;
 
+/// How many completion candidates the popup lists. The arrows stop at the last
+/// of them; the rest are reached by typing more of the name.
+const COMPLETION_VISIBLE_ITEMS: usize = 12;
+
 /// How often a drag-selection held past the edge of the text scrolls.
 const DRAG_SCROLL_INTERVAL_MS: u64 = 30;
 /// How long it takes at the edge for each step to scroll one more line.
@@ -1289,7 +1293,7 @@ impl Editor {
             items: completion
                 .items
                 .iter()
-                .take(12)
+                .take(COMPLETION_VISIBLE_ITEMS)
                 .map(|item| item.label.clone())
                 .collect(),
             selected: completion.selected,
@@ -5744,7 +5748,13 @@ impl Editor {
 
     fn move_picker(&mut self, amount: isize) {
         if let Some(completion) = &mut self.completion {
-            let max = completion.items.len().saturating_sub(1);
+            // Only as far as the popup shows: past that the highlight left the
+            // list, and Enter took a candidate nobody could see.
+            let max = completion
+                .items
+                .len()
+                .min(COMPLETION_VISIBLE_ITEMS)
+                .saturating_sub(1);
             completion.selected = if amount < 0 {
                 completion.selected.saturating_sub(amount.unsigned_abs())
             } else {

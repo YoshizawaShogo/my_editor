@@ -5043,6 +5043,26 @@ fn naming_a_declaration_does_not_open_the_completion_popup() {
 }
 
 #[test]
+fn the_arrows_stop_at_the_last_completion_the_popup_shows() {
+    let mut editor = editor_with_lsp();
+    editor.update(AppEvent::TextPaste("item".to_owned()));
+    let items: Vec<_> = (0..20)
+        .map(|index| serde_json::json!({"label": format!("item{index:02}")}))
+        .collect();
+    complete_with(&mut editor, serde_json::Value::Array(items));
+
+    for _ in 0..30 {
+        editor.update(Command::PickerDown.into());
+    }
+
+    // Twenty candidates, but the popup lists the first dozen: the highlight
+    // stays on the last of those instead of walking off the bottom of it.
+    let view = editor.completion_view().expect("completion popup");
+    assert_eq!(view.items.len(), 12);
+    assert_eq!(view.selected, 11);
+}
+
+#[test]
 fn a_lower_case_prefix_still_reaches_a_capitalised_completion() {
     let mut editor = editor_with_lsp();
     editor.update(AppEvent::TextPaste(
