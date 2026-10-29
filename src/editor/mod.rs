@@ -1191,7 +1191,11 @@ impl Editor {
         Some(PickerView {
             title: match picker.mode {
                 PickerMode::Directory => "Open file · / ~ ../ completes paths",
-                PickerMode::Buffer => "Open buffer",
+                PickerMode::Buffer => match picker.pair {
+                    Some(Side::Left) => "Open buffer · 1/2 → left pane",
+                    Some(Side::Right) => "Open buffer · 2/2 → right pane",
+                    None => "Open buffer",
+                },
                 PickerMode::Diff => "Compare with · buffer or file · / ~ ../ completes paths",
                 PickerMode::Command => "Command Palette · key / command / description",
             },
@@ -4694,11 +4698,16 @@ impl Editor {
     }
 
     fn open_picker(&mut self, mode: PickerMode) -> Vec<Effect> {
-        if self
-            .picker
-            .as_ref()
-            .is_some_and(|picker| picker.mode == mode)
-        {
+        if let Some(picker) = self.picker.as_mut().filter(|picker| picker.mode == mode) {
+            // Ctrl+G a second time turns the buffer list into a pair of picks —
+            // one for the left pane, then one for the right — which sets up a
+            // side-by-side in one go. A third press puts it away.
+            if mode == PickerMode::Buffer && picker.pair.is_none() {
+                picker.pair = Some(Side::Left);
+                picker.return_side = Side::Left;
+                self.dirty = true;
+                return Vec::new();
+            }
             self.close_picker();
             return Vec::new();
         }
@@ -4756,6 +4765,7 @@ impl Editor {
             ranking_cache: Vec::new(),
             scan_token,
             path_listing_start: None,
+            pair: None,
         });
         self.focus = Focus::Overlay;
         self.dirty = true;
@@ -4769,6 +4779,39 @@ impl Editor {
                 }]
             })
             .unwrap_or_default()
+    }
+
+    /// The second pick of a pair: every open buffer but `left`, the one just
+    /// put in the left pane, for the right. Esc here leaves the left pick in
+    /// place, and focus goes back to the left either way.
+    fn pick_right_of_pair(&mut self, left: DocumentId) -> Vec<Effect> {
+        let candidates: Vec<_> = self
+            .documents
+            .keys()
+            .filter(|id| **id != left)
+            .copied()
+            .map(PickerCandidate::Document)
+            .collect();
+        if candidates.is_empty() {
+            self.set_status("No other buffers are open");
+            return Vec::new();
+        }
+        self.picker = Some(PickerState {
+            mode: PickerMode::Buffer,
+            base: left,
+            return_side: Side::Left,
+            filtered: (0..candidates.len()).collect(),
+            candidates,
+            query: String::new(),
+            selected: 0,
+            ranking_cache: Vec::new(),
+            scan_token: None,
+            path_listing_start: None,
+            pair: Some(Side::Right),
+        });
+        self.focus = Focus::Overlay;
+        self.dirty = true;
+        Vec::new()
     }
 
     fn open_command_palette(&mut self) {
@@ -4799,6 +4842,7 @@ impl Editor {
             ranking_cache: Vec::new(),
             scan_token: None,
             path_listing_start: None,
+            pair: None,
         });
         self.focus = Focus::Overlay;
         self.dirty = true;
@@ -4839,6 +4883,7 @@ impl Editor {
             ranking_cache: Vec::new(),
             scan_token: Some(token),
             path_listing_start: None,
+            pair: None,
         });
         self.focus = Focus::Overlay;
         self.set_status("Scanning files…".to_owned());
@@ -6115,6 +6160,29 @@ impl Editor {
                 self.focus = Focus::Editor(picker.return_side);
                 effects.extend(self.open_paths([path]));
             }
+            (PickerMode::Buffer, PickerCandidate::Document(target)) if picker.pair.is_some() => {
+                let view = self.view_for(target);
+                if picker.pair == Some(Side::Left) {
+                    // A diff's left half belongs to the comparison; the pair
+                    // replaces it with an ordinary pane.
+                    if self.layout.is_diff() {
+                        self.show_only(view);
+                    } else {
+                        self.layout.left.view = view;
+                    }
+                    self.focus = Focus::Editor(Side::Left);
+                    return self.pick_right_of_pair(target);
+                }
+                if self.layout.is_editor_split() {
+                    if let Some(pane) = self.layout.active_editor_mut(Focus::Editor(Side::Right)) {
+                        pane.view = view;
+                    }
+                } else {
+                    // No second file on the right yet: the pick makes the split.
+                    self.set_right_pane(Some(RightPane::Editor(EditorPane { view })));
+                }
+                final_side = Side::Left;
+            }
             (PickerMode::Buffer, PickerCandidate::Document(target)) => {
                 self.focus = Focus::Editor(picker.return_side);
                 let view = self.view_for(target);
@@ -7093,6 +7161,9 @@ struct PickerState {
     /// from here on answers a path-shaped query and is dropped once the query
     /// stops being one, restoring the picker's own candidates underneath.
     path_listing_start: Option<usize>,
+    /// Picking a pair of buffers — Ctrl+G pressed twice — and which pane this
+    /// pick fills: the left first, then the right. `None` for a single pick.
+    pair: Option<Side>,
 }
 
 impl PickerState {

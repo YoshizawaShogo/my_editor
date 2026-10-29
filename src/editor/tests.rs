@@ -3677,7 +3677,7 @@ fn directory_picker_replaces_the_find_pane_and_receives_keyboard_input() {
 }
 
 #[test]
-fn ctrl_t_and_ctrl_g_toggle_their_picker_closed() {
+fn ctrl_t_toggles_its_picker_closed_and_ctrl_g_after_a_pair() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 24 });
 
@@ -3695,11 +3695,98 @@ fn ctrl_t_and_ctrl_g_toggle_their_picker_closed() {
     );
     assert!(editor.picker_view().is_none());
 
+    // Ctrl+G's second press turns the list into a pair of picks; the third
+    // puts it away.
     editor.open_paths([PathBuf::from("one.txt"), PathBuf::from("two.txt")]);
     editor.update(Command::OpenBufferPicker.into());
     assert!(editor.picker_view().is_some());
     editor.update(Command::OpenBufferPicker.into());
+    assert!(editor.picker_view().is_some());
+    editor.update(Command::OpenBufferPicker.into());
     assert!(editor.picker_view().is_none());
+}
+
+#[test]
+fn ctrl_g_twice_picks_a_file_for_each_pane_in_turn() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+    editor.open_paths([
+        PathBuf::from("first.txt"),
+        PathBuf::from("second.txt"),
+        PathBuf::from("third.txt"),
+    ]);
+    for (id, text) in [(1, "first"), (2, "second"), (3, "third")] {
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(id),
+            result: Ok(text.to_owned()),
+        }));
+    }
+    let choose = |editor: &mut Editor, name: &str| {
+        for character in name.chars() {
+            editor.update(AppEvent::TextInput(character));
+        }
+        editor.update(Command::PickerConfirm.into());
+    };
+
+    editor.update(Command::OpenBufferPicker.into());
+    editor.update(Command::OpenBufferPicker.into());
+    assert_eq!(
+        editor.picker_view().unwrap().title,
+        "Open buffer · 1/2 → left pane"
+    );
+
+    // The first pick fills the left pane and the list comes straight back for
+    // the right one, without the file just chosen.
+    choose(&mut editor, "first.txt");
+    let picker = editor.picker_view().expect("the second pick");
+    assert_eq!(picker.title, "Open buffer · 2/2 → right pane");
+    assert!(
+        picker
+            .items
+            .iter()
+            .all(|item| !item.label.contains("first.txt")),
+        "{:?}",
+        picker
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+
+    // The second fills the right, making the split, and the picker is done.
+    choose(&mut editor, "second.txt");
+    assert!(editor.picker_view().is_none());
+    let (left, right, diff) = editor.split_buffers().expect("a split");
+    assert!(!diff);
+    assert_eq!(left.text.to_string(), "first");
+    assert_eq!(right.text.to_string(), "second");
+    assert_eq!(editor.focus(), Focus::Editor(Side::Left));
+}
+
+#[test]
+fn backing_out_of_the_second_pick_keeps_the_first() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+    editor.open_paths([PathBuf::from("first.txt"), PathBuf::from("second.txt")]);
+    for (id, text) in [(1, "first"), (2, "second")] {
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(id),
+            result: Ok(text.to_owned()),
+        }));
+    }
+    editor.update(Command::OpenBufferPicker.into());
+    editor.update(Command::OpenBufferPicker.into());
+    for character in "first.txt".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+    editor.update(Command::PickerConfirm.into());
+
+    editor.update(Command::PickerCancel.into());
+
+    assert!(editor.picker_view().is_none());
+    assert!(editor.split_buffers().is_none());
+    assert_eq!(editor.active_buffer().unwrap().text.to_string(), "first");
+    assert_eq!(editor.focus(), Focus::Editor(Side::Left));
 }
 
 #[test]
