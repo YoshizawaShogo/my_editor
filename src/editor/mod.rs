@@ -2255,6 +2255,69 @@ impl Editor {
         }]
     }
 
+    /// What follows the primary caret on its line, without the line break.
+    fn rest_of_caret_line(&self) -> String {
+        let Some(pane) = self.layout.active_editor(self.focus) else {
+            return String::new();
+        };
+        let Some(editable) = self
+            .documents
+            .get(&pane.view.doc)
+            .and_then(Document::editable_opt)
+        else {
+            return String::new();
+        };
+        let text = editable.text();
+        let head = pane.view.selections.primary().head.0.min(text.len_chars());
+        let line = text.char_to_line(head);
+        let line_end = text.line_to_char(line) + text.line(line).len_chars();
+        text.slice(head..line_end)
+            .to_string()
+            .trim_end_matches(['\r', '\n'])
+            .to_owned()
+    }
+
+    /// Whether the caret sits at the end of an unfinished Rust `use` line —
+    /// `use petgraph::` with nothing after it yet. A single bare caret only:
+    /// wrapping a selection in braces is not the end of a declaration.
+    fn caret_ends_a_use_line(&self) -> bool {
+        let Some(pane) = self.layout.active_editor(self.focus) else {
+            return false;
+        };
+        let Some(document) = self.documents.get(&pane.view.doc) else {
+            return false;
+        };
+        let Some(editable) = document.editable_opt() else {
+            return false;
+        };
+        if document.language.as_deref() != Some("rust")
+            || pane.view.selections.len() != 1
+            || !pane.view.selections.primary().is_caret()
+        {
+            return false;
+        }
+        let text = editable.text();
+        let head = pane.view.selections.primary().head.0.min(text.len_chars());
+        let line = text.char_to_line(head);
+        let line_start = text.line_to_char(line);
+        let line_end = line_start + text.line(line).len_chars();
+        let before = text.slice(line_start..head).to_string();
+        let after = text.slice(head..line_end).to_string();
+        // `use`, `pub use` and `pub(crate) use` alike.
+        let declaration = before.trim_start();
+        let declaration = match declaration.strip_prefix("pub") {
+            Some(rest) => {
+                let rest = rest.trim_start();
+                rest.strip_prefix('(')
+                    .and_then(|scoped| scoped.split_once(')'))
+                    .map_or(rest, |(_, after_scope)| after_scope)
+                    .trim_start()
+            }
+            None => declaration,
+        };
+        declaration.starts_with("use ") && after.trim().is_empty()
+    }
+
     /// The character `back` places before the primary caret in the active
     /// buffer: 1 is the one just typed.
     fn char_before_caret(&self, back: usize) -> Option<char> {
@@ -4015,6 +4078,13 @@ impl Editor {
                 // bracket is not: `[` inside `[]` is a pair of its own, and
                 // stepping over the `]` left no way to nest one.
                 let quote = closing == character;
+                // The braces of a `use` are the last thing on its line, and the
+                // line still needs its `;` — closing it here saves going back.
+                let closing_text = if character == '{' && self.caret_ends_a_use_line() {
+                    "};".to_owned()
+                } else {
+                    closing.to_string()
+                };
                 self.edit_active(|document, view| {
                     if quote
                         && document
@@ -4026,9 +4096,33 @@ impl Editor {
                     document.editable_mut().insert_pair(
                         &mut view.selections,
                         character,
-                        closing,
+                        &closing_text,
                         at,
                     );
+                });
+            }
+            ';' => {
+                // The `;` a `use` line's braces brought along is still ahead of
+                // the caret when the habit of typing one arrives: step over it
+                // rather than doubling it. Only when it is all that is left on
+                // the line, so a `;` typed anywhere else goes in as typed.
+                let step_over = self.rest_of_caret_line().trim_end() == ";";
+                self.edit_active(|document, view| {
+                    if step_over
+                        && document
+                            .editable_mut()
+                            .skip_closing_character(&mut view.selections, ';')
+                    {
+                        return;
+                    }
+                    match at {
+                        Some(at) => {
+                            document
+                                .editable_mut()
+                                .insert_timed(&mut view.selections, ";", at)
+                        }
+                        None => document.editable_mut().insert(&mut view.selections, ";"),
+                    }
                 });
             }
             '}' => self.edit_active(|document, view| {

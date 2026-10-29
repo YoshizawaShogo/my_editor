@@ -131,11 +131,14 @@ impl Editable {
         self.replace_ranges(selections, targets, replacements, Some(at), None, None);
     }
 
+    /// Type `opening` and, where auto-closing helps, `closing` after it with the
+    /// caret left in between. `closing` is text rather than a character so a
+    /// caller can close more than the bracket — `};` after the `{` of a `use`.
     pub fn insert_pair(
         &mut self,
         selections: &mut Selections,
         opening: char,
-        closing: char,
+        closing: &str,
         at: Option<Instant>,
     ) {
         let targets: Vec<_> = selections.iter().copied().collect();
@@ -152,7 +155,7 @@ impl Editable {
             } else {
                 // Wrapping a selection, or at a spot where auto-closing helps.
                 replacements.push(format!("{opening}{selected}{closing}"));
-                cursor_backs.push(1);
+                cursor_backs.push(closing.chars().count());
             }
         }
         self.replace_ranges(
@@ -1189,7 +1192,7 @@ mod tests {
             let mut editable = Editable::new("");
             let mut selections = Selections::default();
 
-            editable.insert_pair(&mut selections, opening, closing, None);
+            editable.insert_pair(&mut selections, opening, &closing.to_string(), None);
             assert_eq!(editable.text().to_string(), format!("{opening}{closing}"));
             assert_eq!(selections.primary().head, CharIdx(1));
 
@@ -1206,7 +1209,7 @@ mod tests {
         let mut editable = Editable::new("A=B");
         let mut selections = Selections::single(Selection::caret(CharIdx(2)));
 
-        editable.insert_pair(&mut selections, '"', '"', None);
+        editable.insert_pair(&mut selections, '"', "\"", None);
 
         assert_eq!(editable.text().to_string(), "A=\"B");
         assert_eq!(selections.primary().head, CharIdx(3));
@@ -1218,7 +1221,7 @@ mod tests {
         let mut editable = Editable::new("A=");
         let mut selections = Selections::single(Selection::caret(CharIdx(2)));
 
-        editable.insert_pair(&mut selections, '"', '"', None);
+        editable.insert_pair(&mut selections, '"', "\"", None);
 
         assert_eq!(editable.text().to_string(), "A=\"\"");
         assert_eq!(selections.primary().head, CharIdx(3));
@@ -1231,7 +1234,7 @@ mod tests {
         let mut editable = Editable::new("()");
         let mut selections = Selections::single(Selection::caret(CharIdx(1)));
 
-        editable.insert_pair(&mut selections, '"', '"', None);
+        editable.insert_pair(&mut selections, '"', "\"", None);
 
         assert_eq!(editable.text().to_string(), "(\"\")");
     }

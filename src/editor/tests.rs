@@ -5595,6 +5595,58 @@ fn bracketed_multiline_paste_is_inserted_literally_and_normalizes_line_endings()
 }
 
 #[test]
+fn the_braces_of_a_use_line_come_with_its_semicolon() {
+    let typed = |path: &str, text: &str| {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from(path)]);
+        editor.update(AppEvent::TextPaste(text.to_owned()));
+        editor.update(AppEvent::TextInput('{'));
+        let buffer = editor.active_buffer().unwrap();
+        let caret = buffer.view.selections.primary().head.0;
+        let text = buffer.text.to_string();
+        format!("{}|{}", &text[..caret], &text[caret..])
+    };
+
+    // At the end of a `use`, the line still needs its `;`: it comes with the
+    // braces, and the caret waits between them.
+    assert_eq!(typed("main.rs", "use petgraph::"), "use petgraph::{|};");
+    assert_eq!(
+        typed("main.rs", "pub(crate) use std::collections::"),
+        "pub(crate) use std::collections::{|};"
+    );
+
+    // Anywhere else a brace is just a brace.
+    assert_eq!(typed("main.rs", "fn main() "), "fn main() {|}");
+    // Typed the way it happens — the outer braces brought `};` along, and the
+    // inner ones go in before it — the line already has its `;`.
+    let mut editor = Editor::default();
+    editor.open_paths([PathBuf::from("main.rs")]);
+    for character in "use a::{b, c::{".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+    assert_eq!(
+        editor.active_buffer().unwrap().text.to_string(),
+        "use a::{b, c::{}};"
+    );
+    // And only Rust has this `use`.
+    assert_eq!(typed("notes.txt", "use petgraph::"), "use petgraph::{|}");
+
+    // Finishing the line by habit — `}` then `;` — steps over what the braces
+    // brought instead of ending up with `;;`.
+    let mut editor = Editor::default();
+    editor.open_paths([PathBuf::from("main.rs")]);
+    for character in "use petgraph::{Graph};".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+    let buffer = editor.active_buffer().unwrap();
+    assert_eq!(buffer.text.to_string(), "use petgraph::{Graph};");
+    assert_eq!(
+        buffer.view.selections.primary().head.0,
+        buffer.text.len_chars()
+    );
+}
+
+#[test]
 fn a_bracket_nests_while_a_quote_steps_over_its_twin() {
     let mut editor = Editor::default();
 
