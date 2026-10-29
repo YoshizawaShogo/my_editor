@@ -92,6 +92,9 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
     if ctrl && key.code == KeyCode::Char('b') {
         return Some(Command::ToggleTree.into());
     }
+    if ctrl && key.code == KeyCode::Char('l') {
+        return Some(Command::AddLineAbove.into());
+    }
     if ctrl && key.code == KeyCode::Char('f') {
         // Open (or, when already open, cycle the scope of) the find & replace pane.
         return Some(Command::OpenReplace.into());

@@ -3447,6 +3447,7 @@ impl Editor {
             self.focus = Focus::Editor(side);
         }
         match command {
+            Command::AddLineAbove => self.add_line_above(),
             Command::InsertNewline => {
                 let (tab_size, insert_spaces) = self.active_indentation_settings();
                 let line_comment = self
@@ -4267,6 +4268,41 @@ impl Editor {
             head: crate::position::CharIdx(editable.text().len_chars()),
         });
         self.dirty = true;
+    }
+
+    /// Ctrl+L: what going to the start of the line, pressing Enter and moving
+    /// back up does — a blank line above, the caret on it — in one step that
+    /// undoes as one, wherever on the line the caret was. Each caret's line
+    /// gets its own, once however many carets share it.
+    fn add_line_above(&mut self) {
+        self.edit_active(|document, view| {
+            let editable = document.editable_mut();
+            let text = editable.text();
+            let mut starts: Vec<usize> = view
+                .selections
+                .iter()
+                .map(|selection| {
+                    text.line_to_char(text.char_to_line(selection.head.0.min(text.len_chars())))
+                })
+                .collect();
+            starts.sort_unstable();
+            starts.dedup();
+            let mut selections = crate::view::Selections::from_vec(
+                starts
+                    .into_iter()
+                    .map(|start| Selection::caret(CharIdx(start)))
+                    .collect(),
+                0,
+            );
+            editable.insert(&mut selections, "\n");
+            // Each caret now sits after the break it put in, at the start of its
+            // own line pushed down one; the blank line is just before it.
+            let carets = selections
+                .iter()
+                .map(|selection| Selection::caret(CharIdx(selection.head.0.saturating_sub(1))))
+                .collect();
+            view.selections = crate::view::Selections::from_vec(carets, 0);
+        });
     }
 
     fn collapse_selections(&mut self) {
@@ -7098,6 +7134,12 @@ const COMMAND_PALETTE: &[CommandPaletteEntry] = &[
         name: "Rename Symbol",
         description: "Rename the symbol through the language server",
         command: Command::Rename,
+    },
+    CommandPaletteEntry {
+        key: "Ctrl+L",
+        name: "Line Add",
+        description: "Insert a blank line above the current line and move onto it",
+        command: Command::AddLineAbove,
     },
     CommandPaletteEntry {
         key: "Ctrl+N",

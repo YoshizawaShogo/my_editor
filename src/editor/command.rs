@@ -1,6 +1,8 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
     InsertNewline,
+    /// Ctrl+L: a blank line above the caret's line, with the caret on it.
+    AddLineAbove,
     DeleteBackward,
     DeleteForward,
     Move {

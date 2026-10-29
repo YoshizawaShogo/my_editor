@@ -5760,6 +5760,39 @@ fn the_braces_of_a_use_line_come_with_its_semicolon() {
 }
 
 #[test]
+fn ctrl_l_opens_a_blank_line_above_and_moves_onto_it() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::TextPaste("one\n    two\nthree".to_owned()));
+    // The caret somewhere in the middle of `two`.
+    editor.update(
+        Command::Move {
+            direction: Direction::Up,
+            unit: Unit::Character,
+            extend: false,
+        }
+        .into(),
+    );
+
+    editor.update(Command::AddLineAbove.into());
+
+    // As if Home-to-column-0, Enter, Up: the line keeps its place and its
+    // indent, a blank one opens above it, and the caret is on the blank one.
+    let buffer = editor.active_buffer().unwrap();
+    assert_eq!(buffer.text.to_string(), "one\n\n    two\nthree");
+    let head = buffer.view.selections.primary().head.0;
+    assert_eq!(buffer.text.char_to_line(head), 1);
+    assert_eq!(head, buffer.text.line_to_char(1));
+    drop(buffer);
+
+    // One step, so one undo puts it back.
+    editor.update(Command::Undo.into());
+    assert_eq!(
+        editor.active_buffer().unwrap().text.to_string(),
+        "one\n    two\nthree"
+    );
+}
+
+#[test]
 fn a_bracket_nests_while_a_quote_steps_over_its_twin() {
     let mut editor = Editor::default();
 
