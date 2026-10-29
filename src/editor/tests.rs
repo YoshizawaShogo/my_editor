@@ -5760,6 +5760,44 @@ fn the_braces_of_a_use_line_come_with_its_semicolon() {
 }
 
 #[test]
+fn clicking_back_into_the_text_puts_the_go_to_line_prompt_away() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 40, rows: 10 });
+    editor.update(AppEvent::TextPaste("one\ntwo\nthree".to_owned()));
+    editor.update(Command::GoToLine.into());
+    editor.update(AppEvent::TextInput('2'));
+
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 6,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+
+    // The prompt is gone and the keyboard is back in the text, where the
+    // click put the caret.
+    assert_eq!(editor.goto_view(), None);
+    assert_eq!(editor.focus(), Focus::Editor(Side::Left));
+    let buffer = editor.active_buffer().unwrap();
+    assert_eq!(
+        buffer
+            .text
+            .char_to_line(buffer.view.selections.primary().head.0),
+        0
+    );
+    drop(buffer);
+    // Column 6 is just past the five-column gutter: between `o` and `ne`.
+    editor.update(AppEvent::TextInput('x'));
+    assert_eq!(
+        editor.active_buffer().unwrap().text.to_string(),
+        "oxne\ntwo\nthree"
+    );
+}
+
+#[test]
 fn ctrl_l_opens_a_blank_line_above_and_moves_onto_it() {
     let mut editor = Editor::default();
     editor.update(AppEvent::TextPaste("one\n    two\nthree".to_owned()));

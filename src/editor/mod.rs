@@ -366,6 +366,16 @@ impl Editor {
                 effects
             }
             AppEvent::Mouse(mouse) => {
+                // A click back in the text is a way of going somewhere else than
+                // the go-to-line prompt was asking about: put the prompt away and
+                // let the click place the caret, instead of leaving the prompt up
+                // to swallow whatever is typed next.
+                if let Some((side, _)) = self.goto_input.take_if(|_| {
+                    matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left))
+                }) {
+                    self.focus = Focus::Editor(side);
+                    self.dirty = true;
+                }
                 if self.picker.is_some()
                     && matches!(mouse.event.kind, MouseEventKind::Down(MouseButton::Left))
                 {
