@@ -695,6 +695,7 @@ impl Runtime {
                                 hover_provider: capabilities.hover_provider,
                                 semantic_tokens_legend: capabilities.semantic_tokens_legend,
                                 signature_help_triggers: capabilities.signature_help_triggers,
+                                completion_triggers: capabilities.completion_triggers,
                             },
                             Err(error) => crate::lsp::LspEvent::InitializationFailed {
                                 server,
@@ -759,7 +760,10 @@ impl Runtime {
                             "completionItem": {
                                 "snippetSupport": true,
                                 "documentationFormat": ["markdown", "plaintext"]
-                            }
+                            },
+                            // Requests say whether a trigger character or a
+                            // Ctrl+Space asked for them.
+                            "contextSupport": true
                         },
                         "signatureHelp": {
                             "signatureInformation": {
@@ -1025,6 +1029,7 @@ struct InitializeCapabilities {
     hover_provider: bool,
     semantic_tokens_legend: Option<crate::lsp::SemanticTokensLegend>,
     signature_help_triggers: Vec<String>,
+    completion_triggers: Vec<String>,
 }
 
 fn parse_initialize_response(
@@ -1088,11 +1093,17 @@ fn parse_initialize_response(
                 .unwrap_or_else(|| vec!["(".to_owned(), ",".to_owned()])
         })
         .unwrap_or_default();
+    let completion_triggers = result
+        .capabilities
+        .completion_provider
+        .and_then(|options| options.trigger_characters)
+        .unwrap_or_default();
     Ok(InitializeCapabilities {
         incremental_sync,
         hover_provider,
         semantic_tokens_legend,
         signature_help_triggers,
+        completion_triggers,
     })
 }
 
@@ -2061,8 +2072,27 @@ mod tests {
                 hover_provider: true,
                 semantic_tokens_legend: None,
                 signature_help_triggers: Vec::new(),
+                completion_triggers: Vec::new(),
             })
         );
+    }
+
+    #[test]
+    fn initialize_capabilities_keep_completion_trigger_characters() {
+        let response = Response {
+            id: RequestId::from(0),
+            result: Some(serde_json::json!({
+                "capabilities": {
+                    "completionProvider": {"triggerCharacters": [".", ":", "'"]}
+                }
+            })),
+            error: None,
+        };
+
+        let capabilities = parse_initialize_response(response).unwrap();
+
+        // These are what lets `value.` ask for its methods with nothing typed.
+        assert_eq!(capabilities.completion_triggers, vec![".", ":", "'"]);
     }
 
     #[test]
@@ -2095,6 +2125,7 @@ mod tests {
                     token_modifiers: vec!["deprecated".to_owned()],
                 }),
                 signature_help_triggers: Vec::new(),
+                completion_triggers: Vec::new(),
             })
         );
     }

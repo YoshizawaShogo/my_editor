@@ -2421,6 +2421,7 @@ fn click_before_lsp_open_is_deferred_and_sent_when_hover_becomes_available() {
         hover_provider: true,
         semantic_tokens_legend: None,
         signature_help_triggers: Vec::new(),
+        completion_triggers: Vec::new(),
     }));
 
     assert!(effects.iter().any(|effect| matches!(
@@ -4362,6 +4363,7 @@ fn file_opened_after_lsp_initialization_gets_did_open_and_semantic_tokens() {
             token_modifiers: Vec::new(),
         }),
         signature_help_triggers: Vec::new(),
+        completion_triggers: Vec::new(),
     }));
 
     editor.open_paths([PathBuf::from("/tmp/second.rs")]);
@@ -4402,6 +4404,7 @@ fn a_server_without_semantic_tokens_opens_without_requesting_them_and_reaches_re
         hover_provider: true,
         semantic_tokens_legend: None,
         signature_help_triggers: Vec::new(),
+        completion_triggers: Vec::new(),
     }));
 
     // didOpen is still sent, but no semantic-tokens request.
@@ -4612,6 +4615,7 @@ fn external_reload_resyncs_full_text_to_lsp_server() {
         hover_provider: true,
         semantic_tokens_legend: None,
         signature_help_triggers: Vec::new(),
+        completion_triggers: Vec::new(),
     }));
     assert!(editor.doc_is_opened(DocumentId(1)));
     let version_before = editor.doc_version(DocumentId(1)).unwrap();
@@ -4705,6 +4709,7 @@ fn status_reports_language_and_lsp_lifecycle() {
             token_modifiers: Vec::new(),
         }),
         signature_help_triggers: Vec::new(),
+        completion_triggers: Vec::new(),
     }));
     assert_eq!(
         editor.active_buffer().unwrap().language_status,
@@ -5040,6 +5045,90 @@ fn naming_a_declaration_does_not_open_the_completion_popup() {
         "{:?}",
         view.items
     );
+}
+
+/// Ask for completion the way the debounced path does after a keystroke, and
+/// return the request that went out, if any.
+fn refreshed_completion_request(editor: &mut Editor) -> Option<serde_json::Value> {
+    let version = editor.doc_version(DocumentId(0)).unwrap();
+    editor
+        .update(AppEvent::Lsp(LspEvent::CompletionRefreshDue {
+            doc: DocumentId(0),
+            version,
+        }))
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::LspRequest { method, params, .. } if method == "textDocument/completion" => {
+                Some(serde_json::from_str(&params).unwrap())
+            }
+            _ => None,
+        })
+}
+
+#[test]
+fn a_trigger_character_asks_for_completion_with_nothing_typed_after_it() {
+    let mut editor = editor_with_lsp();
+    editor.test_register_server("rust", 1).completion_triggers =
+        vec![".".to_owned(), ":".to_owned()];
+
+    // `.` is where a method list is wanted, and nothing has been typed after it.
+    editor.update(AppEvent::TextPaste("values.".to_owned()));
+    let request = refreshed_completion_request(&mut editor).expect("a completion request");
+    assert_eq!(
+        request["context"],
+        serde_json::json!({"triggerKind": 2, "triggerCharacter": "."})
+    );
+
+    // A blank is not a trigger: with nothing typed, nothing is asked for.
+    editor.update(AppEvent::TextPaste(" ".to_owned()));
+    assert_eq!(refreshed_completion_request(&mut editor), None);
+
+    // A lone `:` annotates a type; only `::` is a path worth listing.
+    editor.update(AppEvent::TextPaste("let total:".to_owned()));
+    assert_eq!(refreshed_completion_request(&mut editor), None);
+    editor.update(AppEvent::TextPaste(" std::".to_owned()));
+    let request = refreshed_completion_request(&mut editor).expect("a completion request");
+    assert_eq!(request["context"]["triggerCharacter"], ":");
+}
+
+#[test]
+fn ctrl_space_says_it_was_invoked_by_hand() {
+    let mut editor = editor_with_lsp();
+    editor.update(AppEvent::TextPaste("value".to_owned()));
+
+    let request = editor
+        .request_completion(true)
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::LspRequest { params, .. } => {
+                Some(serde_json::from_str::<serde_json::Value>(&params).unwrap())
+            }
+            _ => None,
+        })
+        .expect("a completion request");
+
+    assert_eq!(request["context"], serde_json::json!({"triggerKind": 1}));
+}
+
+#[test]
+fn with_nothing_typed_the_servers_own_ranking_orders_the_popup() {
+    let mut editor = editor_with_lsp();
+    editor.test_register_server("rust", 1).completion_triggers = vec![".".to_owned()];
+    editor.update(AppEvent::TextPaste("values.".to_owned()));
+
+    // Every candidate scores the same with nothing typed, so length would put
+    // `as_ref` first; the server ranks the type's own `push` and `len` above it.
+    complete_with(
+        &mut editor,
+        serde_json::json!([
+            {"label": "as_ref", "sortText": "80000003"},
+            {"label": "push", "sortText": "7ffffff0"},
+            {"label": "len", "sortText": "7ffffff1"},
+        ]),
+    );
+
+    let view = editor.completion_view().expect("completion popup");
+    assert_eq!(view.items, vec!["push", "len", "as_ref"]);
 }
 
 #[test]

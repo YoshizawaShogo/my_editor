@@ -46,6 +46,9 @@ pub enum LspEvent {
         /// The characters that should trigger `textDocument/signatureHelp`
         /// (typically `(` and `,`). Empty when the server has no such provider.
         signature_help_triggers: Vec<String>,
+        /// The characters that should trigger `textDocument/completion` with
+        /// nothing typed after them — `.` for a method, `:` for a path.
+        completion_triggers: Vec<String>,
     },
     InitializationFailed {
         server: u64,

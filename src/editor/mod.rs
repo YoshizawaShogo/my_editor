@@ -78,6 +78,10 @@ struct LspServer {
     semantic_legend: Option<crate::lsp::SemanticTokensLegend>,
     /// Characters that trigger signature help; empty when unsupported.
     signature_help_triggers: Vec<String>,
+    /// Characters after which completion is asked for with nothing typed yet:
+    /// `.` lists a value's methods, `::` a path's items. Empty when the server
+    /// names none.
+    completion_triggers: Vec<String>,
     error: Option<String>,
     restart_count: u8,
 }
@@ -92,6 +96,7 @@ impl LspServer {
             incremental_sync: false,
             semantic_legend: None,
             signature_help_triggers: Vec::new(),
+            completion_triggers: Vec::new(),
             error: None,
             restart_count: 0,
         }
@@ -106,6 +111,7 @@ impl LspServer {
         self.incremental_sync = false;
         self.semantic_legend = None;
         self.signature_help_triggers = Vec::new();
+        self.completion_triggers = Vec::new();
         self.error = Some(error);
     }
 }
@@ -1665,6 +1671,7 @@ impl Editor {
                 hover_provider,
                 semantic_tokens_legend,
                 signature_help_triggers,
+                completion_triggers,
             } => {
                 self.finish_progress(&format!("lsp:{server}"));
                 if let Some(entry) = self.server_mut(server) {
@@ -1674,6 +1681,7 @@ impl Editor {
                     entry.incremental_sync = incremental_sync;
                     entry.semantic_legend = semantic_tokens_legend;
                     entry.signature_help_triggers = signature_help_triggers;
+                    entry.completion_triggers = completion_triggers;
                     entry.restart_count = 0;
                     entry.error = (!hover_provider).then(|| "hover is not supported".to_owned());
                 }
@@ -1861,8 +1869,14 @@ impl Editor {
                                     ))
                                 })
                                 .collect();
+                            // The server's own ranking. Read before `label` is
+                            // moved into the candidate; a server that sends none
+                            // ranks by label, as the spec says to.
+                            let sort_text =
+                                item.sort_text.clone().unwrap_or_else(|| item.label.clone());
                             Some((
                                 score,
+                                sort_text,
                                 // How much text the pick would put in the buffer.
                                 // Neither of the other two strings measures the
                                 // name: rust-analyzer's label carries type hints
@@ -1881,14 +1895,21 @@ impl Editor {
                             ))
                         })
                         .collect();
-                        // Equal scores go to the shorter insertion. The fuzzy
-                        // score only measures the part that matched, and
-                        // rust-analyzer gives both the same sortText, so `Vec`
-                        // and `VecDeque` tie on a typed `V` — and no further
-                        // typing can lift `Vec` above a candidate it is a prefix
-                        // of, so the shorter one has to come first while it can.
+                        // Equal scores go to the server's ranking, then to the
+                        // shorter insertion. Right after a `.` nothing is typed,
+                        // so every candidate scores the same and the server's
+                        // relevance — the type's own methods before the blanket
+                        // trait ones — is all there is to go on for which dozen
+                        // the popup shows. Where that ties too (`Vec` and
+                        // `VecDeque` share a sortText on a typed `V`), the
+                        // shorter one comes first: no further typing could lift
+                        // it above a candidate it is a prefix of.
                         items.sort_by(|left, right| {
-                            right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
+                            right
+                                .0
+                                .cmp(&left.0)
+                                .then_with(|| left.1.cmp(&right.1))
+                                .then_with(|| left.2.cmp(&right.2))
                         });
                         // Offer language snippets alongside the server's results,
                         // ranked to the top so `for`, `fn`, … are easy to reach.
@@ -1896,7 +1917,7 @@ impl Editor {
                             .as_deref()
                             .map(|language| snippet_candidates(language, &prefix))
                             .unwrap_or_default();
-                        merged.extend(items.into_iter().map(|(_, _, item)| item));
+                        merged.extend(items.into_iter().map(|(_, _, _, item)| item));
                         let items = merged;
                         if !items.is_empty() {
                             self.completion = Some(CompletionState {
@@ -2183,9 +2204,28 @@ impl Editor {
         let Some((doc, version, prefix, anchor)) = self.completion_context() else {
             return Vec::new();
         };
-        if !manual && prefix.is_empty() {
+        // With nothing typed, ask only right after a character the server names
+        // as a trigger: the `.` of `value.` is where a method list is wanted, and
+        // it is never a word character, so it used to leave the popup shut
+        // until the first letter of the method was already typed.
+        let trigger = (prefix.is_empty() && !manual)
+            .then(|| self.char_before_caret(1))
+            .flatten()
+            .filter(|character| self.is_completion_trigger(*character))
+            // A lone `:` is a type annotation or a field, where rust-analyzer
+            // lists everything in scope only for the space typed next to shut it
+            // again; `::` is a path, where the list is what is wanted.
+            .filter(|character| *character != ':' || self.char_before_caret(2) == Some(':'));
+        if !manual && prefix.is_empty() && trigger.is_none() {
             return Vec::new();
         }
+        let context = match trigger {
+            Some(character) => serde_json::json!({
+                "triggerKind": 2,
+                "triggerCharacter": character.to_string()
+            }),
+            None => serde_json::json!({"triggerKind": 1}),
+        };
         let id = self.next_lsp_request;
         let add_parentheses = self.completion_adds_parentheses(doc, anchor);
         self.next_lsp_request += 1;
@@ -2208,10 +2248,44 @@ impl Editor {
             method: "textDocument/completion".to_owned(),
             params: serde_json::json!({
                 "textDocument": {"uri": format!("file://{}", path.display())},
-                "position": {"line": line, "character": character}
+                "position": {"line": line, "character": character},
+                "context": context
             })
             .to_string(),
         }]
+    }
+
+    /// The character `back` places before the primary caret in the active
+    /// buffer: 1 is the one just typed.
+    fn char_before_caret(&self, back: usize) -> Option<char> {
+        let pane = self.layout.active_editor(self.focus)?;
+        let text = self
+            .documents
+            .get(&pane.view.doc)
+            .and_then(Document::editable_opt)?
+            .text();
+        let head = pane.view.selections.primary().head.0.min(text.len_chars());
+        head.checked_sub(back).map(|before| text.char(before))
+    }
+
+    /// Whether the active buffer's language server asks for completion after
+    /// `character` with nothing typed yet.
+    fn is_completion_trigger(&self, character: char) -> bool {
+        let mut buffer = [0u8; 4];
+        let needle = character.encode_utf8(&mut buffer);
+        self.layout
+            .active_editor(self.focus)
+            .and_then(|pane| self.documents.get(&pane.view.doc))
+            .and_then(|document| document.language.as_deref())
+            .and_then(|language| self.lsp_servers.get(language))
+            .and_then(|id| self.servers.get(id))
+            .filter(|server| server.ready)
+            .is_some_and(|server| {
+                server
+                    .completion_triggers
+                    .iter()
+                    .any(|trigger| trigger == needle)
+            })
     }
 
     /// After typing a word character in a buffer without LSP completion, pop up
