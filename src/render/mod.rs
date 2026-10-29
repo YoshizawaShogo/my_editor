@@ -228,8 +228,11 @@ fn draw_split_divider(frame: &mut Frame<'_>, area: Rect) {
 
 /// The workspace's folders: the root on a heading line, then each entry
 /// indented by depth — a folder with ▸ or ▾ for shut or open, a file under the
-/// same indent. The file the left pane shows is marked, so the tree says where
-/// it sits as well as what is around it.
+/// same indent. Each level of indent carries a faint guide, straight down from
+/// the ▾ of the folder it belongs to and in the rainbow the editor's own indent
+/// guides use, so which folder a row is in can be read off the line it hangs
+/// from instead of by counting spaces. The file the left pane shows is marked,
+/// so the tree says where it sits as well as what is around it.
 fn draw_tree_pane(frame: &mut Frame<'_>, area: Rect, tree: &crate::editor::TreeView<'_>) {
     if area.height == 0 {
         return;
@@ -260,11 +263,22 @@ fn draw_tree_pane(frame: &mut Frame<'_>, area: Rect, tree: &crate::editor::TreeV
                 } else {
                     Style::default().fg(FG).bg(POPUP_BG)
                 };
-                Line::from(vec![
-                    Span::styled("  ".repeat(row.depth), background),
-                    Span::styled(marker, Style::default().fg(MUTED).bg(POPUP_BG)),
-                    Span::styled(row.entry.name.clone(), style),
-                ])
+                let mut spans: Vec<Span<'static>> = (0..row.depth)
+                    .map(|level| {
+                        Span::styled(
+                            "│ ",
+                            Style::default()
+                                .fg(INDENT_GUIDES[level % INDENT_GUIDES.len()])
+                                .bg(POPUP_BG),
+                        )
+                    })
+                    .collect();
+                spans.push(Span::styled(
+                    marker,
+                    Style::default().fg(MUTED).bg(POPUP_BG),
+                ));
+                spans.push(Span::styled(row.entry.name.clone(), style));
+                Line::from(spans)
             }),
     );
     frame.render_widget(Paragraph::new(lines).style(background), area);
@@ -2832,6 +2846,53 @@ mod tests {
         // A full-width space has no glyph to colour, so the block shows instead.
         assert_eq!(buffer[(5, 4)].bg, CONFUSABLE_BG);
         assert_eq!(buffer[(7, 4)].symbol(), "x");
+    }
+
+    #[test]
+    fn the_file_tree_hangs_each_level_from_a_guide() {
+        use crate::editor::{AppEvent, Command, IoEvent, TreeEntry};
+        let root = std::path::PathBuf::from("/ws");
+        let mut editor = Editor::default();
+        editor.set_workspace_root(root.clone());
+        editor.update(AppEvent::Resize { cols: 80, rows: 8 });
+        editor.open_paths([root.join("src/editor/mod.rs")]);
+        editor.update(Command::ToggleTree.into());
+        let entry = |path: &str, is_dir| TreeEntry {
+            name: path.rsplit('/').next().unwrap().to_owned(),
+            path: root.join(path),
+            is_dir,
+        };
+        for (folder, entries) in [
+            ("", vec![entry("src", true)]),
+            ("src", vec![entry("src/editor", true)]),
+            ("src/editor", vec![entry("src/editor/mod.rs", false)]),
+        ] {
+            let path = if folder.is_empty() {
+                root.clone()
+            } else {
+                root.join(folder)
+            };
+            editor.update(AppEvent::Io(IoEvent::DirectoryListed {
+                path,
+                result: Ok(entries),
+            }));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        // The tree pane starts at column 41; row 0 is the root heading, then
+        // `src` (depth 0), `editor` (depth 1), `mod.rs` (depth 2).
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(41, 1)].symbol(), "▾");
+        // Each deeper row hangs from a guide straight under its folder's ▾,
+        // one colour per level as in the editor's indentation.
+        assert_eq!(buffer[(41, 2)].symbol(), "│");
+        assert_eq!(buffer[(41, 2)].fg, INDENT_GUIDES[0]);
+        assert_eq!(buffer[(43, 2)].symbol(), "▾");
+        assert_eq!(buffer[(41, 3)].symbol(), "│");
+        assert_eq!(buffer[(43, 3)].symbol(), "│");
+        assert_eq!(buffer[(43, 3)].fg, INDENT_GUIDES[1]);
     }
 
     #[test]
