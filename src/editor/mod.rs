@@ -1344,6 +1344,11 @@ impl Editor {
             .map(|shell| shell.parser.screen().contents())
     }
 
+    /// Where the shell last said it was (its OSC 7 report), for the status row.
+    pub fn terminal_cwd(&self) -> Option<&std::path::Path> {
+        self.shell.as_ref()?.cwd.as_deref()
+    }
+
     pub fn terminal_screen(&self) -> Option<&vt100::Screen> {
         let shell = self.shell.as_ref()?;
         Some(

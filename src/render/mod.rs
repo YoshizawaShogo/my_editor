@@ -87,19 +87,43 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
     frame.render_widget(Block::default().style(Style::default().bg(BG)), areas[0]);
     if editor.search_pane_visible() {
         let (left, divider, right) = split_panes(areas[0]);
-        draw_file_half(frame, left, areas[1], editor, editor.document_focused());
+        let (left_status, right_status) = split_status_areas(frame, areas[1]);
+        let file_focused = editor.document_focused();
+        draw_file_half(frame, left, left_status, editor, file_focused);
+        draw_segments(
+            frame,
+            right_status,
+            tool_status_segments(editor, !file_focused),
+            !file_focused,
+        );
         draw_split_divider(frame, divider);
         if let Some(search) = editor.search_view() {
             draw_search_pane(frame, right, &search);
         }
     } else if let Some(tree) = editor.tree_view() {
         let (left, divider, right) = split_panes(areas[0]);
-        draw_file_half(frame, left, areas[1], editor, true);
+        let (left_status, right_status) = split_status_areas(frame, areas[1]);
+        draw_file_half(frame, left, left_status, editor, true);
+        // The tree is read with the mouse and never holds focus.
+        draw_segments(
+            frame,
+            right_status,
+            tool_status_segments(editor, false),
+            false,
+        );
         draw_split_divider(frame, divider);
         draw_tree_pane(frame, right, &tree);
     } else if editor.shell_visible() {
         let (left, divider, right) = split_panes(areas[0]);
-        draw_file_half(frame, left, areas[1], editor, !editor.shell_focused());
+        let (left_status, right_status) = split_status_areas(frame, areas[1]);
+        let shell_focused = editor.shell_focused();
+        draw_file_half(frame, left, left_status, editor, !shell_focused);
+        draw_segments(
+            frame,
+            right_status,
+            tool_status_segments(editor, shell_focused),
+            shell_focused,
+        );
         if let Some(screen) = editor.terminal_screen() {
             draw_terminal(
                 frame,
@@ -128,16 +152,7 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
             },
         );
         draw_split_divider(frame, divider);
-        draw_status(
-            frame,
-            areas[1],
-            editor,
-            if editor.focused_side() == crate::editor::Side::Right {
-                &right
-            } else {
-                &left
-            },
-        );
+        draw_split_status(frame, areas[1], editor, &left, &right);
     } else if let Some((left, right, false)) = editor.split_buffers() {
         let (left_area, divider, right_area) = split_panes(areas[0]);
         let focused = editor.focused_side();
@@ -154,16 +169,7 @@ pub fn draw(frame: &mut Frame<'_>, editor: &Editor) {
             focused == crate::editor::Side::Right,
         );
         draw_split_divider(frame, divider);
-        draw_status(
-            frame,
-            areas[1],
-            editor,
-            if focused == crate::editor::Side::Right {
-                &right
-            } else {
-                &left
-            },
-        );
+        draw_split_status(frame, areas[1], editor, &left, &right);
     } else if let Some(buffer) = editor.active_buffer() {
         draw_buffer(frame, areas[0], &buffer, true);
         draw_status(frame, areas[1], editor, &buffer);
@@ -1155,7 +1161,12 @@ fn draw_start_page(frame: &mut Frame<'_>, area: Rect) {
 fn draw_file_half(frame: &mut Frame<'_>, area: Rect, status: Rect, editor: &Editor, focused: bool) {
     if let Some(buffer) = editor.active_buffer() {
         draw_buffer(frame, area, &buffer, focused);
-        draw_status(frame, status, editor, &buffer);
+        draw_segments(
+            frame,
+            status,
+            file_status_segments(editor, &buffer, focused),
+            focused,
+        );
     } else if let Some(buffer) = editor.active_large_buffer() {
         draw_large_buffer(frame, area, &buffer);
         draw_large_status(frame, status, editor, &buffer);
@@ -2326,7 +2337,196 @@ fn highlight_color(kind: Option<&str>) -> Color {
     }
 }
 
-fn draw_status(frame: &mut Frame<'_>, area: Rect, editor: &Editor, buffer: &ActiveBuffer<'_>) {
+/// One block of a status bar, and what it gives up when the bar is narrower
+/// than everything it would like to say.
+struct StatusSegment {
+    text: String,
+    background: Color,
+    fit: Fit,
+}
+
+#[derive(Clone, PartialEq)]
+enum Fit {
+    /// The pane's subject — a file's path, a folder. Always shown, shortened
+    /// from the left when it must be (see [`ellipsize_path`]); `marker` (the
+    /// modified and changed-on-disk dots) stays in front of it untouched.
+    Name { marker: String },
+    /// Kept to the last: the diagnostic counts, a tool's own name.
+    Keep,
+    /// Given up first when room runs short, lowest rank first.
+    Drop(u8),
+    /// The transient message: cut short at the end to whatever room is left.
+    Message,
+}
+
+impl StatusSegment {
+    fn new(text: impl Into<String>, background: Color, fit: Fit) -> Self {
+        Self {
+            text: text.into(),
+            background,
+            fit,
+        }
+    }
+
+    fn shown(&self) -> String {
+        match &self.fit {
+            Fit::Name { marker } => format!("{marker}{}", self.text),
+            _ => self.text.clone(),
+        }
+    }
+
+    /// Columns on screen, padding included.
+    fn width(&self) -> usize {
+        unicode_width::UnicodeWidthStr::width(self.shown().as_str()) + 2
+    }
+}
+
+/// Fit `segments` into `width` columns: drop what may be dropped, cut the
+/// message short, and only then shorten the name — what the pane is showing
+/// is the last thing to lose.
+fn fit_status(mut segments: Vec<StatusSegment>, width: usize) -> Vec<StatusSegment> {
+    let total =
+        |segments: &[StatusSegment]| segments.iter().map(StatusSegment::width).sum::<usize>();
+    while total(&segments) > width {
+        let Some(index) = segments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, segment)| match segment.fit {
+                Fit::Drop(rank) => Some((rank, index)),
+                _ => None,
+            })
+            .min()
+            .map(|(_, index)| index)
+        else {
+            break;
+        };
+        segments.remove(index);
+    }
+    if total(&segments) > width
+        && let Some(index) = segments
+            .iter()
+            .position(|segment| segment.fit == Fit::Message)
+    {
+        let others = total(&segments) - segments[index].width();
+        let room = width.saturating_sub(others + 2);
+        // A message cut to a word or two says nothing; let the name have it.
+        if room < 8 {
+            segments.remove(index);
+        } else {
+            segments[index].text = truncate_end(&segments[index].text, room);
+        }
+    }
+    if total(&segments) > width
+        && let Some(index) = segments
+            .iter()
+            .position(|segment| matches!(segment.fit, Fit::Name { .. }))
+    {
+        let others = total(&segments) - segments[index].width();
+        let marker = match &segments[index].fit {
+            Fit::Name { marker } => unicode_width::UnicodeWidthStr::width(marker.as_str()),
+            _ => 0,
+        };
+        let room = width.saturating_sub(others + 2 + marker).max(1);
+        segments[index].text = ellipsize_path(&segments[index].text, room);
+    }
+    segments
+}
+
+/// `path` shortened to `room` columns from the left, as `…/folder/file.rs`:
+/// the end of a path is what tells two files apart, so the file name and as
+/// many folders right above it as fit are kept. Past that, the end of the name
+/// itself, as `…le.rs`.
+fn ellipsize_path(path: &str, room: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if path.width() <= room {
+        return path.to_owned();
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    for keep in (1..parts.len()).rev() {
+        let candidate = format!("…/{}", parts[parts.len() - keep..].join("/"));
+        if candidate.width() <= room {
+            return candidate;
+        }
+    }
+    let name = parts.last().copied().unwrap_or(path);
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 1;
+    for character in name.chars().rev() {
+        let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + width > room {
+            break;
+        }
+        used += width;
+        tail.push(character);
+    }
+    tail.reverse();
+    format!("…{}", tail.into_iter().collect::<String>())
+}
+
+/// `text` cut to `room` columns, ending in `…` when anything was cut.
+fn truncate_end(text: &str, room: usize) -> String {
+    if unicode_width::UnicodeWidthStr::width(text) <= room {
+        return text.to_owned();
+    }
+    let mut kept = String::new();
+    let mut used = 1;
+    for character in text.chars() {
+        let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + width > room {
+            break;
+        }
+        used += width;
+        kept.push(character);
+    }
+    kept.push('…');
+    kept
+}
+
+/// The pane the other half of a split status row belongs to is drawn in one
+/// dim shade, so the focused one is the bar that reads as the bar.
+const STATUS_UNFOCUSED_BG: Color = Color::Rgb(0x23, 0x27, 0x37);
+
+/// Draw one status bar — a whole row, or one pane's half of it.
+fn draw_segments(frame: &mut Frame<'_>, area: Rect, segments: Vec<StatusSegment>, focused: bool) {
+    frame.render_widget(
+        Paragraph::new(status_line(segments, usize::from(area.width), focused))
+            .style(Style::default().bg(STATUS_BG)),
+        area,
+    );
+}
+
+/// The segments, fitted to `width`, as distinct colour blocks. The change of
+/// background between blocks is the only divider — there is no separator
+/// glyph — so the bar renders the same on any terminal and needs no
+/// Powerline/Nerd font (the old U+E0B0 separator lives in the Private Use Area
+/// and shows as tofu without one).
+fn status_line(segments: Vec<StatusSegment>, width: usize, focused: bool) -> Line<'static> {
+    Line::from(
+        fit_status(segments, width)
+            .into_iter()
+            .map(|segment| {
+                let (foreground, background) = if focused {
+                    (Color::White, segment.background)
+                } else {
+                    (MUTED, STATUS_UNFOCUSED_BG)
+                };
+                Span::styled(
+                    format!(" {} ", segment.shown()),
+                    Style::default().fg(foreground).bg(background),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// What a file pane's bar says. The focused one says everything; the other
+/// names its file and its diagnostic count, which is what tells the two apart
+/// and what is worth noticing from across the split.
+fn file_status_segments(
+    editor: &Editor,
+    buffer: &ActiveBuffer<'_>,
+    focused: bool,
+) -> Vec<StatusSegment> {
     let marker = if buffer.modified { "● " } else { "" };
     let external = if buffer.external_changed { "⚠ " } else { "" };
     let errors = buffer
@@ -2339,15 +2539,28 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, editor: &Editor, buffer: &Acti
         .iter()
         .filter(|diagnostic| diagnostic.severity == crate::lsp::DiagnosticSeverity::Warning)
         .count();
-    let mut segments = vec![(
-        format!("{external}{marker}{}", buffer.name),
+    let mut segments = vec![StatusSegment::new(
+        buffer.name.clone(),
         Color::Rgb(0x35, 0x4f, 0x7a),
+        Fit::Name {
+            marker: format!("{external}{marker}"),
+        },
     )];
-    segments.push((buffer.language_status.clone(), Color::Rgb(0x35, 0x65, 0x70)));
-    if let Some(git) = git_status_label(buffer.git_branch, buffer.git_status) {
-        segments.push((git, Color::Rgb(0x3f, 0x64, 0x53)));
+    if focused {
+        segments.push(StatusSegment::new(
+            buffer.language_status.clone(),
+            Color::Rgb(0x35, 0x65, 0x70),
+            Fit::Drop(0),
+        ));
+        if let Some(git) = git_status_label(buffer.git_branch, buffer.git_status) {
+            segments.push(StatusSegment::new(
+                git,
+                Color::Rgb(0x3f, 0x64, 0x53),
+                Fit::Drop(1),
+            ));
+        }
     }
-    segments.push((
+    segments.push(StatusSegment::new(
         format!("E:{errors} W:{warnings}"),
         if errors > 0 {
             Color::Rgb(0x8f, 0x3f, 0x4d)
@@ -2356,14 +2569,117 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, editor: &Editor, buffer: &Acti
         } else {
             Color::Rgb(0x3b, 0x4a, 0x62)
         },
+        Fit::Keep,
     ));
-    if let Some(status) = editor.status() {
-        segments.push((status.to_owned(), Color::Rgb(0x4b, 0x4f, 0x61)));
+    if focused {
+        segments.extend(message_segment(editor));
     }
-    frame.render_widget(
-        Paragraph::new(segmented_line(segments)).style(Style::default().bg(STATUS_BG)),
+    segments
+}
+
+/// The transient message, on whichever bar is the focused one.
+fn message_segment(editor: &Editor) -> Option<StatusSegment> {
+    editor
+        .status()
+        .map(|status| StatusSegment::new(status, Color::Rgb(0x4b, 0x4f, 0x61), Fit::Message))
+}
+
+/// A whole-row bar for a lone file pane.
+fn draw_status(frame: &mut Frame<'_>, area: Rect, editor: &Editor, buffer: &ActiveBuffer<'_>) {
+    draw_segments(
+        frame,
         area,
+        file_status_segments(editor, buffer, true),
+        true,
     );
+}
+
+/// The status row under a split: each pane's bar sits under that pane, so the
+/// file that is not focused is named somewhere too, and the focused one's bar
+/// is under the pane it describes rather than always on the left.
+fn split_status_areas(frame: &mut Frame<'_>, area: Rect) -> (Rect, Rect) {
+    frame.render_widget(Block::default().style(Style::default().bg(STATUS_BG)), area);
+    let (left, _, right) = split_panes(area);
+    (left, right)
+}
+
+/// Two file panes side by side: each one's bar under it, the focused one in
+/// full and the other dimmed.
+fn draw_split_status(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    editor: &Editor,
+    left: &ActiveBuffer<'_>,
+    right: &ActiveBuffer<'_>,
+) {
+    let right_focused = editor.focused_side() == crate::editor::Side::Right;
+    let (left_area, right_area) = split_status_areas(frame, area);
+    draw_segments(
+        frame,
+        left_area,
+        file_status_segments(editor, left, !right_focused),
+        !right_focused,
+    );
+    draw_segments(
+        frame,
+        right_area,
+        file_status_segments(editor, right, right_focused),
+        right_focused,
+    );
+}
+
+/// What a tool in the right pane is, in a word or two.
+fn tool_status_segments(editor: &Editor, focused: bool) -> Vec<StatusSegment> {
+    let label = |text: &str| StatusSegment::new(text, Color::Rgb(0x35, 0x4f, 0x7a), Fit::Keep);
+    let detail = |text: String| {
+        StatusSegment::new(
+            text,
+            Color::Rgb(0x3b, 0x4a, 0x62),
+            Fit::Name {
+                marker: String::new(),
+            },
+        )
+    };
+    let mut segments = if let Some(search) = editor.search_view() {
+        let scope = match search.scope {
+            crate::editor::SearchScope::CurrentBuffer => "file",
+            crate::editor::SearchScope::AllBuffers => "buffers",
+            crate::editor::SearchScope::Directory => "dir",
+        };
+        vec![
+            label("find"),
+            StatusSegment::new(
+                format!("{scope} · {} hits", search.total),
+                Color::Rgb(0x3b, 0x4a, 0x62),
+                Fit::Keep,
+            ),
+        ]
+    } else if let Some(tree) = editor.tree_view() {
+        vec![label("tree"), detail(home_relative(&tree.root))]
+    } else if editor.shell_visible() {
+        let mut segments = vec![label("terminal")];
+        if let Some(cwd) = editor.terminal_cwd() {
+            segments.push(detail(home_relative(&cwd.display().to_string())));
+        }
+        segments
+    } else {
+        Vec::new()
+    };
+    if focused {
+        segments.extend(message_segment(editor));
+    }
+    segments
+}
+
+/// `path` with the home directory written as `~`, the way a shell prompt says
+/// it — shorter, and the part that would be cut first anyway.
+fn home_relative(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
+            format!("~{}", &path[home.len()..])
+        }
+        _ => path.to_owned(),
+    }
 }
 
 /// The reader's own status line. It cannot reuse [`draw_status`], which reports
@@ -2380,20 +2696,23 @@ fn draw_large_status(
     // nothing analyses a file this big — give their slot to the size, which is
     // the reason it opened read only.
     let mut segments = vec![
-        (buffer.name.clone(), Color::Rgb(0x35, 0x4f, 0x7a)),
-        (LARGE_FILE_STATUS.to_owned(), Color::Rgb(0x35, 0x65, 0x70)),
-        (
+        StatusSegment::new(
+            buffer.name.clone(),
+            Color::Rgb(0x35, 0x4f, 0x7a),
+            Fit::Name {
+                marker: String::new(),
+            },
+        ),
+        // Kept: it is what the pane is and why nothing in it can be edited.
+        StatusSegment::new(LARGE_FILE_STATUS, Color::Rgb(0x35, 0x65, 0x70), Fit::Keep),
+        StatusSegment::new(
             human_bytes(buffer.file.len_bytes()),
             Color::Rgb(0x3b, 0x4a, 0x62),
+            Fit::Keep,
         ),
     ];
-    if let Some(status) = editor.status() {
-        segments.push((status.to_owned(), Color::Rgb(0x4b, 0x4f, 0x61)));
-    }
-    frame.render_widget(
-        Paragraph::new(segmented_line(segments)).style(Style::default().bg(STATUS_BG)),
-        area,
-    );
+    segments.extend(message_segment(editor));
+    draw_segments(frame, area, segments, true);
 }
 
 /// Sizes in the unit a reader would say out loud: 12.0MB, not 12582958 bytes.
@@ -2418,24 +2737,6 @@ fn git_status_label(branch: Option<&str>, status: Option<&str>) -> Option<String
         || format!("<git> clean @{branch}"),
         |status| format!("<git> {status} @{branch}"),
     ))
-}
-
-/// Render the status segments as distinct colored blocks. The change in
-/// background color between segments is the only divider — there is no
-/// separator glyph — so the bar renders identically on any terminal/font and
-/// needs no Powerline/Nerd font (the old U+E0B0 separator lives in the Unicode
-/// Private Use Area and shows as tofu without such a font).
-fn segmented_line(segments: Vec<(String, Color)>) -> Line<'static> {
-    let spans = segments
-        .into_iter()
-        .map(|(text, background)| {
-            Span::styled(
-                format!(" {text} "),
-                Style::default().fg(Color::White).bg(background),
-            )
-        })
-        .collect::<Vec<_>>();
-    Line::from(spans)
 }
 
 fn draw_status_text(frame: &mut Frame<'_>, area: Rect, status: &str) {
@@ -2724,13 +3025,135 @@ mod tests {
     }
 
     #[test]
+    fn a_long_path_keeps_its_end_when_shortened() {
+        let path = "src/editor/very/deep/folder/mod.rs";
+        // Room for all of it: untouched.
+        assert_eq!(ellipsize_path(path, 80), path);
+        // Short of that: the file and as many folders above it as fit.
+        assert_eq!(ellipsize_path(path, 18), "…/folder/mod.rs");
+        assert_eq!(ellipsize_path(path, 10), "…/mod.rs");
+        // Not even `…/name`: the end of the name itself.
+        assert_eq!(ellipsize_path(path, 5), "…d.rs");
+    }
+
+    /// Each column of `row` as text, so a half of the status row can be read.
+    fn row_text(
+        terminal: &Terminal<TestBackend>,
+        row: u16,
+        columns: std::ops::Range<u16>,
+    ) -> String {
+        let buffer = terminal.backend().buffer();
+        columns
+            .map(|column| buffer[(column, row)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn a_split_names_both_files_each_under_its_own_pane() {
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 100, rows: 6 });
+        editor.open_paths([
+            std::path::PathBuf::from("left.rs"),
+            std::path::PathBuf::from("right.rs"),
+        ]);
+        for id in [1, 2] {
+            editor.update(crate::editor::AppEvent::Io(
+                crate::editor::IoEvent::FileLoaded {
+                    id: crate::document::DocumentId(id),
+                    result: Ok(String::new()),
+                },
+            ));
+        }
+        // right.rs is active; the split brings left.rs up on the right and the
+        // focus with it, leaving right.rs on the left, unfocused.
+        editor.update(crate::editor::Command::ToggleSplit.into());
+        let mut terminal = Terminal::new(TestBackend::new(100, 6)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        // The status row is split at the panes' divider (column 50).
+        let left = row_text(&terminal, 5, 0..50);
+        let right = row_text(&terminal, 5, 51..100);
+        assert!(left.contains("right.rs"), "{left}");
+        assert!(right.contains("left.rs"), "{right}");
+        // The focused side says everything; the other only its name and count,
+        // dimmed.
+        assert!(right.contains("<lsp> rust"), "{right}");
+        assert!(!left.contains("<lsp>"), "{left}");
+        assert!(left.contains("E:0"), "{left}");
+        assert_eq!(terminal.backend().buffer()[(1, 5)].fg, MUTED);
+    }
+
+    #[test]
+    fn a_narrow_bar_gives_up_details_before_the_files_name() {
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 30, rows: 4 });
+        editor.open_paths([std::path::PathBuf::from(
+            "src/editor/very/deep/folder/mod.rs",
+        )]);
+        editor.update(crate::editor::AppEvent::Io(
+            crate::editor::IoEvent::FileLoaded {
+                id: crate::document::DocumentId(1),
+                result: Ok(String::new()),
+            },
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(30, 4)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        let bar = row_text(&terminal, 3, 0..30);
+        // The language went first; the counts stay; the path keeps its end.
+        assert!(!bar.contains("<syntax>"), "{bar}");
+        assert!(bar.contains("E:0 W:0"), "{bar}");
+        assert!(bar.contains("…/") && bar.contains("mod.rs"), "{bar}");
+    }
+
+    #[test]
+    fn a_tool_in_the_right_pane_says_what_it_is() {
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 100, rows: 6 });
+        let token = match editor
+            .update(crate::editor::Command::ToggleShell.into())
+            .as_slice()
+        {
+            [crate::editor::Effect::SpawnShell { token, .. }] => *token,
+            other => panic!("expected a shell spawn, got {other:?}"),
+        };
+        // Where the shell is comes from its own report, as it does live.
+        editor.update(crate::editor::AppEvent::Terminal(
+            crate::editor::TerminalEvent::Output {
+                token,
+                bytes: b"\x1b]7;file://host/srv/project\x07".to_vec(),
+            },
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 6)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        let right = row_text(&terminal, 5, 51..100);
+        assert!(right.contains("terminal"), "{right}");
+        assert!(right.contains("/srv/project"), "{right}");
+
+        // The find pane: what it searches and how many hits.
+        editor.update(crate::editor::Command::OpenSearch.into());
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+        let right = row_text(&terminal, 5, 51..100);
+        assert!(right.contains("find"), "{right}");
+        assert!(right.contains("file · 0 hits"), "{right}");
+    }
+
+    #[test]
     fn statusline_segments_are_distinct_color_blocks_without_a_separator_glyph() {
         let first = Color::Rgb(1, 2, 3);
         let second = Color::Rgb(4, 5, 6);
-        let line = segmented_line(vec![
-            ("file.rs".to_owned(), first),
-            ("<git> M @main".to_owned(), second),
-        ]);
+        let line = status_line(
+            vec![
+                StatusSegment::new("file.rs", first, Fit::Keep),
+                StatusSegment::new("<git> M @main", second, Fit::Keep),
+            ],
+            80,
+            true,
+        );
 
         // One span per segment and no separator span: the background color
         // change is the only divider, so the bar needs no Powerline/Nerd font.
