@@ -662,7 +662,7 @@ fn draw_goto_line(frame: &mut Frame<'_>, value: &str) {
     };
     let inner = draw_popup_frame(frame, area);
     frame.render_widget(
-        Paragraph::new(format!("Go to line  {value}")).style(Style::default().fg(FG).bg(POPUP_BG)),
+        Paragraph::new(format!("Go to line: {value}")).style(Style::default().fg(FG).bg(POPUP_BG)),
         inner,
     );
 }
