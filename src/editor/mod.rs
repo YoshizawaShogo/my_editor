@@ -1200,7 +1200,11 @@ impl Editor {
             .collect();
         Some(PickerView {
             title: match picker.mode {
-                PickerMode::Directory => "Open file · / ~ ../ completes paths",
+                PickerMode::Directory => match picker.pair {
+                    Some(Side::Left) => "Open file · 1/2 → left pane · / ~ ../ completes paths",
+                    Some(Side::Right) => "Open file · 2/2 → right pane · / ~ ../ completes paths",
+                    None => "Open file · / ~ ../ completes paths",
+                },
                 PickerMode::Buffer => match picker.pair {
                     Some(Side::Left) => "Open buffer · 1/2 → left pane",
                     Some(Side::Right) => "Open buffer · 2/2 → right pane",
@@ -4900,11 +4904,19 @@ impl Editor {
     }
 
     fn open_directory_picker(&mut self) -> Vec<Effect> {
-        if self
+        if let Some(picker) = self
             .picker
-            .as_ref()
-            .is_some_and(|picker| picker.mode == PickerMode::Directory)
+            .as_mut()
+            .filter(|picker| picker.mode == PickerMode::Directory)
         {
+            // As with Ctrl+G: a second press makes it a pair of picks, left
+            // then right, and a third puts it away.
+            if picker.pair.is_none() {
+                picker.pair = Some(Side::Left);
+                picker.return_side = Side::Left;
+                self.dirty = true;
+                return Vec::new();
+            }
             self.close_picker();
             return Vec::new();
         }
@@ -6193,6 +6205,12 @@ impl Editor {
             return Vec::new();
         };
         let Some(candidate_index) = picker.filtered.get(picker.selected) else {
+            // A path that matches nothing is created where the caret is, which
+            // in a pair is not the pane being picked for: leave the list up.
+            if picker.pair.is_some() {
+                self.picker = Some(picker);
+                return Vec::new();
+            }
             if picker.mode == PickerMode::Directory && !picker.query.is_empty() {
                 self.focus = Focus::Editor(picker.return_side);
                 return vec![Effect::ResolveDirectPath {
@@ -6207,6 +6225,44 @@ impl Editor {
         let mut effects = Vec::new();
         let mut final_side = picker.return_side;
         match (picker.mode, candidate) {
+            (PickerMode::Directory, PickerCandidate::Path(path)) if picker.pair.is_some() => {
+                if picker.pair == Some(Side::Left) {
+                    // `open_paths` folds a diff back to one pane itself.
+                    self.focus = Focus::Editor(Side::Left);
+                    effects.extend(self.open_paths([path.clone()]));
+                    // Straight on to the right pane's pick, from the same scan:
+                    // no second walk of the workspace, and without the file
+                    // just put on the left.
+                    let mut right = picker;
+                    if let Some(start) = right.path_listing_start.take() {
+                        right.candidates.truncate(start);
+                    }
+                    right.candidates.retain(|candidate| {
+                        !matches!(candidate, PickerCandidate::Path(listed) if *listed == path)
+                    });
+                    right.filtered = (0..right.candidates.len()).collect();
+                    right.query.clear();
+                    right.selected = 0;
+                    right.ranking_cache.clear();
+                    right.pair = Some(Side::Right);
+                    right.return_side = Side::Left;
+                    self.picker = Some(right);
+                    self.focus = Focus::Overlay;
+                    self.dirty = true;
+                    return effects;
+                }
+                let (id, load) = self.document_for_path(path);
+                effects.extend(load);
+                let view = self.view_for(id);
+                if self.layout.is_editor_split() {
+                    if let Some(pane) = self.layout.active_editor_mut(Focus::Editor(Side::Right)) {
+                        pane.view = view;
+                    }
+                } else {
+                    self.set_right_pane(Some(RightPane::Editor(EditorPane { view })));
+                }
+                final_side = Side::Left;
+            }
             (PickerMode::Directory, PickerCandidate::Path(path)) => {
                 self.focus = Focus::Editor(picker.return_side);
                 effects.extend(self.open_paths([path]));

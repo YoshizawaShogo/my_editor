@@ -3677,7 +3677,7 @@ fn directory_picker_replaces_the_find_pane_and_receives_keyboard_input() {
 }
 
 #[test]
-fn ctrl_t_toggles_its_picker_closed_and_ctrl_g_after_a_pair() {
+fn ctrl_t_and_ctrl_g_close_on_the_third_press_after_a_pair() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 24 });
 
@@ -3688,15 +3688,18 @@ fn ctrl_t_toggles_its_picker_closed_and_ctrl_g_after_a_pair() {
         [Effect::StartFileScan { .. }]
     ));
     assert!(editor.picker_view().is_some());
+    // The second press turns the list into a pair of picks — without walking
+    // the workspace again — and the third puts it away.
     assert!(
         editor
             .update(Command::OpenDirectoryPicker.into())
             .is_empty()
     );
+    assert!(editor.picker_view().is_some());
+    editor.update(Command::OpenDirectoryPicker.into());
     assert!(editor.picker_view().is_none());
 
-    // Ctrl+G's second press turns the list into a pair of picks; the third
-    // puts it away.
+    // Ctrl+G the same.
     editor.open_paths([PathBuf::from("one.txt"), PathBuf::from("two.txt")]);
     editor.update(Command::OpenBufferPicker.into());
     assert!(editor.picker_view().is_some());
@@ -3764,6 +3767,67 @@ fn ctrl_g_twice_picks_a_file_for_each_pane_in_turn() {
 }
 
 #[test]
+fn ctrl_t_twice_opens_a_file_in_each_pane_in_turn() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+    let token = editor
+        .update(Command::OpenDirectoryPicker.into())
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::StartFileScan { token, .. } => Some(token),
+            _ => None,
+        })
+        .unwrap();
+    editor.update(AppEvent::FileScan(FileScanEvent::Batch {
+        token,
+        paths: vec![PathBuf::from("first.rs"), PathBuf::from("second.rs")],
+    }));
+    let choose = |editor: &mut Editor, name: &str| {
+        for character in name.chars() {
+            editor.update(AppEvent::TextInput(character));
+        }
+        editor.update(Command::PickerConfirm.into())
+    };
+
+    editor.update(Command::OpenDirectoryPicker.into());
+    assert!(
+        editor
+            .picker_view()
+            .unwrap()
+            .title
+            .starts_with("Open file · 1/2 → left pane")
+    );
+
+    // The first lands on the left, and the same list — no second scan, and
+    // without the file just opened — comes back for the right.
+    let effects = choose(&mut editor, "first.rs");
+    assert!(
+        matches!(effects.as_slice(), [Effect::ReadFile { path, .. }] if path.ends_with("first.rs")),
+        "{effects:?}"
+    );
+    let picker = editor.picker_view().expect("the second pick");
+    assert!(picker.title.starts_with("Open file · 2/2 → right pane"));
+    assert_eq!(picker.total, 1);
+
+    let effects = choose(&mut editor, "second.rs");
+    assert!(
+        matches!(effects.as_slice(), [Effect::ReadFile { path, .. }] if path.ends_with("second.rs")),
+        "{effects:?}"
+    );
+    assert!(editor.picker_view().is_none());
+    for (id, text) in [(1, "first"), (2, "second")] {
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(id),
+            result: Ok(text.to_owned()),
+        }));
+    }
+    let (left, right, _) = editor.split_buffers().expect("a split");
+    assert_eq!(left.text.to_string(), "first");
+    assert_eq!(right.text.to_string(), "second");
+    assert_eq!(editor.focus(), Focus::Editor(Side::Left));
+}
+
+#[test]
 fn backing_out_of_the_second_pick_keeps_the_first() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 24 });
@@ -3820,7 +3884,7 @@ fn stale_file_scan_batches_do_not_enter_a_reopened_picker() {
             _ => None,
         })
         .unwrap();
-    editor.update(Command::OpenDirectoryPicker.into());
+    editor.update(Command::PickerCancel.into());
     let second = editor
         .update(Command::OpenDirectoryPicker.into())
         .into_iter()
