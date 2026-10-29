@@ -5219,6 +5219,32 @@ fn with_nothing_typed_the_servers_own_ranking_orders_the_popup() {
 }
 
 #[test]
+fn a_tuples_fields_lead_the_list_after_its_dot() {
+    let mut editor = editor_with_lsp();
+    editor.test_register_server("rust", 1).completion_triggers = vec![".".to_owned()];
+    editor.update(AppEvent::TextPaste("pair.".to_owned()));
+
+    // Captured from rust-analyzer for `pair.` on a `(usize, String)`: the
+    // fields are `0` and `1`, ranked level with the postfix snippets and
+    // ahead of them only by being shorter.
+    complete_with(
+        &mut editor,
+        serde_json::json!([
+            {"label": "ref", "kind": 15, "sortText": "7fffffff", "insertText": "&pair"},
+            {"label": "0", "kind": 5, "filterText": "0", "sortText": "7fffffff",
+             "textEdit": {"range": {"start": {"line": 0, "character": 5},
+                                    "end": {"line": 0, "character": 5}}, "newText": "0"}},
+            {"label": "1", "kind": 5, "filterText": "1", "sortText": "7fffffff",
+             "textEdit": {"range": {"start": {"line": 0, "character": 5},
+                                    "end": {"line": 0, "character": 5}}, "newText": "1"}},
+        ]),
+    );
+
+    let view = editor.completion_view().expect("completion popup");
+    assert_eq!(view.items[..2], ["0".to_owned(), "1".to_owned()]);
+}
+
+#[test]
 fn the_arrows_stop_at_the_last_completion_the_popup_shows() {
     let mut editor = editor_with_lsp();
     editor.update(AppEvent::TextPaste("item".to_owned()));
