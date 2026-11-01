@@ -132,6 +132,34 @@ impl Config {
         })
     }
 
+    /// The language a script's `#!` line names. A script runs under that
+    /// interpreter whatever it is called, so this wins over the file's name —
+    /// a tcsh script called `setup` or even `setup.sh` is still tcsh. Only
+    /// interpreters with a language here count; anything else leaves the
+    /// decision to the name.
+    pub fn language_for_shebang(&self, first_line: &str) -> Option<&LanguageConfig> {
+        let mut words = first_line.strip_prefix("#!")?.split_whitespace();
+        let mut program = words.next()?;
+        // `#!/usr/bin/env tcsh` (or `env -S tcsh -f`): the program is the one
+        // env goes on to run.
+        if program.rsplit('/').next() == Some("env") {
+            program = words.find(|word| !word.starts_with('-'))?;
+        }
+        let name = program.rsplit('/').next()?;
+        // Versioned names count as the plain one: `python3.12`, `tclsh8.6`.
+        let language = match name
+            .trim_end_matches(|character: char| character.is_ascii_digit() || character == '.')
+        {
+            "tcsh" | "csh" => "csh",
+            "bash" | "sh" | "dash" | "ksh" => "bash",
+            "python" => "python",
+            "tclsh" | "wish" => "tcl",
+            "make" | "gmake" => "make",
+            _ => return None,
+        };
+        self.language.iter().find(|config| config.name == language)
+    }
+
     pub fn indentation_for_language(&self, language: Option<&str>) -> (usize, bool) {
         let language =
             language.and_then(|name| self.language.iter().find(|language| language.name == name));
@@ -242,6 +270,29 @@ fn parse_size(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shebang_names_the_language_whatever_the_file_is_called() {
+        let config = Config::default();
+        let language = |line: &str| {
+            config
+                .language_for_shebang(line)
+                .map(|language| language.name.as_str())
+        };
+
+        assert_eq!(language("#!/bin/tcsh"), Some("csh"));
+        assert_eq!(language("#!/bin/csh -f"), Some("csh"));
+        assert_eq!(language("#!/usr/bin/env tcsh"), Some("csh"));
+        assert_eq!(language("#!/usr/bin/env -S tcsh -f"), Some("csh"));
+        assert_eq!(language("#! /bin/sh"), Some("bash"));
+        assert_eq!(language("#!/usr/bin/env python3"), Some("python"));
+        assert_eq!(language("#!/usr/bin/tclsh8.6"), Some("tcl"));
+        assert_eq!(language("#!/usr/bin/make -f"), Some("make"));
+        // An interpreter with no language here, or no shebang at all, leaves the
+        // decision to the file's name.
+        assert_eq!(language("#!/usr/bin/perl"), None);
+        assert_eq!(language("set x = 1"), None);
+    }
 
     #[test]
     fn parses_config_and_size() {

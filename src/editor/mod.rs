@@ -1484,6 +1484,16 @@ impl Editor {
                     if let Some(document) = self.documents.get_mut(&id) {
                         document.load_text(&contents);
                         document.external_changed = false;
+                        // A script says on its first line what runs it, which
+                        // outranks its name: `setup` or `run.sh` written for
+                        // tcsh is coloured as csh.
+                        if let Some(language) = contents
+                            .lines()
+                            .next()
+                            .and_then(|line| self.config.language_for_shebang(line))
+                        {
+                            document.language = Some(language.name.clone());
+                        }
                         if let Some(language) = document.language.clone() {
                             document.editable_mut().enable_highlight(&language);
                         }

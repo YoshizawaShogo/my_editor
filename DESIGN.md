@@ -835,6 +835,8 @@ struct EdgeSummary { errors: usize, warnings: usize, git_changes: usize, search_
 
 言語判定ルールと、言語ごとの LSP コマンド名はユーザ設定可能。tree-sitter の適用対象もこの言語判定に従う（判定された言語名に対応する文法がバンドルされていれば適用）。
 
+**シバン**: ファイル内容を読み込んだ時点で1行目が `#!` なら、そのインタプリタで言語を決め直す（`Config::language_for_shebang`）。既知のインタプリタなら**ファイル名・拡張子より優先**する — スクリプトは名前に関係なくシバンのインタプリタで動くため（`setup` や `run.sh` でも `#!/bin/tcsh` なら csh）。`#!/usr/bin/env X`／`env -S X` は env の先の X を見る。`python3.12`・`tclsh8.6` のような版付きの名前は元の名前として扱う。対応: tcsh/csh→csh、bash/sh/dash/ksh→bash、python→python、tclsh/wish→tcl、make/gmake→make。知らないインタプリタやシバン無しはファイル名どおり。
+
 ```toml
 [[language]]
 name = "rust"

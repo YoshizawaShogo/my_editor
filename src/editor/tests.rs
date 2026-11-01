@@ -2728,6 +2728,23 @@ fn double_and_triple_click_select_word_and_line() {
 }
 
 #[test]
+fn a_tcsh_script_is_coloured_as_csh_whatever_it_is_called() {
+    for name in ["setup", "run.sh"] {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from(name)]);
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(1),
+            result: Ok("#!/bin/tcsh -f\nset x = 1\n".to_owned()),
+        }));
+
+        // No extension, or a misleading one: the first line says what runs it.
+        let buffer = editor.active_buffer().unwrap();
+        assert_eq!(buffer.language, Some("csh"), "{name}");
+        assert!(!buffer.syntax_spans.is_empty(), "{name} is not coloured");
+    }
+}
+
+#[test]
 fn f6_twice_chooses_both_sides_of_a_comparison_afresh() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 80, rows: 24 });
