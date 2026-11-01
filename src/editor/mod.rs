@@ -1311,6 +1311,7 @@ impl Editor {
             field_cursor: search.field_cursor,
             field_selection: self.search_selection(),
             results_scroll: search.results_scroll,
+            pinned_heading: pinned_result_heading(search),
             error: search.error.clone(),
         })
     }
@@ -5405,8 +5406,14 @@ impl Editor {
             return Some(Vec::new());
         }
         if relative > layout.results_top {
-            let row = usize::from(relative - layout.results_top - 1)
-                + self.search().map_or(0, |search| search.results_scroll);
+            let offset = usize::from(relative - layout.results_top - 1);
+            // The top row shows the pinned heading when there is one, so a click
+            // there is a click on that heading rather than the hit beneath it.
+            let pinned = (offset == 0)
+                .then(|| self.search().and_then(pinned_result_heading))
+                .flatten();
+            let row =
+                pinned.unwrap_or(offset + self.search().map_or(0, |search| search.results_scroll));
             // A heading opens the first hit in its file.
             let hit = self
                 .search()
@@ -5898,10 +5905,10 @@ impl Editor {
         let Some(row) = rows.iter().position(|row| *row == ResultRow::Hit(index)) else {
             return;
         };
-        let top = match row.checked_sub(1).map(|above| rows[above]) {
-            Some(ResultRow::File(_)) => row - 1,
-            _ => row,
-        };
+        // One row of lead-in above the hit: its heading when that is the row
+        // above, or else the row the pinned heading will cover — either way the
+        // hit itself is never the one hidden under it.
+        let top = row.saturating_sub(1);
         if let Some(search) = self.search_mut() {
             if top < search.results_scroll {
                 search.results_scroll = top;
@@ -7806,6 +7813,21 @@ const SEARCH_LIST_LIMIT: usize = 500;
 /// so the hits under it read the way a single-file search does: a line number
 /// and the line. Putting the path on every hit's row pushed the text it was
 /// found in off to the right.
+/// The row of the file heading to pin above the list, when the list has been
+/// scrolled into the middle of a file's hits: the heading of the file the top
+/// row belongs to. `None` when the top row is a heading itself, or the search
+/// spans one file and has none. Hits keep their rows; the pinned heading is
+/// drawn over the top one, the way a sticky header covers what passes under it.
+fn pinned_result_heading(search: &SearchState) -> Option<usize> {
+    let rows = result_rows(search);
+    match rows.get(search.results_scroll)? {
+        ResultRow::File(_) => None,
+        ResultRow::Hit(_) => rows[..search.results_scroll]
+            .iter()
+            .rposition(|row| matches!(row, ResultRow::File(_))),
+    }
+}
+
 fn result_rows(search: &SearchState) -> Vec<ResultRow> {
     let grouped = search.scope != SearchScope::CurrentBuffer;
     let same_file = |left: &SearchHit, right: &SearchHit| match (left, right) {
@@ -7847,6 +7869,9 @@ pub struct SearchView {
     pub field_selection: Option<std::ops::Range<usize>>,
     pub results_scroll: usize,
     pub error: Option<String>,
+    /// The item to draw pinned over the list's top row: the heading of the file
+    /// that row is in, once the list has scrolled past where it was.
+    pub pinned_heading: Option<usize>,
 }
 
 #[derive(Debug)]

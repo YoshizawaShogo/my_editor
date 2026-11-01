@@ -976,7 +976,7 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
             );
         let inner = block.inner(results_area);
         frame.render_widget(block, results_area);
-        let lines = search
+        let mut lines = search
             .items
             .iter()
             .skip(search.results_scroll)
@@ -986,6 +986,15 @@ fn draw_search_pane(frame: &mut Frame<'_>, area: Rect, search: &crate::editor::S
                 None => search_heading_line(item),
             })
             .collect::<Vec<_>>();
+        // Scrolled into the middle of a file's hits, its heading is pinned over
+        // the top row, so which file the lines below belong to is never off
+        // screen; it changes over as the next file's heading reaches the top.
+        if let Some(pinned) = search.pinned_heading
+            && let Some(first) = lines.first_mut()
+        {
+            *first = search_heading_line(&search.items[pinned])
+                .patch_style(Style::default().add_modifier(Modifier::UNDERLINED));
+        }
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().bg(POPUP_BG)),
             inner,

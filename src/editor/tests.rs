@@ -1828,6 +1828,69 @@ fn a_search_across_files_heads_each_file_with_its_lines_below() {
 }
 
 #[test]
+fn the_heading_of_the_file_being_scrolled_through_stays_pinned() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 30 });
+    editor.update(Command::OpenSearch.into());
+    editor.update(Command::CycleSearchScope.into());
+    editor.update(Command::CycleSearchScope.into());
+    for character in "foo".chars() {
+        editor.update(AppEvent::TextInput(character));
+    }
+    let token = editor.search().unwrap().grep_token.expect("grep started");
+    let hit = |path: &str, line| GrepHit {
+        path: PathBuf::from(path),
+        line,
+        text: format!("foo {line}"),
+    };
+    let mut hits: Vec<_> = (0..30).map(|line| hit("src/a.rs", line)).collect();
+    hits.extend((0..30).map(|line| hit("src/b.rs", line)));
+    editor.update(AppEvent::Grep(GrepEvent::Hits { token, hits }));
+    let pinned = |editor: &Editor| {
+        let view = editor.search_view().unwrap();
+        view.pinned_heading
+            .map(|index| view.items[index].text.clone())
+    };
+    let wheel = |editor: &mut Editor, times| {
+        for _ in 0..times {
+            editor.update(AppEvent::Mouse(MouseInput {
+                event: MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 60,
+                    row: 25,
+                    modifiers: KeyModifiers::NONE,
+                },
+                clicks: 1,
+            }));
+        }
+    };
+
+    // At the top the heading is in its own row; nothing needs pinning.
+    assert_eq!(pinned(&editor), None);
+
+    // Into a.rs's hits, its heading stays above them…
+    wheel(&mut editor, 2);
+    assert_eq!(pinned(&editor).as_deref(), Some("src/a.rs"));
+    // …and once b.rs's lines reach the top, its heading takes over.
+    wheel(&mut editor, 11);
+    assert_eq!(pinned(&editor).as_deref(), Some("src/b.rs"));
+
+    // A click on the pinned row is a click on that heading: b.rs's first hit.
+    let (_, pane_y, _, _) = editor.search_pane_rect();
+    let list_top = pane_y + crate::editor::search_pane_layout(true, false).results_top + 1;
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 60,
+            row: list_top,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+    assert_eq!(editor.search_view().unwrap().current, Some(30));
+}
+
+#[test]
 fn a_drag_held_past_the_bottom_keeps_selecting_until_released() {
     let mut editor = Editor::default();
     editor.update(AppEvent::Resize { cols: 40, rows: 10 });
