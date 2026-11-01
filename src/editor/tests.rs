@@ -2728,6 +2728,68 @@ fn double_and_triple_click_select_word_and_line() {
 }
 
 #[test]
+fn f6_twice_chooses_both_sides_of_a_comparison_afresh() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 80, rows: 24 });
+    editor.open_paths([
+        PathBuf::from("old.txt"),
+        PathBuf::from("new.txt"),
+        PathBuf::from("current.txt"),
+    ]);
+    for (id, text) in [(1, "same\nold"), (2, "same\nnew"), (3, "current")] {
+        editor.update(AppEvent::Io(IoEvent::FileLoaded {
+            id: DocumentId(id),
+            result: Ok(text.to_owned()),
+        }));
+    }
+    let choose = |editor: &mut Editor, name: &str| {
+        for character in name.chars() {
+            editor.update(AppEvent::TextInput(character));
+        }
+        editor.update(Command::PickerConfirm.into());
+    };
+
+    editor.update(Command::OpenDiffPicker.into());
+    editor.update(Command::OpenDiffPicker.into());
+    let picker = editor.picker_view().expect("the first pick");
+    assert!(picker.title.starts_with("Compare · 1/2 → left side"));
+    // The file in front of you is a choice now, not only the base.
+    assert!(
+        picker
+            .items
+            .iter()
+            .any(|item| item.label.contains("current.txt")),
+        "{:?}",
+        picker
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+
+    choose(&mut editor, "old.txt");
+    let picker = editor.picker_view().expect("the second pick");
+    assert!(picker.title.starts_with("Compare · 2/2 → right side"));
+    assert!(
+        picker
+            .items
+            .iter()
+            .all(|item| !item.label.contains("old.txt"))
+    );
+
+    choose(&mut editor, "new.txt");
+    assert!(editor.picker_view().is_none());
+    let (left, right, diff) = editor.split_buffers().expect("a comparison");
+    assert!(diff);
+    assert_eq!(left.text.to_string(), "same\nold");
+    assert_eq!(right.text.to_string(), "same\nnew");
+
+    // Over the comparison, F6 still closes it.
+    editor.update(Command::OpenDiffPicker.into());
+    assert!(editor.split_buffers().is_none_or(|(_, _, diff)| !diff));
+}
+
+#[test]
 fn diff_picker_opens_current_and_selected_buffers_side_by_side() {
     let mut editor = Editor::default();
     editor.open_paths([PathBuf::from("left.txt"), PathBuf::from("right.txt")]);

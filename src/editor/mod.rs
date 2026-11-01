@@ -1210,7 +1210,11 @@ impl Editor {
                     Some(Side::Right) => "Open buffer · 2/2 → right pane",
                     None => "Open buffer",
                 },
-                PickerMode::Diff => "Compare with · buffer or file · / ~ ../ completes paths",
+                PickerMode::Diff => match picker.pair {
+                    Some(Side::Left) => "Compare · 1/2 → left side · / ~ ../ completes paths",
+                    Some(Side::Right) => "Compare · 2/2 → right side · / ~ ../ completes paths",
+                    None => "Compare with · buffer or file · / ~ ../ completes paths",
+                },
                 PickerMode::Command => "Command Palette · key / command / description",
             },
             query: picker.query.clone(),
@@ -4754,12 +4758,28 @@ impl Editor {
 
     fn open_picker(&mut self, mode: PickerMode) -> Vec<Effect> {
         if let Some(picker) = self.picker.as_mut().filter(|picker| picker.mode == mode) {
-            // Ctrl+G a second time turns the buffer list into a pair of picks —
-            // one for the left pane, then one for the right — which sets up a
-            // side-by-side in one go. A third press puts it away.
-            if mode == PickerMode::Buffer && picker.pair.is_none() {
+            // Ctrl+G (or F6) a second time turns the list into a pair of picks
+            // — one for the left side, then one for the right — which sets up a
+            // side-by-side, or a whole new comparison, in one go. A third press
+            // puts it away.
+            if matches!(mode, PickerMode::Buffer | PickerMode::Diff) && picker.pair.is_none() {
                 picker.pair = Some(Side::Left);
                 picker.return_side = Side::Left;
+                // A comparison chosen afresh may well start from the file in
+                // front of you, which a single F6 leaves out as its base.
+                let base = picker.base;
+                if mode == PickerMode::Diff
+                    && !picker.candidates.iter().any(|candidate| {
+                        matches!(candidate, PickerCandidate::Document(id) if *id == base)
+                    })
+                {
+                    picker
+                        .candidates
+                        .insert(0, PickerCandidate::Document(picker.base));
+                    picker.filtered = (0..picker.candidates.len()).collect();
+                    picker.ranking_cache.clear();
+                    picker.selected = 0;
+                }
                 self.dirty = true;
                 return Vec::new();
             }
@@ -6299,6 +6319,44 @@ impl Editor {
                     self.show_only(view);
                     final_side = Side::Left;
                 }
+            }
+            (PickerMode::Diff, candidate) if picker.pair == Some(Side::Left) => {
+                // The left side of the comparison. Opened (or found) now, then
+                // straight on to the right side from the same list, without it;
+                // that second pick goes through the ordinary arms below with
+                // this one as their base.
+                let left = match candidate {
+                    PickerCandidate::Document(id) => id,
+                    PickerCandidate::Path(path) => {
+                        let (id, load) = self.document_for_path(path);
+                        effects.extend(load);
+                        id
+                    }
+                    PickerCandidate::Command(_) => return effects,
+                };
+                let left_path = self
+                    .documents
+                    .get(&left)
+                    .and_then(|document| document.path.clone());
+                let mut right = picker;
+                if let Some(start) = right.path_listing_start.take() {
+                    right.candidates.truncate(start);
+                }
+                right.candidates.retain(|candidate| match candidate {
+                    PickerCandidate::Document(id) => *id != left,
+                    PickerCandidate::Path(path) => Some(path) != left_path.as_ref(),
+                    PickerCandidate::Command(_) => true,
+                });
+                right.filtered = (0..right.candidates.len()).collect();
+                right.query.clear();
+                right.selected = 0;
+                right.ranking_cache.clear();
+                right.base = left;
+                right.pair = Some(Side::Right);
+                self.picker = Some(right);
+                self.focus = Focus::Overlay;
+                self.dirty = true;
+                return effects;
             }
             (PickerMode::Diff, PickerCandidate::Path(path)) => {
                 let (target, load) = self.document_for_path(path);
