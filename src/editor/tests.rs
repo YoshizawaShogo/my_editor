@@ -3063,6 +3063,41 @@ fn mouse_wheel_scrolls_the_pane_under_the_cursor_not_the_active_one() {
 }
 
 #[test]
+fn scrolling_the_diff_past_the_end_stops_at_the_last_screenful() {
+    let mut editor = diff_editor();
+    let wheel = |kind| {
+        AppEvent::Mouse(MouseInput {
+            event: MouseEvent {
+                kind,
+                column: 10,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            clicks: 0,
+        })
+    };
+    let rows = editor.diff_rows().unwrap().len();
+    let height = usize::from(editor.terminal_size.1 - 1);
+    let last_screenful = rows.saturating_sub(height);
+    assert!(last_screenful > 0);
+
+    // Far more scrolling than there is to scroll: the top row stops at the
+    // last screenful instead of piling up beyond it.
+    for _ in 0..20 {
+        editor.update(wheel(MouseEventKind::ScrollDown));
+    }
+    assert_eq!(editor.diff_top_row(), last_screenful);
+    assert_eq!(editor.diff_hunk_position().unwrap().1, 2);
+
+    // So a single scroll up moves the view straight away.
+    editor.update(wheel(MouseEventKind::ScrollUp));
+    assert_eq!(
+        editor.diff_top_row(),
+        last_screenful.saturating_sub(Editor::MOUSE_WHEEL_SCROLL_LINES as usize)
+    );
+}
+
+#[test]
 fn diff_navigation_steps_between_hunks_and_stops_at_the_ends() {
     let mut editor = diff_editor();
     let (_, total) = editor.diff_hunk_position().unwrap();

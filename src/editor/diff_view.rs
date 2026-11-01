@@ -179,33 +179,30 @@ impl super::Editor {
         true
     }
 
+    /// The highest top row that still fills the screen: the start of the last
+    /// screenful of `rows` aligned rows. The renderer and hit-testing clamp to
+    /// the same bound.
+    fn max_diff_top_row(&self, rows: usize) -> usize {
+        rows.saturating_sub(usize::from(self.terminal_size.1.saturating_sub(1)))
+    }
+
     pub(super) fn scroll_diff(&mut self, amount: isize) {
-        // The exact row count needs the alignment; the sum of both line counts
-        // bounds it, and the renderer clamps the last screenful precisely.
-        let max_row = self
-            .layout
-            .split()
-            .map(|(left, right, _)| {
-                [left, right]
-                    .iter()
-                    .map(|pane| {
-                        self.documents
-                            .get(&pane.view.doc)
-                            .and_then(Document::editable_opt)
-                            .map_or(0, |editable| editable.text().len_lines())
-                    })
-                    .sum::<usize>()
-            })
-            .unwrap_or(0)
-            .saturating_sub(1);
+        // Clamp to the real last screenful, not a loose bound. Scrolling past
+        // the end used to pile up in `top_row` while the renderer kept showing
+        // the last screenful, so scrolling back up did nothing for a while.
+        let Some(rows) = self.diff_rows() else {
+            return;
+        };
+        let max_row = self.max_diff_top_row(rows.len());
         let Some(diff) = self.layout.diff_mut() else {
             return;
         };
         diff.top_row = if amount < 0 {
             diff.top_row.saturating_sub(amount.unsigned_abs())
         } else {
-            (diff.top_row + amount as usize).min(max_row)
-        };
+            diff.top_row + amount as usize
+        }
+        .min(max_row);
         self.dirty = true;
     }
 
@@ -215,16 +212,22 @@ impl super::Editor {
             return;
         };
         let starts = crate::diff::hunk_starts(&rows);
+        let max_row = self.max_diff_top_row(rows.len());
         let Some(diff) = self.layout.diff_mut() else {
             return;
         };
-        let current = diff.top_row;
+        // A hunk in the last screenful can only be scrolled to that screenful;
+        // if that is where the view already is, there is nowhere further to go.
+        let current = diff.top_row.min(max_row);
         let target = if forward {
             starts.iter().find(|start| **start > current)
         } else {
             starts.iter().rev().find(|start| **start < current)
         };
-        let Some(target) = target.copied() else {
+        let Some(target) = target
+            .map(|start| (*start).min(max_row))
+            .filter(|target| *target != current)
+        else {
             self.notify(
                 ToastLevel::Info,
                 if forward {
@@ -244,7 +247,11 @@ impl super::Editor {
     pub fn diff_hunk_position(&self) -> Option<(usize, usize)> {
         let rows = self.diff_rows()?;
         let starts = crate::diff::hunk_starts(&rows);
-        let top = self.layout.diff()?.top_row;
+        let top = self
+            .layout
+            .diff()?
+            .top_row
+            .min(self.max_diff_top_row(rows.len()));
         let index = starts.iter().filter(|start| **start <= top).count();
         Some((index, starts.len()))
     }

@@ -1543,9 +1543,9 @@ fn draw_diff(
             .as_ref()
             .is_some_and(|(line, _)| *line == focused_line),
     });
-    // The view scrolls by aligned row. `top_row` is an upper-bounded guess made
-    // without the alignment (see `Editor::scroll_diff`), so the last screenful
-    // is clamped here, where the real row count is known.
+    // The view scrolls by aligned row. Scrolling already stops `top_row` at the
+    // last screenful (see `Editor::scroll_diff`), but a resize or an edit since
+    // then can shrink it, so clamp here too.
     let start = top_row.min(rows.len().saturating_sub(height));
     let mut rendered_left = Vec::new();
     let mut rendered_right = Vec::new();
