@@ -6003,6 +6003,58 @@ fn clicking_back_into_the_text_puts_the_go_to_line_prompt_away() {
     );
 }
 
+fn nested_source() -> String {
+    let mut lines = vec!["impl Thing {".to_owned(), "    fn work() {".to_owned()];
+    lines.extend((0..30).map(|step| format!("        step{step}();")));
+    lines.extend(["    }".to_owned(), "}".to_owned()]);
+    lines.join("\n")
+}
+
+#[test]
+fn scrolling_into_a_function_pins_the_lines_it_sits_in() {
+    let mut editor = Editor::default();
+    editor.update(AppEvent::Resize { cols: 40, rows: 12 });
+    editor.update(AppEvent::TextPaste(nested_source()));
+    editor.update(
+        Command::Move {
+            direction: Direction::Left,
+            unit: Unit::Document,
+            extend: false,
+        }
+        .into(),
+    );
+    assert!(editor.active_buffer().unwrap().sticky_lines.is_empty());
+
+    // One notch of the wheel: `impl Thing {` and `fn work() {` are off the top,
+    // and both stay on screen pinned over it.
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+    assert_eq!(editor.active_buffer().unwrap().sticky_lines, vec![0, 1]);
+
+    // A click on the pinned `fn work() {` goes to that line.
+    editor.update(AppEvent::Mouse(MouseInput {
+        event: MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        },
+        clicks: 1,
+    }));
+    let buffer = editor.active_buffer().unwrap();
+    let head = buffer.view.selections.primary().head.0;
+    assert_eq!(buffer.text.char_to_line(head), 1);
+    assert_eq!(head, buffer.text.line_to_char(1) + 4);
+    assert_eq!(buffer.view.scroll.top_line, 0);
+}
+
 #[test]
 fn ctrl_l_opens_a_blank_line_above_and_moves_onto_it() {
     let mut editor = Editor::default();

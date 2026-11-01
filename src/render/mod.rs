@@ -38,6 +38,9 @@ const CODE_STRING: Color = Color::Rgb(0xb4, 0xbe, 0x82); // green: "text", 'c'
 const CODE_NUMBER: Color = Color::Rgb(0xd7, 0xb8, 0x7a); // amber: 0, 1, 2, true
 const CODE_BUILTIN: Color = Color::Rgb(0xc6, 0x8b, 0xa5); // dusty rose: macros, lifetimes
 const SELECTION: Color = Color::Rgb(0x27, 0x2c, 0x42);
+/// Behind the lines pinned over the top of a pane: a shade off the text's own
+/// background, so the header reads as a header and not as text in place.
+const STICKY_BG: Color = Color::Rgb(0x1e, 0x21, 0x2e);
 /// One colour per indent level, cycling. Dim enough to sit under the code
 /// rather than compete with it, while the change of hue still counts the
 /// levels at a glance.
@@ -1786,7 +1789,9 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
     let mut gutter_lines = Vec::with_capacity(end.saturating_sub(start));
     let mut text_lines = Vec::with_capacity(end.saturating_sub(start));
 
-    for line_index in start..end {
+    // One line, as its gutter and its wrapped rows — a closure so the lines
+    // pinned over the top of the pane are drawn exactly as they are in place.
+    let render_line = |line_index: usize| -> (Line<'static>, Vec<Vec<Span<'static>>>) {
         let line_diagnostic = buffer
             .diagnostics
             .iter()
@@ -1955,7 +1960,11 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
         while rows.len() < row_count {
             rows.push(Vec::new());
         }
-        gutter_lines.push(Line::from(gutter_spans));
+        (Line::from(gutter_spans), rows)
+    };
+    for line_index in start..end {
+        let (gutter, rows) = render_line(line_index);
+        gutter_lines.push(gutter);
         gutter_lines
             .extend(std::iter::repeat_with(Line::default).take(rows.len().saturating_sub(1)));
         text_lines.extend(rows.into_iter().map(Line::from));
@@ -2009,6 +2018,47 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
             let symbol = format!("{}\u{20d2}", cell.symbol());
             cell.set_symbol(&symbol).set_fg(FG);
         }
+    }
+
+    // The lines opening the blocks the visible code is in, pinned over the top
+    // rows as they are drawn in place — colours, numbers and all — on a tint
+    // that sets them apart from the text scrolling underneath. Before the edge
+    // badges, which stay on top of them.
+    let tint = |line: Line<'static>| {
+        Line::from(
+            line.spans
+                .into_iter()
+                .map(|span| {
+                    let mut style = span.style;
+                    if style.bg.is_none_or(|background| background == BG) {
+                        style.bg = Some(STICKY_BG);
+                    }
+                    Span::styled(span.content, style)
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    for (row, &line) in buffer.sticky_lines.iter().enumerate() {
+        let Ok(row) = u16::try_from(row) else { break };
+        if row >= area.height {
+            break;
+        }
+        let (gutter, rows) = render_line(line);
+        let first_row = Line::from(rows.into_iter().next().unwrap_or_default());
+        let gutter_cell = Rect::new(gutter_area.x, area.y + row, gutter_area.width, 1);
+        let text_cell = Rect::new(text_area.x, area.y + row, text_area.width, 1);
+        // Cleared first: a paragraph only writes where it has text, and the line
+        // scrolled underneath would otherwise show through past its end.
+        frame.render_widget(Clear, gutter_cell);
+        frame.render_widget(Clear, text_cell);
+        frame.render_widget(
+            Paragraph::new(tint(gutter)).style(Style::default().bg(STICKY_BG)),
+            gutter_cell,
+        );
+        frame.render_widget(
+            Paragraph::new(tint(first_row)).style(Style::default().bg(STICKY_BG)),
+            text_cell,
+        );
     }
 
     let above_errors = buffer
@@ -2900,6 +2950,7 @@ mod tests {
             git_status: Some("M"),
             semantic_spans: &[],
             syntax_spans: &[],
+            sticky_lines: Vec::new(),
         };
 
         terminal
@@ -3325,6 +3376,64 @@ mod tests {
         assert_eq!(buffer[(41, 3)].symbol(), "│");
         assert_eq!(buffer[(43, 3)].symbol(), "│");
         assert_eq!(buffer[(43, 3)].fg, INDENT_GUIDES[1]);
+    }
+
+    #[test]
+    fn the_lines_a_scrolled_function_sits_in_are_drawn_over_the_top() {
+        let mut editor = Editor::default();
+        editor.update(crate::editor::AppEvent::Resize { cols: 40, rows: 12 });
+        let mut source = vec!["impl Thing {".to_owned(), "    fn work() {".to_owned()];
+        source.extend((0..30).map(|step| format!("        step{step}();")));
+        source.extend(["    }".to_owned(), "}".to_owned()]);
+        editor.update(crate::editor::AppEvent::TextPaste(source.join("\n")));
+        editor.update(
+            crate::editor::Command::Move {
+                direction: crate::editor::Direction::Left,
+                unit: crate::editor::Unit::Document,
+                extend: false,
+            }
+            .into(),
+        );
+        editor.update(crate::editor::AppEvent::Mouse(crate::editor::MouseInput {
+            event: crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: 10,
+                row: 5,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            clicks: 1,
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        // The top two rows are the pinned lines, numbered as they are in the
+        // file, on the header's tint; the row under them is where the scroll
+        // actually is.
+        let row = |terminal: &Terminal<TestBackend>, row: u16| {
+            let buffer = terminal.backend().buffer();
+            (0..40)
+                .map(|column| buffer[(column, row)].symbol())
+                .collect::<String>()
+        };
+        assert!(
+            row(&terminal, 0).contains("1 impl Thing {"),
+            "{}",
+            row(&terminal, 0)
+        );
+        assert!(
+            row(&terminal, 1).contains("2 │   fn work() {"),
+            "{}",
+            row(&terminal, 1)
+        );
+        assert!(row(&terminal, 2).contains("step"), "{}", row(&terminal, 2));
+        assert_eq!(terminal.backend().buffer()[(20, 0)].bg, STICKY_BG);
+        // Nothing of the line underneath shows past the pinned one's end.
+        assert!(
+            row(&terminal, 0).trim_end().ends_with("impl Thing {"),
+            "{}",
+            row(&terminal, 0)
+        );
     }
 
     #[test]

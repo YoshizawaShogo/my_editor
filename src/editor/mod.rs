@@ -6,6 +6,7 @@ mod focus;
 mod layout;
 mod navigate;
 mod snippet_session;
+mod sticky;
 mod tree;
 
 pub use command::{Command, Direction, Unit, VerticalDirection};
@@ -753,7 +754,59 @@ impl Editor {
                 .syntax
                 .as_ref()
                 .map_or(&[], crate::highlight::IncrementalHighlighter::spans),
+            sticky_lines: self.pane_sticky_lines(
+                editable.text(),
+                &pane.view,
+                self.config
+                    .indentation_for_language(document.language.as_deref())
+                    .0,
+            ),
         })
+    }
+
+    /// Where a click on row `row` of the focused pane's pinned header should
+    /// take the caret — the first non-blank of that pinned line — or `None` when
+    /// the row is not part of the header. The diff draws no header.
+    fn pinned_line_at(&self, row: u16) -> Option<CharIdx> {
+        if self.layout.is_diff() {
+            return None;
+        }
+        let pane = self.layout.active_editor(self.focus)?;
+        let document = self.documents.get(&pane.view.doc)?;
+        let text = document.editable_opt()?.text();
+        let tab_size = self
+            .config
+            .indentation_for_language(document.language.as_deref())
+            .0;
+        let line = *self
+            .pane_sticky_lines(text, &pane.view, tab_size)
+            .get(usize::from(row))?;
+        let start = text.line_to_char(line);
+        let indent = text
+            .line(line)
+            .chars()
+            .take_while(|character| matches!(character, ' ' | '\t'))
+            .count();
+        Some(CharIdx(start + indent))
+    }
+
+    /// The lines to pin over a file pane showing `view` of `text`: as many as
+    /// a third of the pane affords, up to [`sticky::STICKY_MAX_LINES`], never
+    /// covering the row the caret is on.
+    fn pane_sticky_lines(&self, text: &Rope, view: &View, tab_size: usize) -> Vec<usize> {
+        let rows = usize::from(self.terminal_size.1.saturating_sub(1));
+        let top = view.scroll.top_line;
+        let caret_line = text.char_to_line(view.selections.primary().head.0.min(text.len_chars()));
+        let caret_row = (top..top + rows)
+            .contains(&caret_line)
+            .then(|| caret_line - top);
+        sticky::sticky_lines(
+            text,
+            top,
+            tab_size,
+            sticky::STICKY_MAX_LINES.min(rows / 3),
+            caret_row,
+        )
     }
 
     pub fn show_start_page(&self) -> bool {
@@ -1143,6 +1196,17 @@ impl Editor {
                     .syntax
                     .as_ref()
                     .map_or(&[], crate::highlight::IncrementalHighlighter::spans),
+                sticky_lines: if diff {
+                    Vec::new()
+                } else {
+                    self.pane_sticky_lines(
+                        left_document.text(),
+                        &left.view,
+                        self.config
+                            .indentation_for_language(left_doc.language.as_deref())
+                            .0,
+                    )
+                },
             },
             ActiveBuffer {
                 name: right_doc
@@ -1168,6 +1232,17 @@ impl Editor {
                     .syntax
                     .as_ref()
                     .map_or(&[], crate::highlight::IncrementalHighlighter::spans),
+                sticky_lines: if diff {
+                    Vec::new()
+                } else {
+                    self.pane_sticky_lines(
+                        right_document.text(),
+                        &right.view,
+                        self.config
+                            .indentation_for_language(right_doc.language.as_deref())
+                            .0,
+                    )
+                },
             },
             diff,
         ))
@@ -4632,6 +4707,19 @@ impl Editor {
                         shell.selection = None;
                     }
                 }
+                // A click on a pinned line goes to that line: the header names
+                // the block, and its first line is where a click on the name
+                // should land — not the text hidden underneath.
+                if let Some(target) = self.pinned_line_at(mouse.row) {
+                    self.record_jump_origin();
+                    if let Some(pane) = self.layout.active_editor_mut(self.focus) {
+                        pane.view.selections.set_single(Selection::caret(target));
+                    }
+                    self.drag_anchor = None;
+                    self.reveal_caret_with_context();
+                    self.dirty = true;
+                    return;
+                }
                 let Some(index) = self.mouse_position(mouse.column, mouse.row) else {
                     return;
                 };
@@ -7115,6 +7203,9 @@ pub struct ActiveBuffer<'a> {
     pub git_status: Option<&'a str>,
     pub semantic_spans: &'a [crate::lsp::SemanticSpan],
     pub syntax_spans: &'a [crate::highlight::HighlightSpan],
+    /// Lines pinned over the pane's top rows: the ones opening the blocks the
+    /// visible code is in (see [`sticky::sticky_lines`]).
+    pub sticky_lines: Vec<usize>,
 }
 
 pub struct LargeBuffer<'a> {
