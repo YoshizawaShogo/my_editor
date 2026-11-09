@@ -273,16 +273,17 @@ impl Editable {
                     .text
                     .slice(self.text.line_to_char(line)..insertion)
                     .into();
-                let comment = line_comment
-                    .and_then(|marker| continued_line_comment(&prefix, &raw_indentation, marker));
-                if let Some(comment) = comment {
-                    return (format!("\n{indentation}{comment} "), 0);
-                }
+                // The comment is not carried onto the new line: more often than
+                // not the comment is finished and code comes next.
+                let in_comment =
+                    line_comment.is_some_and(|marker| prefix.trim_start().starts_with(marker));
                 // A line that ends by opening a bracket — `if {`, `fn main() {`, a
                 // call's `(` — starts a block, so what follows sits one level deeper.
-                let opens_block = prefix
-                    .trim_end_matches([' ', '\t'])
-                    .ends_with(['(', '[', '{']);
+                // A comment that happens to end in one opens nothing.
+                let opens_block = !in_comment
+                    && prefix
+                        .trim_end_matches([' ', '\t'])
+                        .ends_with(['(', '[', '{']);
                 if opens_block {
                     (format!("\n{indentation}{unit}"), 0)
                 } else {
@@ -852,22 +853,6 @@ impl Editable {
     }
 }
 
-fn continued_line_comment(prefix: &str, indentation: &str, marker: &str) -> Option<String> {
-    let content = prefix.strip_prefix(indentation)?;
-    if !content.starts_with(marker) {
-        return None;
-    }
-    if marker == "//" {
-        if content.starts_with("///") && !content.starts_with("////") {
-            return Some("///".to_owned());
-        }
-        if content.starts_with("//!") {
-            return Some("//!".to_owned());
-        }
-    }
-    Some(marker.to_owned())
-}
-
 fn normalized_indentation(indentation: &str, tab_size: usize, insert_spaces: bool) -> String {
     if !insert_spaces {
         return indentation.to_owned();
@@ -1020,16 +1005,11 @@ mod tests {
     }
 
     #[test]
-    fn newline_continues_line_and_doc_comments() {
-        let mut editable = Editable::new("    // note");
-        let mut selections = Selections::single(Selection::caret(CharIdx(11)));
+    fn newline_after_a_comment_does_not_continue_it() {
+        let mut editable = Editable::new("    /// docs");
+        let mut selections = Selections::single(Selection::caret(CharIdx(12)));
         editable.insert_newline(&mut selections, Some("//"), 4, true);
-        assert_eq!(editable.text().to_string(), "    // note\n    // ");
-
-        let mut editable = Editable::new("/// docs");
-        let mut selections = Selections::single(Selection::caret(CharIdx(8)));
-        editable.insert_newline(&mut selections, Some("//"), 4, true);
-        assert_eq!(editable.text().to_string(), "/// docs\n/// ");
+        assert_eq!(editable.text().to_string(), "    /// docs\n    ");
     }
 
     #[test]
@@ -1317,10 +1297,10 @@ mod tests {
         editable.insert_newline(&mut selections, Some("#"), 4, false);
         assert_eq!(editable.text().to_string(), format!("{text}\n\t\t"));
 
-        // A comment that happens to end in a brace only continues the comment.
+        // A comment that happens to end in a brace opens no block.
         let mut editable = Editable::new("    // if ready {");
         let mut selections = Selections::single(Selection::caret(CharIdx(17)));
         editable.insert_newline(&mut selections, Some("//"), 4, true);
-        assert_eq!(editable.text().to_string(), "    // if ready {\n    // ");
+        assert_eq!(editable.text().to_string(), "    // if ready {\n    ");
     }
 }
