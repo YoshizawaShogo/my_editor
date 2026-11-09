@@ -6036,6 +6036,38 @@ fn a_quote_beginning_a_rust_lifetime_comes_without_its_closing_half() {
 }
 
 #[test]
+fn a_closure_gets_both_of_its_pipes() {
+    let typed = |path: &str, before: &str, keys: &str| {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from(path)]);
+        editor.update(AppEvent::TextPaste(before.to_owned()));
+        for character in keys.chars() {
+            editor.update(AppEvent::TextInput(character));
+        }
+        let buffer = editor.active_buffer().unwrap();
+        let caret = buffer.view.selections.primary().head.0;
+        let text = buffer.text.to_string();
+        // `^` marks the caret, which `|` would be lost among.
+        format!("{}^{}", &text[..caret], &text[caret..])
+    };
+
+    // The pair goes in, and the closing one is stepped over.
+    assert_eq!(typed("main.rs", "v.map(", "|"), "v.map(|^|");
+    assert_eq!(typed("main.rs", "v.map(", "|x| x"), "v.map(|x| x^");
+    assert_eq!(typed("main.rs", "spawn(move ", "||"), "spawn(move ||^");
+    assert_eq!(
+        typed("main.rs", "let f = ", "|a, b| a"),
+        "let f = |a, b| a^"
+    );
+
+    // After a value it is an or, of either kind.
+    assert_eq!(typed("main.rs", "a ", "|| b"), "a || b^");
+    assert_eq!(typed("main.rs", "Some(1) ", "| None"), "Some(1) | None^");
+    // Only Rust's closures are written this way.
+    assert_eq!(typed("notes.txt", "f(", "|"), "f(|^");
+}
+
+#[test]
 fn the_braces_of_a_use_line_come_with_its_semicolon() {
     let typed = |path: &str, text: &str| {
         let mut editor = Editor::default();

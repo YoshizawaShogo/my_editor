@@ -2442,25 +2442,18 @@ impl Editor {
         declaration.starts_with("use ") && after.trim().is_empty()
     }
 
-    /// Whether a quote typed at the primary caret in Rust begins a lifetime
-    /// rather than a char literal (see [`begins_a_lifetime`]).
-    fn caret_begins_rust_lifetime(&self) -> bool {
-        let Some(pane) = self.layout.active_editor(self.focus) else {
-            return false;
-        };
-        let Some(document) = self.documents.get(&pane.view.doc) else {
-            return false;
-        };
-        let Some(editable) = document.editable_opt() else {
-            return false;
-        };
+    /// The primary caret's line up to the caret, when the active buffer is
+    /// Rust: what decides whether a `'` or `|` typed there opens something.
+    fn rust_line_before_caret(&self) -> Option<String> {
+        let pane = self.layout.active_editor(self.focus)?;
+        let document = self.documents.get(&pane.view.doc)?;
         if document.language.as_deref() != Some("rust") {
-            return false;
+            return None;
         }
-        let text = editable.text();
+        let text = document.editable_opt()?.text();
         let head = pane.view.selections.primary().head.0.min(text.len_chars());
         let line_start = text.line_to_char(text.char_to_line(head));
-        begins_a_lifetime(&text.slice(line_start..head).to_string())
+        Some(text.slice(line_start..head).to_string())
     }
 
     /// The character `back` places before the primary caret in the active
@@ -4228,7 +4221,11 @@ impl Editor {
                 // line still needs its `;` — closing it here saves going back.
                 let closing_text = if character == '{' && self.caret_ends_a_use_line() {
                     "};".to_owned()
-                } else if character == '\'' && self.caret_begins_rust_lifetime() {
+                } else if character == '\''
+                    && self
+                        .rust_line_before_caret()
+                        .is_some_and(|before| begins_a_lifetime(&before))
+                {
                     // A lifetime has no closing quote.
                     String::new()
                 } else {
@@ -4272,6 +4269,24 @@ impl Editor {
                         }
                         None => document.editable_mut().insert(&mut view.selections, ";"),
                     }
+                });
+            }
+            // A closure's parameters sit between a pair of `|`, typed out like
+            // a bracket's: the pair goes in where a closure can start, and the
+            // closing one is stepped over. `||` typed in full comes out as
+            // `||` either way, so the logical or is unharmed.
+            '|' if let Some(before) = self.rust_line_before_caret() => {
+                let closing = if begins_a_closure(&before) { "|" } else { "" };
+                self.edit_active(|document, view| {
+                    if document
+                        .editable_mut()
+                        .skip_closing_character(&mut view.selections, '|')
+                    {
+                        return;
+                    }
+                    document
+                        .editable_mut()
+                        .insert_pair(&mut view.selections, '|', closing, at);
                 });
             }
             '}' => self.edit_active(|document, view| {
@@ -7174,6 +7189,23 @@ fn snippet_candidates(language: &str, prefix: &str) -> Vec<CompletionCandidate> 
 
 /// The whole word the caret sits on or immediately after, or None when the caret
 /// is not touching a word. Used as the ctags lookup symbol.
+/// Whether a `|` typed after `before` (the line up to the caret) begins a
+/// Rust closure's parameters: where an expression starts — after `(`, `,`,
+/// `=`, `=>`, `move` or `return`. After a value it is an or, `a | b`, and at
+/// the start of a line it is the `|` rustfmt leads a pattern's next
+/// alternative with.
+fn begins_a_closure(before: &str) -> bool {
+    let before = before.trim_end();
+    if before.ends_with(['(', ',', '=']) || before.ends_with("=>") {
+        return true;
+    }
+    let word = before
+        .rsplit(|character: char| !is_word(character))
+        .next()
+        .unwrap_or_default();
+    matches!(word, "move" | "return")
+}
+
 /// Whether a quote typed after `before` (the line up to the caret) begins a
 /// Rust lifetime: right after `<` or `&` — `impl<'a>`, `&'a str` — or after a
 /// comma inside `<…>`, as in `<'a, 'b>`. A comma inside a call's `(…)` is a
