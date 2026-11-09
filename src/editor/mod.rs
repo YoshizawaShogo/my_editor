@@ -1867,6 +1867,7 @@ impl Editor {
                     side,
                     anchor,
                     add_parentheses,
+                    manual,
                 }) if self.doc_version(doc) == Some(version)
                     && self
                         .layout
@@ -1901,6 +1902,8 @@ impl Editor {
                                 .0
                             })
                         };
+                        // Whether the server offers exactly what is typed.
+                        let mut typed_a_whole_word = false;
                         let mut items: Vec<_> = match response {
                             lsp_types::CompletionResponse::Array(items) => items,
                             lsp_types::CompletionResponse::List(list) => list.items,
@@ -1962,6 +1965,7 @@ impl Editor {
                             // so does `Some` over a typed `some`, which corrects
                             // the case.
                             if !prefix.is_empty() && insert == prefix {
+                                typed_a_whole_word = true;
                                 return None;
                             }
                             let cursor_back = usize::from(
@@ -2032,7 +2036,13 @@ impl Editor {
                             .unwrap_or_default();
                         merged.extend(items.into_iter().map(|(_, _, _, item)| item));
                         let items = merged;
-                        if !items.is_empty() {
+                        // A word typed out in full is finished, and the key that
+                        // follows is for what comes next: offering longer words
+                        // there turns the Enter after `self` into `self::`.
+                        // Ctrl+Space still lists them.
+                        if typed_a_whole_word && !manual {
+                            self.dismiss_completion();
+                        } else if !items.is_empty() {
                             self.completion = Some(CompletionState {
                                 items,
                                 selected: 0,
@@ -2353,6 +2363,7 @@ impl Editor {
                 side,
                 anchor,
                 add_parentheses,
+                manual,
             },
         );
         vec![Effect::LspRequest {
@@ -8040,6 +8051,8 @@ enum PendingLsp {
         side: Side,
         anchor: CharIdx,
         add_parentheses: bool,
+        /// Asked for with Ctrl+Space rather than by typing.
+        manual: bool,
     },
     /// `side` is the file pane the definition opens in, fixed at the click so a
     /// response that arrives after focus has moved still lands where it was aimed.

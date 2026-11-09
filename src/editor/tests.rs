@@ -5218,6 +5218,51 @@ fn complete_with(editor: &mut Editor, items: serde_json::Value) {
     }));
 }
 
+/// Completion as typing asks for it, answered with `items`.
+fn complete_automatically_with(editor: &mut Editor, items: serde_json::Value) {
+    let request = editor
+        .request_completion(false)
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::LspRequest { id, .. } => Some(id),
+            _ => None,
+        })
+        .expect("a completion request");
+    editor.update(AppEvent::Lsp(LspEvent::Response {
+        id: request,
+        result: Ok(items),
+    }));
+}
+
+#[test]
+fn a_word_typed_in_full_leaves_enter_for_a_new_line() {
+    // Captured from rust-analyzer at `self` in a method body.
+    let items = serde_json::json!([
+        {"label": "self::", "kind": 14, "insertText": "self::", "sortText": "7fffffff"},
+        {"label": "self", "kind": 6, "insertText": "self", "sortText": "7ffffffe"},
+        {"label": "Self", "kind": 12, "insertText": "Self", "sortText": "7fffffff"},
+    ]);
+    let mut editor = editor_with_lsp();
+    editor.update(AppEvent::TextPaste("sel".to_owned()));
+    complete_automatically_with(&mut editor, items.clone());
+    assert!(editor.completion_view().is_some());
+
+    // Typing the last letter makes the word whole: the popup goes, and Enter
+    // breaks the line, ready for `.method()` on the next one.
+    editor.update(AppEvent::TextInput('f'));
+    complete_automatically_with(&mut editor, items.clone());
+    assert!(editor.completion_view().is_none());
+    editor.update(Command::InsertNewline.into());
+    assert_eq!(editor.active_buffer().unwrap().text.to_string(), "self\n");
+
+    // Asked for, the longer words are still there.
+    let mut editor = editor_with_lsp();
+    editor.update(AppEvent::TextPaste("self".to_owned()));
+    complete_with(&mut editor, items);
+    let view = editor.completion_view().expect("completion popup");
+    assert!(view.items.iter().any(|item| item == "self::"));
+}
+
 #[test]
 fn completion_replaces_the_span_the_server_names() {
     // The server asks to replace `s.push`, not just the word under the caret,
