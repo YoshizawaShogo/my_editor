@@ -5949,7 +5949,7 @@ fn bracketed_multiline_paste_is_inserted_literally_and_normalizes_line_endings()
 }
 
 #[test]
-fn a_quote_after_an_angle_bracket_in_rust_opens_a_lifetime_alone() {
+fn a_quote_beginning_a_rust_lifetime_comes_without_its_closing_half() {
     let typed = |path: &str, text: &str| {
         let mut editor = Editor::default();
         editor.open_paths([PathBuf::from(path)]);
@@ -5962,8 +5962,17 @@ fn a_quote_after_an_angle_bracket_in_rust_opens_a_lifetime_alone() {
     };
 
     assert_eq!(typed("main.rs", "impl<"), "impl<'|");
-    // A char literal still gets its closing quote, and only Rust has lifetimes.
+    assert_eq!(typed("main.rs", "fn f(s: &"), "fn f(s: &'|");
+    assert_eq!(typed("main.rs", "struct S<'a, "), "struct S<'a, '|");
+    assert_eq!(
+        typed("main.rs", "fn f<T: Fn() -> u8, "),
+        "fn f<T: Fn() -> u8, '|"
+    );
+    // A char literal still gets its closing quote — a comma in a call's
+    // arguments, even inside generics — and only Rust has lifetimes.
     assert_eq!(typed("main.rs", "let c = "), "let c = '|'");
+    assert_eq!(typed("main.rs", "f::<u8>(a, "), "f::<u8>(a, '|'");
+    assert_eq!(typed("main.rs", "if a < b { f(a, "), "if a < b { f(a, '|'");
     assert_eq!(typed("notes.txt", "a<"), "a<'|'");
 }
 

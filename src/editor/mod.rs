@@ -2431,15 +2431,25 @@ impl Editor {
         declaration.starts_with("use ") && after.trim().is_empty()
     }
 
-    /// Whether the primary caret sits right after a `<` in Rust, where a quote
-    /// can only begin a lifetime.
-    fn caret_opens_rust_generics(&self) -> bool {
-        let rust = self
-            .layout
-            .active_editor(self.focus)
-            .and_then(|pane| self.documents.get(&pane.view.doc))
-            .is_some_and(|document| document.language.as_deref() == Some("rust"));
-        rust && self.char_before_caret(1) == Some('<')
+    /// Whether a quote typed at the primary caret in Rust begins a lifetime
+    /// rather than a char literal (see [`begins_a_lifetime`]).
+    fn caret_begins_rust_lifetime(&self) -> bool {
+        let Some(pane) = self.layout.active_editor(self.focus) else {
+            return false;
+        };
+        let Some(document) = self.documents.get(&pane.view.doc) else {
+            return false;
+        };
+        let Some(editable) = document.editable_opt() else {
+            return false;
+        };
+        if document.language.as_deref() != Some("rust") {
+            return false;
+        }
+        let text = editable.text();
+        let head = pane.view.selections.primary().head.0.min(text.len_chars());
+        let line_start = text.line_to_char(text.char_to_line(head));
+        begins_a_lifetime(&text.slice(line_start..head).to_string())
     }
 
     /// The character `back` places before the primary caret in the active
@@ -4207,8 +4217,8 @@ impl Editor {
                 // line still needs its `;` — closing it here saves going back.
                 let closing_text = if character == '{' && self.caret_ends_a_use_line() {
                     "};".to_owned()
-                } else if character == '\'' && self.caret_opens_rust_generics() {
-                    // `<'` begins a lifetime, which has no closing quote.
+                } else if character == '\'' && self.caret_begins_rust_lifetime() {
+                    // A lifetime has no closing quote.
                     String::new()
                 } else {
                     closing.to_string()
@@ -7144,6 +7154,39 @@ fn snippet_candidates(language: &str, prefix: &str) -> Vec<CompletionCandidate> 
 
 /// The whole word the caret sits on or immediately after, or None when the caret
 /// is not touching a word. Used as the ctags lookup symbol.
+/// Whether a quote typed after `before` (the line up to the caret) begins a
+/// Rust lifetime: right after `<` or `&` — `impl<'a>`, `&'a str` — or after a
+/// comma inside `<…>`, as in `<'a, 'b>`. A comma inside a call's `(…)` is a
+/// char literal's place, `f(a, 'x')`, so it is the innermost bracket still open
+/// that decides.
+fn begins_a_lifetime(before: &str) -> bool {
+    match before.trim_end().chars().next_back() {
+        Some('<' | '&') => true,
+        Some(',') => {
+            let mut open = Vec::new();
+            let mut previous = None;
+            for character in before.chars() {
+                match character {
+                    '<' | '(' | '[' | '{' => open.push(character),
+                    // `->` and `=>` close nothing.
+                    '>' if !matches!(previous, Some('-' | '=')) => {
+                        if open.last() == Some(&'<') {
+                            open.pop();
+                        }
+                    }
+                    ')' | ']' | '}' => {
+                        open.pop();
+                    }
+                    _ => {}
+                }
+                previous = Some(character);
+            }
+            open.last() == Some(&'<')
+        }
+        _ => false,
+    }
+}
+
 fn word_at(text: &ropey::Rope, caret: CharIdx) -> Option<String> {
     let len = text.len_chars();
     let cursor = caret.0.min(len);
