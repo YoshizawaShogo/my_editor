@@ -1775,9 +1775,14 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
                 .min(buffer.text.len_chars()),
         )
     });
+    // Hints are not underlined: they are the server's asides, not problems, and
+    // some span far more than they are about — rust-analyzer's "not included in
+    // the module tree" covers the whole file. The gutter mark and the message at
+    // the end of the line are as loud as an aside needs to be.
     let diagnostic_ranges = buffer
         .diagnostics
         .iter()
+        .filter(|diagnostic| diagnostic.severity != crate::lsp::DiagnosticSeverity::Hint)
         .filter(|diagnostic| Some(diagnostic_line(buffer.text, diagnostic)) != editing_line)
         .map(|diagnostic| {
             (
@@ -1857,31 +1862,25 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
             let next_col = display_col_after(display_col, character, buffer.tab_size);
             let index = line_start + char_col;
             let byte = buffer.text.char_to_byte(index);
+            let semantic = buffer
+                .semantic_spans
+                .iter()
+                .find(|span| span.start.0 <= index && index < span.end.0)
+                .map(|span| span.token_kind.as_str());
+            let syntax = buffer
+                .syntax_spans
+                .iter()
+                .rev()
+                .find(|span| span.start_byte <= byte && byte < span.end_byte)
+                .map(|span| span.kind.as_str());
             let style = if selections
                 .iter()
                 .any(|selection| selection.contains(&index))
             {
                 Style::default().fg(FG).bg(SELECTION)
             } else {
-                let semantic = buffer
-                    .semantic_spans
-                    .iter()
-                    .find(|span| span.start.0 <= index && index < span.end.0)
-                    .map(|span| span.token_kind.as_str());
                 let mut style = Style::default()
-                    .fg(semantic.map_or_else(
-                        || {
-                            highlight_color(
-                                buffer
-                                    .syntax_spans
-                                    .iter()
-                                    .rev()
-                                    .find(|span| span.start_byte <= byte && byte < span.end_byte)
-                                    .map(|span| span.kind.as_str()),
-                            )
-                        },
-                        semantic_color,
-                    ))
+                    .fg(semantic.map_or_else(|| highlight_color(syntax), semantic_color))
                     .bg(
                         if occurrence_ranges
                             .iter()
@@ -1922,7 +1921,13 @@ fn draw_buffer(frame: &mut Frame<'_>, area: Rect, buffer: &ActiveBuffer<'_>, foc
                     blank_cell(display_col, leading, trailing, buffer.tab_size, style);
                 push_cell(&mut rows, display_col / text_width, glyph, cell);
             } else {
-                let style = if confusable_with_ascii(character) {
+                // Prose is written with an IME on, where ー and full-width
+                // punctuation are the right characters; only code is flagged.
+                let prose = [semantic, syntax]
+                    .into_iter()
+                    .flatten()
+                    .any(|kind| kind.contains("comment") || kind.contains("string"));
+                let style = if confusable_with_ascii(character) && !prose {
                     style.bg(CONFUSABLE_BG)
                 } else {
                     style
@@ -3844,6 +3849,92 @@ mod tests {
         );
         terminal.draw(|frame| draw(frame, &editor)).unwrap();
         assert!(underlined(&terminal, 0));
+    }
+
+    #[test]
+    fn hints_are_not_underlined_but_problems_inside_them_are() {
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        let path = std::path::PathBuf::from("/tmp/hint.rs");
+        editor.open_paths([path.clone()]);
+        editor.update(crate::editor::AppEvent::Io(
+            crate::editor::IoEvent::FileLoaded {
+                id: crate::document::DocumentId(1),
+                result: Ok("first\nsecond\nthird".to_owned()),
+            },
+        ));
+        let diagnostic = |line, end_line, end_character, severity| crate::lsp::Diagnostic {
+            line,
+            character: 0,
+            end_line,
+            end_character,
+            severity,
+            message: String::new(),
+        };
+        editor.update(crate::editor::AppEvent::Lsp(
+            crate::lsp::LspEvent::Diagnostics {
+                uri: format!("file://{}", path.display()),
+                // rust-analyzer's "not included in the module tree" is a hint
+                // over the whole file.
+                diagnostics: vec![
+                    diagnostic(0, 2, 5, crate::lsp::DiagnosticSeverity::Hint),
+                    diagnostic(1, 1, 6, crate::lsp::DiagnosticSeverity::Warning),
+                ],
+            },
+        ));
+        // Off both diagnostics' first lines, so neither is held back as the line
+        // being typed on.
+        for _ in 0..2 {
+            editor.update(
+                crate::editor::Command::Move {
+                    direction: crate::editor::Direction::Down,
+                    unit: crate::editor::Unit::Line,
+                    extend: false,
+                }
+                .into(),
+            );
+        }
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let underlined = |row: u16| {
+            (0..40).find(|column| {
+                buffer[(*column, row)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+            })
+        };
+        assert_eq!(underlined(0), None);
+        let column = underlined(1).expect("the warning is underlined");
+        assert_eq!(
+            buffer[(column, 1)].underline_color,
+            diagnostic_color(crate::lsp::DiagnosticSeverity::Warning)
+        );
+    }
+
+    #[test]
+    fn look_alikes_are_flagged_in_code_but_not_in_comments() {
+        let backend = TestBackend::new(30, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut editor = Editor::default();
+        editor.open_paths([std::path::PathBuf::from("/tmp/prose.rs")]);
+        editor.update(crate::editor::AppEvent::Io(
+            crate::editor::IoEvent::FileLoaded {
+                id: crate::document::DocumentId(1),
+                result: Ok("// トークン\nlet a = 1ー2;".to_owned()),
+            },
+        ));
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let dash = |row: u16| {
+            (0..30)
+                .find(|column| buffer[(*column, row)].symbol() == "ー")
+                .map(|column| buffer[(column, row)].bg)
+        };
+        assert_ne!(dash(0), Some(CONFUSABLE_BG));
+        assert_eq!(dash(1), Some(CONFUSABLE_BG));
     }
 
     #[test]
