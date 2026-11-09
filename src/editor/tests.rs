@@ -6068,6 +6068,40 @@ fn a_closure_gets_both_of_its_pipes() {
 }
 
 #[test]
+fn the_equals_of_a_let_comes_with_its_semicolon() {
+    let typed = |path: &str, before: &str, keys: &str| {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from(path)]);
+        editor.update(AppEvent::TextPaste(before.to_owned()));
+        for character in keys.chars() {
+            editor.update(AppEvent::TextInput(character));
+        }
+        let buffer = editor.active_buffer().unwrap();
+        let caret = buffer.view.selections.primary().head.0;
+        let text = buffer.text.to_string();
+        format!("{}|{}", &text[..caret], &text[caret..])
+    };
+
+    assert_eq!(typed("main.rs", "    let x ", "="), "    let x =|;");
+    // The value is typed in front of it — brackets and quotes still close —
+    // and a `;` typed by habit steps over it.
+    assert_eq!(
+        typed("main.rs", "let v: Vec<u8> ", "= vec![1];"),
+        "let v: Vec<u8> = vec![1];|"
+    );
+    assert_eq!(typed("main.rs", "let s ", "= \"a"), "let s = \"a|\";");
+
+    // Conditions take no `;`, a second `=` is a comparison, and only Rust
+    // has this `let`.
+    assert_eq!(
+        typed("main.rs", "if let Some(x) ", "="),
+        "if let Some(x) =|"
+    );
+    assert_eq!(typed("main.rs", "let b = a ", "=="), "let b = a ==|");
+    assert_eq!(typed("notes.txt", "let x ", "="), "let x =|");
+}
+
+#[test]
 fn the_braces_of_a_use_line_come_with_its_semicolon() {
     let typed = |path: &str, text: &str| {
         let mut editor = Editor::default();

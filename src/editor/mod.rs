@@ -2442,6 +2442,20 @@ impl Editor {
         declaration.starts_with("use ") && after.trim().is_empty()
     }
 
+    /// Whether a lone caret sits at the end of a Rust `let` that has no `=` yet
+    /// — `let x`, `let mut v: Vec<u8>` — so the `=` typed there begins its
+    /// value. `if let` and `while let` take no `;`, and start otherwise.
+    fn caret_starts_a_let_value(&self) -> bool {
+        let lone_caret = self.layout.active_editor(self.focus).is_some_and(|pane| {
+            pane.view.selections.len() == 1 && pane.view.selections.primary().is_caret()
+        });
+        lone_caret
+            && self.rest_of_caret_line().trim().is_empty()
+            && self.rust_line_before_caret().is_some_and(|before| {
+                before.trim_start().starts_with("let ") && !before.contains('=')
+            })
+    }
+
     /// The primary caret's line up to the caret, when the active buffer is
     /// Rust: what decides whether a `'` or `|` typed there opens something.
     fn rust_line_before_caret(&self) -> Option<String> {
@@ -4289,6 +4303,14 @@ impl Editor {
                         .insert_pair(&mut view.selections, '|', closing, at);
                 });
             }
+            // A `let` line ends in a `;` that is easy to forget once its value
+            // is typed: it comes with the `=`, and the habit of typing it
+            // anyway steps over it (see `;` above).
+            '=' if self.caret_starts_a_let_value() => self.edit_active(|document, view| {
+                document
+                    .editable_mut()
+                    .insert_pair(&mut view.selections, '=', ";", at);
+            }),
             '}' => self.edit_active(|document, view| {
                 if !document
                     .editable_mut()

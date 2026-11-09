@@ -170,14 +170,15 @@ impl Editable {
 
     /// Whether a freshly typed opening bracket/quote at `at` should also drop its
     /// closing half. Mirrors VS Code: only when nothing presses right after the
-    /// caret — end of the text or line, whitespace, or a closing bracket. A
-    /// regular character following inserts the single opening character alone.
+    /// caret — end of the text or line, whitespace, a closing bracket, or the
+    /// `;` that ends the statement (`let x = ` brings one along). A regular
+    /// character following inserts the single opening character alone.
     fn should_auto_close(&self, at: usize) -> bool {
         if at >= self.text.len_chars() {
             return true;
         }
         let next = self.text.char(at);
-        next.is_whitespace() || matches!(next, ')' | ']' | '}')
+        next.is_whitespace() || matches!(next, ')' | ']' | '}' | ';')
     }
 
     pub fn skip_closing_character(&self, selections: &mut Selections, closing: char) -> bool {
