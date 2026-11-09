@@ -208,6 +208,9 @@ fn translate_key(key: KeyEvent, at: Instant, focus: &Focus) -> Option<AppEvent> 
         ),
         KeyCode::Esc => Some(Command::CollapseSelections.into()),
         KeyCode::Enter => Some(Command::InsertNewline.into()),
+        // A terminal sends Shift+Tab as a key of its own (`ESC [ Z`), which
+        // crossterm reports as BackTab rather than as Tab with Shift held.
+        KeyCode::BackTab => Some(Command::Outdent.into()),
         KeyCode::Tab if shift => Some(Command::Outdent.into()),
         KeyCode::Tab => Some(Command::Indent.into()),
         KeyCode::Backspace => Some(Command::DeleteBackward.into()),
@@ -437,6 +440,18 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn shift_tab_outdents() {
+        // What crossterm makes of the `ESC [ Z` a terminal sends for Shift+Tab.
+        let raw = raw_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        let mut pending = KeyChordState::default();
+
+        assert_eq!(
+            translate(raw, &Focus::Editor(Side::Left), &mut pending),
+            Some(Command::Outdent.into())
+        );
     }
 
     #[test]
