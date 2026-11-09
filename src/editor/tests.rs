@@ -5949,6 +5949,25 @@ fn bracketed_multiline_paste_is_inserted_literally_and_normalizes_line_endings()
 }
 
 #[test]
+fn a_quote_after_an_angle_bracket_in_rust_opens_a_lifetime_alone() {
+    let typed = |path: &str, text: &str| {
+        let mut editor = Editor::default();
+        editor.open_paths([PathBuf::from(path)]);
+        editor.update(AppEvent::TextPaste(text.to_owned()));
+        editor.update(AppEvent::TextInput('\''));
+        let buffer = editor.active_buffer().unwrap();
+        let caret = buffer.view.selections.primary().head.0;
+        let text = buffer.text.to_string();
+        format!("{}|{}", &text[..caret], &text[caret..])
+    };
+
+    assert_eq!(typed("main.rs", "impl<"), "impl<'|");
+    // A char literal still gets its closing quote, and only Rust has lifetimes.
+    assert_eq!(typed("main.rs", "let c = "), "let c = '|'");
+    assert_eq!(typed("notes.txt", "a<"), "a<'|'");
+}
+
+#[test]
 fn the_braces_of_a_use_line_come_with_its_semicolon() {
     let typed = |path: &str, text: &str| {
         let mut editor = Editor::default();

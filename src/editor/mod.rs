@@ -2431,6 +2431,17 @@ impl Editor {
         declaration.starts_with("use ") && after.trim().is_empty()
     }
 
+    /// Whether the primary caret sits right after a `<` in Rust, where a quote
+    /// can only begin a lifetime.
+    fn caret_opens_rust_generics(&self) -> bool {
+        let rust = self
+            .layout
+            .active_editor(self.focus)
+            .and_then(|pane| self.documents.get(&pane.view.doc))
+            .is_some_and(|document| document.language.as_deref() == Some("rust"));
+        rust && self.char_before_caret(1) == Some('<')
+    }
+
     /// The character `back` places before the primary caret in the active
     /// buffer: 1 is the one just typed.
     fn char_before_caret(&self, back: usize) -> Option<char> {
@@ -4196,6 +4207,9 @@ impl Editor {
                 // line still needs its `;` — closing it here saves going back.
                 let closing_text = if character == '{' && self.caret_ends_a_use_line() {
                     "};".to_owned()
+                } else if character == '\'' && self.caret_opens_rust_generics() {
+                    // `<'` begins a lifetime, which has no closing quote.
+                    String::new()
                 } else {
                     closing.to_string()
                 };
