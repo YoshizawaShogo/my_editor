@@ -7132,15 +7132,24 @@ impl Editor {
 
 /// Completion candidates for the language's snippets whose prefix starts with
 /// what has been typed. Empty when nothing is typed or the language has none.
+/// Smart case, as for buffer words: a typed capital is meant, so `Fn` in
+/// `impl Fn` asks for the trait, not for the `fn` snippet.
 fn snippet_candidates(language: &str, prefix: &str) -> Vec<CompletionCandidate> {
     if prefix.is_empty() {
         return Vec::new();
     }
+    let typed_a_capital = prefix.chars().any(char::is_uppercase);
     let prefix_lower = prefix.to_lowercase();
     let prefix_len = prefix.chars().count();
     crate::snippet::snippets_for(language)
         .iter()
-        .filter(|snippet| snippet.prefix.to_lowercase().starts_with(&prefix_lower))
+        .filter(|snippet| {
+            if typed_a_capital {
+                snippet.prefix.starts_with(prefix)
+            } else {
+                snippet.prefix.to_lowercase().starts_with(&prefix_lower)
+            }
+        })
         .map(|snippet| CompletionCandidate {
             label: format!("{}  (snippet)", snippet.prefix),
             insert: String::new(),

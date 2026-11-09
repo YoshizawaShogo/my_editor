@@ -5598,6 +5598,20 @@ fn the_shorter_candidate_wins_a_tie_so_typing_on_can_still_reach_it() {
 }
 
 #[test]
+fn a_typed_capital_does_not_reach_a_lower_case_snippet() {
+    let mut editor = editor_with_lsp();
+    editor.update(AppEvent::TextPaste("impl F".to_owned()));
+    complete_with(
+        &mut editor,
+        serde_json::json!([{"label": "Fn", "kind": 8, "insertText": "Fn"}]),
+    );
+
+    // Heading for the `Fn` trait; the `fn` snippet is a different word.
+    let view = editor.completion_view().expect("completion popup");
+    assert_eq!(view.items, vec!["Fn".to_owned()]);
+}
+
+#[test]
 fn a_snippet_completion_expands_its_placeholder() {
     let mut editor = editor_with_lsp();
     editor.update(AppEvent::TextPaste("wi".to_owned()));
