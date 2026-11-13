@@ -40,8 +40,8 @@ impl super::Editor {
 
     /// Expand a chosen snippet: drop the `prefix_len` characters already typed,
     /// insert the expanded body, and select its first tab stop (or land the caret
-    /// at the end) so typing overwrites the placeholder. When the snippet has more
-    /// than one stop, a session is started so Tab/Shift+Tab walk the rest.
+    /// at the end) so typing overwrites the placeholder. When the snippet has
+    /// stops, a session is started so Tab/Shift+Tab walk them.
     pub(super) fn expand_snippet_body(&mut self, body: &str, prefix_len: usize) {
         let expansion = crate::snippet::expand(body, &self.caret_line_indent());
         let text = expansion.text;
@@ -68,9 +68,11 @@ impl super::Editor {
                 Some(stop) => (stop.start, stop.end),
                 None => (start + text_len, start + text_len),
             };
-            // More than one stop: remember them on the document so Tab can walk
-            // them and edits keep them aligned. A single stop needs no session.
-            if absolute.len() >= 2 {
+            // Remember the stops on the document so Tab can walk them and edits
+            // keep them aligned. Even a single one: its placeholder is typed over
+            // rather than wrapped (see `snippet_placeholder_selected`), and with
+            // nowhere to walk to, Tab and Shift+Tab fall through to indenting.
+            if !absolute.is_empty() {
                 document.editable_mut().set_snippet_stops(absolute);
             } else {
                 document.editable_mut().clear_snippet_stops();
@@ -86,7 +88,7 @@ impl super::Editor {
                 self.documents
                     .get(doc)
                     .and_then(Document::editable_opt)
-                    .is_some_and(|editable| editable.snippet_stops().len() >= 2)
+                    .is_some_and(|editable| !editable.snippet_stops().is_empty())
             })
             .map(|doc| SnippetSession { doc, current: 0 });
     }
@@ -157,6 +159,26 @@ impl super::Editor {
         self.ensure_cursor_visible();
         self.dirty = true;
         true
+    }
+
+    /// Whether the selection is the current stop's placeholder, still as the
+    /// snippet put it: text to type over, not a selection to wrap in brackets.
+    pub(super) fn snippet_placeholder_selected(&self) -> bool {
+        let Some(session) = &self.snippet_session else {
+            return false;
+        };
+        let Some(pane) = self.layout.active_editor(self.focus) else {
+            return false;
+        };
+        let selection = pane.view.selections.primary();
+        pane.view.doc == session.doc
+            && !selection.is_caret()
+            && self
+                .documents
+                .get(&session.doc)
+                .and_then(Document::editable_opt)
+                .and_then(|editable| editable.snippet_stops().get(session.current).cloned())
+                .is_some_and(|stop| stop == selection.range())
     }
 
     /// End the session once the caret leaves the snippet. The stops travel with

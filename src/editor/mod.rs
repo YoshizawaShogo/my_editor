@@ -4241,6 +4241,10 @@ impl Editor {
                 // bracket is not: `[` inside `[]` is a pair of its own, and
                 // stepping over the `]` left no way to nest one.
                 let quote = closing == character;
+                // A placeholder the snippet selected is there to be typed over:
+                // `"` on `${1:target}` starts a string in its place rather than
+                // quoting the word `target`.
+                let replace_placeholder = self.snippet_placeholder_selected();
                 // The braces of a `use` are the last thing on its line, and the
                 // line still needs its `;` — closing it here saves going back.
                 let closing_text = if character == '{' && self.caret_ends_a_use_line() {
@@ -4262,6 +4266,16 @@ impl Editor {
                             .skip_closing_character(&mut view.selections, closing)
                     {
                         return;
+                    }
+                    if replace_placeholder {
+                        match at {
+                            Some(at) => {
+                                document
+                                    .editable_mut()
+                                    .insert_timed(&mut view.selections, "", at)
+                            }
+                            None => document.editable_mut().insert(&mut view.selections, ""),
+                        }
                     }
                     document.editable_mut().insert_pair(
                         &mut view.selections,
