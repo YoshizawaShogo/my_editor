@@ -234,6 +234,7 @@ impl Editable {
         &mut self,
         selections: &mut Selections,
         line_comment: Option<&str>,
+        statements_end_in_semicolons: bool,
         tab_size: usize,
         insert_spaces: bool,
     ) {
@@ -286,7 +287,37 @@ impl Editable {
                         .trim_end_matches([' ', '\t'])
                         .ends_with(['(', '[', '{']);
                 if opens_block {
-                    (format!("\n{indentation}{unit}"), 0)
+                    return (format!("\n{indentation}{unit}"), 0);
+                }
+                if in_comment || !statements_end_in_semicolons {
+                    return (format!("\n{indentation}"), 0);
+                }
+                // A statement broken over lines — `self` with its `.method()` to
+                // come, `let x =`, `A =>` — continues one level deeper, as
+                // rustfmt sets it. Only from its first line: the lines after
+                // that are a level deep already, and stay there.
+                let content = prefix.trim();
+                let continuing = content.starts_with(['.', '?'])
+                    || content.starts_with("&&")
+                    || content.starts_with("||")
+                    || (0..line)
+                        .rev()
+                        .map(|above| self.text.line(above).to_string())
+                        .find(|above| !above.trim().is_empty())
+                        .is_some_and(|above| leaves_a_statement_open(&above));
+                if leaves_a_statement_open(&prefix) {
+                    if continuing {
+                        (format!("\n{indentation}"), 0)
+                    } else {
+                        (format!("\n{indentation}{unit}"), 0)
+                    }
+                } else if content.starts_with('.') && content.ends_with(';') {
+                    // The `;` closing a method chain returns to the level the
+                    // chain's statement began at.
+                    let outer = indentation
+                        .strip_suffix(unit.as_str())
+                        .unwrap_or(&indentation);
+                    (format!("\n{outer}"), 0)
                 } else {
                     (format!("\n{indentation}"), 0)
                 }
@@ -854,6 +885,18 @@ impl Editable {
     }
 }
 
+/// Whether `line` stops partway through a statement: it has code, and that
+/// code ends in neither the `;` or `,` that finishes it nor a brace. Lines
+/// that open a bracket are left to the block indent; comments and attributes
+/// finish nothing to begin with.
+fn leaves_a_statement_open(line: &str) -> bool {
+    let content = line.trim();
+    !content.is_empty()
+        && !content.starts_with("//")
+        && !content.starts_with('#')
+        && !content.ends_with([';', ',', '{', '}', '(', '['])
+}
+
 fn normalized_indentation(indentation: &str, tab_size: usize, insert_spaces: bool) -> String {
     if !insert_spaces {
         return indentation.to_owned();
@@ -980,7 +1023,7 @@ mod tests {
         let mut editable = Editable::new("    value");
         let mut selections = Selections::single(Selection::caret(CharIdx(9)));
 
-        editable.insert_newline(&mut selections, None, 4, true);
+        editable.insert_newline(&mut selections, None, false, 4, true);
 
         assert_eq!(editable.text().to_string(), "    value\n    ");
         assert_eq!(selections.primary().head, CharIdx(14));
@@ -999,7 +1042,7 @@ mod tests {
         let mut editable = Editable::new("    value");
         let mut selections = Selections::single(Selection::caret(CharIdx(2)));
 
-        editable.insert_newline(&mut selections, None, 4, true);
+        editable.insert_newline(&mut selections, None, false, 4, true);
 
         assert_eq!(editable.text().to_string(), "  \n    value");
         assert_eq!(selections.primary().head, CharIdx(5));
@@ -1009,7 +1052,7 @@ mod tests {
     fn newline_after_a_comment_does_not_continue_it() {
         let mut editable = Editable::new("    /// docs");
         let mut selections = Selections::single(Selection::caret(CharIdx(12)));
-        editable.insert_newline(&mut selections, Some("//"), 4, true);
+        editable.insert_newline(&mut selections, Some("//"), false, 4, true);
         assert_eq!(editable.text().to_string(), "    /// docs\n    ");
     }
 
@@ -1262,7 +1305,7 @@ mod tests {
             let mut editable = Editable::new(&format!("    call{opening}{closing}"));
             let mut selections = Selections::single(Selection::caret(CharIdx(9)));
 
-            editable.insert_newline(&mut selections, None, 4, true);
+            editable.insert_newline(&mut selections, None, false, 4, true);
 
             assert_eq!(
                 editable.text().to_string(),
@@ -1278,12 +1321,42 @@ mod tests {
     }
 
     #[test]
+    fn a_statement_broken_over_lines_continues_one_level_deeper() {
+        // Each line typed, then Enter: the indentation the next one starts at.
+        let typed = |lines: &[&str]| {
+            let mut editable = Editable::new("");
+            let mut selections = Selections::single(Selection::caret(CharIdx(0)));
+            for line in lines {
+                editable.insert(&mut selections, line.trim_start());
+                editable.insert_newline(&mut selections, Some("//"), true, 4, true);
+            }
+            let text = editable.text().to_string();
+            text.rsplit('\n').next().unwrap().len()
+        };
+
+        // `self` with its method still to come.
+        assert_eq!(typed(&["    self"]), 4);
+        // The chain stays at its level, and the `;` ending it returns.
+        assert_eq!(typed(&["self", ".go()"]), 4);
+        assert_eq!(typed(&["self", ".go()", ".done();"]), 0);
+        // `let x =` and a match arm's `=>` take their value on the next line.
+        assert_eq!(typed(&["let x ="]), 4);
+        assert_eq!(typed(&["let x =", "value"]), 4);
+        assert_eq!(typed(&["A =>"]), 4);
+        // Finished lines, comments and attributes keep the level.
+        assert_eq!(typed(&["let x = 1;"]), 0);
+        assert_eq!(typed(&["a: 1,"]), 0);
+        assert_eq!(typed(&["// self"]), 0);
+        assert_eq!(typed(&["#[derive(Debug)]"]), 0);
+    }
+
+    #[test]
     fn newline_after_an_opening_bracket_indents_one_level_deeper() {
         // The closing brace is not right after the caret (it is further down, or
         // not typed yet), so this is not the empty-bracket case.
         let mut editable = Editable::new("    if ready {\n    }");
         let mut selections = Selections::single(Selection::caret(CharIdx(14)));
-        editable.insert_newline(&mut selections, None, 4, true);
+        editable.insert_newline(&mut selections, None, false, 4, true);
         assert_eq!(
             editable.text().to_string(),
             "    if ready {\n        \n    }"
@@ -1295,13 +1368,13 @@ mod tests {
         let text = "\tif {$x > 0} {  ";
         let mut editable = Editable::new(text);
         let mut selections = Selections::single(Selection::caret(CharIdx(text.len())));
-        editable.insert_newline(&mut selections, Some("#"), 4, false);
+        editable.insert_newline(&mut selections, Some("#"), false, 4, false);
         assert_eq!(editable.text().to_string(), format!("{text}\n\t\t"));
 
         // A comment that happens to end in a brace opens no block.
         let mut editable = Editable::new("    // if ready {");
         let mut selections = Selections::single(Selection::caret(CharIdx(17)));
-        editable.insert_newline(&mut selections, Some("//"), 4, true);
+        editable.insert_newline(&mut selections, Some("//"), false, 4, true);
         assert_eq!(editable.text().to_string(), "    // if ready {\n    ");
     }
 }

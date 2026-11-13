@@ -1968,6 +1968,13 @@ impl Editor {
                                 typed_a_whole_word = true;
                                 return None;
                             }
+                            // `self::`, `crate::`: a path's head with its
+                            // separator. The separator is quicker typed than
+                            // picked, and offered it takes the Enter or Tab
+                            // meant for the bare word.
+                            if insert.ends_with("::") || insert.ends_with('.') {
+                                return None;
+                            }
                             let cursor_back = usize::from(
                                 !snippet
                                     && callable
@@ -3606,9 +3613,13 @@ impl Editor {
                     })
                     .and_then(|config| config.line_comment.clone());
                 self.edit_active(|document, view| {
+                    // Rust ends its statements with `;`, so a line without one
+                    // is a statement still going.
+                    let statements_end_in_semicolons = document.language.as_deref() == Some("rust");
                     document.editable_mut().insert_newline(
                         &mut view.selections,
                         line_comment.as_deref(),
+                        statements_end_in_semicolons,
                         tab_size,
                         insert_spaces,
                     );

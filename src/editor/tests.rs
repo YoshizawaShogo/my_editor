@@ -5247,20 +5247,27 @@ fn a_word_typed_in_full_leaves_enter_for_a_new_line() {
     complete_automatically_with(&mut editor, items.clone());
     assert!(editor.completion_view().is_some());
 
+    // `self::` is never offered: `::` is quicker typed than picked.
+    let view = editor.completion_view().expect("completion popup");
+    assert!(!view.items.iter().any(|item| item.ends_with("::")));
+
     // Typing the last letter makes the word whole: the popup goes, and Enter
-    // breaks the line, ready for `.method()` on the next one.
+    // breaks the line, one level in for the `.method()` to come.
     editor.update(AppEvent::TextInput('f'));
     complete_automatically_with(&mut editor, items.clone());
     assert!(editor.completion_view().is_none());
     editor.update(Command::InsertNewline.into());
-    assert_eq!(editor.active_buffer().unwrap().text.to_string(), "self\n");
+    assert_eq!(
+        editor.active_buffer().unwrap().text.to_string(),
+        "self\n    "
+    );
 
-    // Asked for, the longer words are still there.
+    // Asked for, the other words are still there.
     let mut editor = editor_with_lsp();
     editor.update(AppEvent::TextPaste("self".to_owned()));
     complete_with(&mut editor, items);
     let view = editor.completion_view().expect("completion popup");
-    assert!(view.items.iter().any(|item| item == "self::"));
+    assert_eq!(view.items, vec!["Self".to_owned()]);
 }
 
 #[test]
