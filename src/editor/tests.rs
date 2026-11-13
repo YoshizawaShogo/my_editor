@@ -6075,7 +6075,7 @@ fn a_closure_gets_both_of_its_pipes() {
 }
 
 #[test]
-fn the_equals_of_a_let_or_type_comes_with_its_semicolon() {
+fn the_equals_of_a_value_item_comes_with_its_semicolon() {
     let typed = |path: &str, before: &str, keys: &str| {
         let mut editor = Editor::default();
         editor.open_paths([PathBuf::from(path)]);
@@ -6097,7 +6097,21 @@ fn the_equals_of_a_let_or_type_comes_with_its_semicolon() {
         "let v: Vec<u8> = vec![1];|"
     );
     assert_eq!(typed("main.rs", "let s ", "= \"a"), "let s = \"a|\";");
-    // A type alias ends the same way, whatever its visibility.
+    // So do a constant and a static, whatever their visibility…
+    assert_eq!(
+        typed("main.rs", "const MAX: usize ", "="),
+        "const MAX: usize =|;"
+    );
+    assert_eq!(
+        typed("main.rs", "pub static mut COUNT: u32 ", "= 0;"),
+        "pub static mut COUNT: u32 = 0;|"
+    );
+    // …but not a `const fn`, whose `=` is a comparison in its body.
+    assert_eq!(
+        typed("main.rs", "const fn one(a: u8) -> bool { a ", "="),
+        "const fn one(a: u8) -> bool { a =|"
+    );
+    // A type alias ends the same way.
     assert_eq!(typed("main.rs", "type Id ", "="), "type Id =|;");
     assert_eq!(
         typed("main.rs", "pub(crate) type Map<K> ", "= HashMap<K, u8>;"),

@@ -2438,10 +2438,11 @@ impl Editor {
         without_visibility(&before).starts_with("use ") && after.trim().is_empty()
     }
 
-    /// Whether a lone caret sits at the end of a Rust `let` or `type` that has
-    /// no `=` yet — `let mut v: Vec<u8>`, `pub type Id` — so the `=` typed
-    /// there begins what the statement ends with `;`. `if let` and `while let`
-    /// take no `;`, and start otherwise.
+    /// Whether a lone caret sits at the end of a Rust `let`, `type`, `const` or
+    /// `static` that has no `=` yet — `let mut v: Vec<u8>`, `pub type Id`,
+    /// `const MAX: usize` — so the `=` typed there begins what the statement
+    /// ends with `;`. `if let` and `while let` take no `;`, and start
+    /// otherwise; a `const fn` has a body, not a value.
     fn caret_starts_a_let_value(&self) -> bool {
         let lone_caret = self.layout.active_editor(self.focus).is_some_and(|pane| {
             pane.view.selections.len() == 1 && pane.view.selections.primary().is_caret()
@@ -2449,9 +2450,15 @@ impl Editor {
         lone_caret
             && self.rest_of_caret_line().trim().is_empty()
             && self.rust_line_before_caret().is_some_and(|before| {
-                let declaration = without_visibility(&before);
-                (declaration.starts_with("let ") || declaration.starts_with("type "))
-                    && !before.contains('=')
+                let mut words = without_visibility(&before).split_whitespace();
+                let item = match words.next() {
+                    Some("let" | "type") => true,
+                    Some("const" | "static") => {
+                        !matches!(words.next(), Some("fn" | "unsafe" | "async" | "extern"))
+                    }
+                    _ => false,
+                };
+                item && !before.contains('=')
             })
     }
 
