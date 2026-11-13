@@ -6075,7 +6075,7 @@ fn a_closure_gets_both_of_its_pipes() {
 }
 
 #[test]
-fn the_equals_of_a_let_comes_with_its_semicolon() {
+fn the_equals_of_a_let_or_type_comes_with_its_semicolon() {
     let typed = |path: &str, before: &str, keys: &str| {
         let mut editor = Editor::default();
         editor.open_paths([PathBuf::from(path)]);
@@ -6097,6 +6097,12 @@ fn the_equals_of_a_let_comes_with_its_semicolon() {
         "let v: Vec<u8> = vec![1];|"
     );
     assert_eq!(typed("main.rs", "let s ", "= \"a"), "let s = \"a|\";");
+    // A type alias ends the same way, whatever its visibility.
+    assert_eq!(typed("main.rs", "type Id ", "="), "type Id =|;");
+    assert_eq!(
+        typed("main.rs", "pub(crate) type Map<K> ", "= HashMap<K, u8>;"),
+        "pub(crate) type Map<K> = HashMap<K, u8>;|"
+    );
 
     // Conditions take no `;`, a second `=` is a comparison, and only Rust
     // has this `let`.

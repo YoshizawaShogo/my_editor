@@ -2435,23 +2435,13 @@ impl Editor {
         let before = text.slice(line_start..head).to_string();
         let after = text.slice(head..line_end).to_string();
         // `use`, `pub use` and `pub(crate) use` alike.
-        let declaration = before.trim_start();
-        let declaration = match declaration.strip_prefix("pub") {
-            Some(rest) => {
-                let rest = rest.trim_start();
-                rest.strip_prefix('(')
-                    .and_then(|scoped| scoped.split_once(')'))
-                    .map_or(rest, |(_, after_scope)| after_scope)
-                    .trim_start()
-            }
-            None => declaration,
-        };
-        declaration.starts_with("use ") && after.trim().is_empty()
+        without_visibility(&before).starts_with("use ") && after.trim().is_empty()
     }
 
-    /// Whether a lone caret sits at the end of a Rust `let` that has no `=` yet
-    /// — `let x`, `let mut v: Vec<u8>` — so the `=` typed there begins its
-    /// value. `if let` and `while let` take no `;`, and start otherwise.
+    /// Whether a lone caret sits at the end of a Rust `let` or `type` that has
+    /// no `=` yet — `let mut v: Vec<u8>`, `pub type Id` — so the `=` typed
+    /// there begins what the statement ends with `;`. `if let` and `while let`
+    /// take no `;`, and start otherwise.
     fn caret_starts_a_let_value(&self) -> bool {
         let lone_caret = self.layout.active_editor(self.focus).is_some_and(|pane| {
             pane.view.selections.len() == 1 && pane.view.selections.primary().is_caret()
@@ -2459,7 +2449,9 @@ impl Editor {
         lone_caret
             && self.rest_of_caret_line().trim().is_empty()
             && self.rust_line_before_caret().is_some_and(|before| {
-                before.trim_start().starts_with("let ") && !before.contains('=')
+                let declaration = without_visibility(&before);
+                (declaration.starts_with("let ") || declaration.starts_with("type "))
+                    && !before.contains('=')
             })
     }
 
@@ -7222,6 +7214,22 @@ fn snippet_candidates(language: &str, prefix: &str) -> Vec<CompletionCandidate> 
 
 /// The whole word the caret sits on or immediately after, or None when the caret
 /// is not touching a word. Used as the ctags lookup symbol.
+/// A Rust declaration line without its leading blanks and visibility: `use`
+/// for `pub use` and `pub(crate) use` alike.
+fn without_visibility(line: &str) -> &str {
+    let declaration = line.trim_start();
+    match declaration.strip_prefix("pub") {
+        Some(rest) => {
+            let rest = rest.trim_start();
+            rest.strip_prefix('(')
+                .and_then(|scoped| scoped.split_once(')'))
+                .map_or(rest, |(_, after_scope)| after_scope)
+                .trim_start()
+        }
+        None => declaration,
+    }
+}
+
 /// Whether a `|` typed after `before` (the line up to the caret) begins a
 /// Rust closure's parameters: where an expression starts — after `(`, `,`,
 /// `=`, `=>`, `move` or `return`. After a value it is an or, `a | b`, and at
