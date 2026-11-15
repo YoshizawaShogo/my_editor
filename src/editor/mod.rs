@@ -4298,9 +4298,19 @@ impl Editor {
             // A closure's parameters sit between a pair of `|`, typed out like
             // a bracket's: the pair goes in where a closure can start, and the
             // closing one is stepped over. `||` typed in full comes out as
-            // `||` either way, so the logical or is unharmed.
+            // `||` either way, so the logical or is unharmed. A selection is
+            // wrapped wherever it is, as by a quote: turning `x` into `|x|` is
+            // what selecting it before typing `|` asks for.
             '|' if let Some(before) = self.rust_line_before_caret() => {
-                let closing = if begins_a_closure(&before) { "|" } else { "" };
+                let selected = self
+                    .layout
+                    .active_editor(self.focus)
+                    .is_some_and(|pane| !pane.view.selections.primary().is_caret());
+                let closing = if selected || begins_a_closure(&before) {
+                    "|"
+                } else {
+                    ""
+                };
                 self.edit_active(|document, view| {
                     if document
                         .editable_mut()

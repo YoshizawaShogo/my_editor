@@ -6078,6 +6078,23 @@ fn a_closure_gets_both_of_its_pipes() {
     // After a value it is an or, of either kind.
     assert_eq!(typed("main.rs", "a ", "|| b"), "a || b^");
     assert_eq!(typed("main.rs", "Some(1) ", "| None"), "Some(1) | None^");
+    // A selection is wrapped wherever it is — here, after a value, where a
+    // bare `|` would be an or — and stays selected.
+    let mut editor = Editor::default();
+    editor.open_paths([PathBuf::from("main.rs")]);
+    editor.update(AppEvent::TextPaste("a x".to_owned()));
+    editor.update(
+        Command::Move {
+            direction: Direction::Left,
+            unit: Unit::Character,
+            extend: true,
+        }
+        .into(),
+    );
+    editor.update(AppEvent::TextInput('|'));
+    let buffer = editor.active_buffer().unwrap();
+    assert_eq!(buffer.text.to_string(), "a |x|");
+    assert_eq!(buffer.view.selections.primary().range(), 3..4);
     // Only Rust's closures are written this way.
     assert_eq!(typed("notes.txt", "f(", "|"), "f(|^");
 }
