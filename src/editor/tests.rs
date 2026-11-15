@@ -5690,19 +5690,13 @@ fn a_snippet_completion_expands_its_placeholder() {
     let selection = buffer.view.selections.primary();
     assert_eq!((selection.range().start, selection.range().end), (14, 22));
 
-    // A quote or bracket too: it opens in the placeholder's place rather than
-    // wrapping the word.
+    // Quoting it first keeps it selected, so it is still typed over.
     editor.update(AppEvent::TextInput('"'));
-    let buffer = editor.active_buffer().unwrap();
-    assert_eq!(buffer.text.to_string(), "with_capacity(\"\")");
-    assert_eq!(buffer.view.selections.primary().head, CharIdx(15));
-
-    // A selection made by hand is still wrapped.
-    let mut editor = editor_with_lsp();
-    editor.update(AppEvent::TextPaste("word".to_owned()));
-    editor.update(Command::SelectAll.into());
-    editor.update(AppEvent::TextInput('"'));
-    assert_eq!(editor.active_buffer().unwrap().text.to_string(), "\"word\"");
+    editor.update(AppEvent::TextInput('a'));
+    assert_eq!(
+        editor.active_buffer().unwrap().text.to_string(),
+        "with_capacity(\"a\")"
+    );
 }
 
 #[test]

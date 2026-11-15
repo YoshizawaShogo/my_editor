@@ -160,12 +160,39 @@ impl Editable {
         }
         self.replace_ranges(
             selections,
-            targets,
+            targets.clone(),
             replacements,
             at,
             None,
             Some(cursor_backs),
         );
+        // A wrapped selection stays selected, inside its new pair, so it can be
+        // wrapped again or typed over — a completion's placeholder quoted with
+        // `"` is still there to be replaced by the string's contents.
+        let primary = selections.primary_index();
+        let kept = selections
+            .iter()
+            .zip(&targets)
+            .map(|(after, before)| {
+                if before.is_caret() {
+                    return *after;
+                }
+                let end = after.head;
+                let start = CharIdx(end.0 - before.range().len());
+                if before.head.0 < before.anchor.0 {
+                    Selection {
+                        anchor: end,
+                        head: start,
+                    }
+                } else {
+                    Selection {
+                        anchor: start,
+                        head: end,
+                    }
+                }
+            })
+            .collect();
+        *selections = Selections::from_vec(kept, primary);
     }
 
     /// Whether a freshly typed opening bracket/quote at `at` should also drop its
@@ -1224,6 +1251,25 @@ mod tests {
             assert_eq!(editable.text().to_string(), "");
             assert_eq!(selections.primary().head, CharIdx(0));
         }
+    }
+
+    #[test]
+    fn a_wrapped_selection_stays_selected_inside_the_pair() {
+        let mut editable = Editable::new("say hi");
+        let mut selections = Selections::single(Selection {
+            anchor: CharIdx(4),
+            head: CharIdx(6),
+        });
+        editable.insert_pair(&mut selections, '"', "\"", None);
+        assert_eq!(editable.text().to_string(), "say \"hi\"");
+        assert_eq!(selections.primary().range(), 5..7);
+
+        // So wrapping again wraps the same text, and typing replaces it.
+        editable.insert_pair(&mut selections, '(', ")", None);
+        assert_eq!(editable.text().to_string(), "say \"(hi)\"");
+        assert_eq!(selections.primary().range(), 6..8);
+        editable.insert(&mut selections, "yo");
+        assert_eq!(editable.text().to_string(), "say \"(yo)\"");
     }
 
     #[test]
